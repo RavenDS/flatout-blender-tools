@@ -1,0 +1,15 @@
+schema_version = "1.0.0"
+
+id = "fo2_trackai_import"
+version = "2.0.1"
+name = "FlatOut 2 TrackAI Importer"
+tagline = "Import FlatOut 2 AI path data (trackai.bin + .bed)"
+maintainer = "ravenDS <https://github.com/RavenDS>"
+type = "add-on"
+
+website = "https://github.com/RavenDS/flatout-blender-tools"
+tags = ["Import-Export"]
+
+blender_version_min = "4.2.0"
+
+license = ["SPDX:GPL-3.0-or-later"]

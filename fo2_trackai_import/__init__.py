@@ -1,7 +1,7 @@
 bl_info = {
     "name":        "FlatOut 2 TrackAI Importer",
     "author":      "ravenDS",
-    "version":     (2, 0, 1),
+    "version":     (2, 1, 0),
     "blender":     (3, 6, 0),
     "location":    "File > Import > FlatOut 2 TrackAI (.bin)",
     "description": "Import FlatOut 2 AI path data (trackai.bin +.bed)",
@@ -88,6 +88,7 @@ class TrackAIData:
                  'startpoints', 'splitpoints',
                  'ai_splines', 'splines_ai_raw',
                  'bed_splitpoints_raw', 'bed_startpoints_raw',
+                 'bed_startpoints_parsed', 'bed_splitpoints_parsed',
                  'ai_bvh_tree_data', 'ai_bvh_leaf_order')
 
     def __init__(self):
@@ -100,6 +101,8 @@ class TrackAIData:
         self.splines_ai_raw = ''
         self.bed_splitpoints_raw = ''
         self.bed_startpoints_raw = ''
+        self.bed_startpoints_parsed = []  # parsed from .bed text
+        self.bed_splitpoints_parsed = []  # parsed from .bed text
         self.ai_bvh_tree_data = b''  # internal tree nodes (after leaf entries, before FILE_END)
         self.ai_bvh_leaf_order = []  # list of node_ref values for leaf ordering
 
@@ -357,6 +360,61 @@ def _parse_splines_ai(filepath, result):
         print(f"[TrackAI]   AI Spline '{sp.name}': {len(sp.points)} points")
 
 
+def _parse_bed_startpoints_text(text):
+    """Parse startpoints.bed text into list of dicts with position and rotation."""
+    results = []
+    current = {}
+    for line in text.split('\n'):
+        stripped = line.strip()
+        if stripped.startswith('Position = {'):
+            vals = stripped.split('{')[1].split('}')[0]
+            coords = [float(v.strip()) for v in vals.split(',')]
+            if len(coords) >= 3:
+                current['position'] = tuple(coords[:3])
+        elif stripped.startswith('["x"]={'):
+            vals = stripped.split('{')[1].split('}')[0]
+            current['rot_x'] = tuple(float(v.strip()) for v in vals.split(','))
+        elif stripped.startswith('["y"]={'):
+            vals = stripped.split('{')[1].split('}')[0]
+            current['rot_y'] = tuple(float(v.strip()) for v in vals.split(','))
+        elif stripped.startswith('["z"]={'):
+            vals = stripped.split('{')[1].split('}')[0]
+            current['rot_z'] = tuple(float(v.strip()) for v in vals.split(','))
+            # z row is last → entry complete
+            if 'position' in current:
+                rot = (current.get('rot_x', (1,0,0))
+                       + current.get('rot_y', (0,1,0))
+                       + current.get('rot_z', (0,0,1)))
+                results.append({
+                    'position': current['position'],
+                    'rotation': rot,
+                })
+            current = {}
+    return results
+
+
+def _parse_bed_splitpoints_text(text):
+    """Parse splitpoints.bed text into list of dicts with position, left, right."""
+    results = []
+    current = {}
+    for line in text.split('\n'):
+        stripped = line.strip()
+        if stripped.startswith('Position = {'):
+            vals = stripped.split('{')[1].split('}')[0]
+            current['position'] = tuple(float(v.strip()) for v in vals.split(','))
+        elif stripped.startswith('Left = {'):
+            vals = stripped.split('{')[1].split('}')[0]
+            current['left'] = tuple(float(v.strip()) for v in vals.split(','))
+        elif stripped.startswith('Right = {'):
+            vals = stripped.split('{')[1].split('}')[0]
+            current['right'] = tuple(float(v.strip()) for v in vals.split(','))
+            # Right is last → entry complete
+            if 'position' in current and 'left' in current:
+                results.append(dict(current))
+            current = {}
+    return results
+
+
 def _parse_companion_files(filepath, result, custom_paths=None):
     """Load companion text files. Uses custom paths if provided, otherwise
     looks in the same directory as the .bin file."""
@@ -376,7 +434,9 @@ def _parse_companion_files(filepath, result, custom_paths=None):
     if os.path.isfile(split_path):
         with open(split_path, 'r') as f:
             result.bed_splitpoints_raw = f.read()
-        print(f"[TrackAI]   Loaded splitpoints.bed from {split_path}")
+        result.bed_splitpoints_parsed = _parse_bed_splitpoints_text(result.bed_splitpoints_raw)
+        print(f"[TrackAI]   Loaded splitpoints.bed from {split_path}"
+              f" ({len(result.bed_splitpoints_parsed)} entries)")
 
     # startpoints.bed
     start_path = cp.get('startpoints_bed_path', '')
@@ -385,7 +445,9 @@ def _parse_companion_files(filepath, result, custom_paths=None):
     if os.path.isfile(start_path):
         with open(start_path, 'r') as f:
             result.bed_startpoints_raw = f.read()
-        print(f"[TrackAI]   Loaded startpoints.bed from {start_path}")
+        result.bed_startpoints_parsed = _parse_bed_startpoints_text(result.bed_startpoints_raw)
+        print(f"[TrackAI]   Loaded startpoints.bed from {start_path}"
+              f" ({len(result.bed_startpoints_parsed)} entries)")
 
 
 # COORDINATE TRANSFORMS
@@ -602,7 +664,7 @@ def create_node_empties(name, nodes, scale, collection):
         collection.objects.link(empty)
 
 
-def create_startpoints(startpoints, scale, collection):
+def create_startpoints(startpoints, scale, collection, bed_startpoints=None):
     """Create empties for start grid positions."""
     for i, sp in enumerate(startpoints):
         pos = fo2_to_blender(sp.position, scale)
@@ -613,10 +675,15 @@ def create_startpoints(startpoints, scale, collection):
         empty['fo2_startpoint_index'] = i
         empty['fo2_startpoint_position'] = list(sp.position)
         empty['fo2_startpoint_rotation'] = list(sp.rotation)
+        # Store .bed coords if available (matched by index)
+        if bed_startpoints and i < len(bed_startpoints):
+            bed = bed_startpoints[i]
+            empty['fo2_bed_startpoint_position'] = list(bed['position'])
+            empty['fo2_bed_startpoint_rotation'] = list(bed['rotation'])
         collection.objects.link(empty)
 
 
-def create_splitpoints(splitpoints, scale, collection):
+def create_splitpoints(splitpoints, scale, collection, bed_splitpoints=None):
     """Create gate-line meshes for checkpoint positions."""
     mat = get_or_create_material("TrackAI_Splitpoint", (1.0, 0.3, 0.0, 1.0))
     for i, sp in enumerate(splitpoints):
@@ -632,6 +699,12 @@ def create_splitpoints(splitpoints, scale, collection):
         obj['fo2_splitpoint_position'] = list(sp.position)
         obj['fo2_splitpoint_left'] = list(sp.left)
         obj['fo2_splitpoint_right'] = list(sp.right)
+        # Store .bed coords if available (matched by index)
+        if bed_splitpoints and i < len(bed_splitpoints):
+            bed = bed_splitpoints[i]
+            obj['fo2_bed_splitpoint_position'] = list(bed['position'])
+            obj['fo2_bed_splitpoint_left'] = list(bed['left'])
+            obj['fo2_bed_splitpoint_right'] = list(bed['right'])
         collection.objects.link(obj)
 
 
@@ -822,14 +895,16 @@ def import_trackai(filepath, context, options):
     if import_startpoints and ai_data.startpoints:
         sp_col = bpy.data.collections.new("TrackAI_Startpoints")
         root_col.children.link(sp_col)
-        create_startpoints(ai_data.startpoints, scale, sp_col)
+        create_startpoints(ai_data.startpoints, scale, sp_col,
+                           bed_startpoints=ai_data.bed_startpoints_parsed)
         print(f"[TrackAI]   Created {len(ai_data.startpoints)} startpoints")
 
     # splitpoints (embedded in trackai.bin extra data)
     if import_splitpoints and ai_data.splitpoints:
         sp_col = bpy.data.collections.new("TrackAI_Splitpoints")
         root_col.children.link(sp_col)
-        create_splitpoints(ai_data.splitpoints, scale, sp_col)
+        create_splitpoints(ai_data.splitpoints, scale, sp_col,
+                           bed_splitpoints=ai_data.bed_splitpoints_parsed)
         print(f"[TrackAI]   Created {len(ai_data.splitpoints)} splitpoints")
 
     # AI Border Splines (from splines.ai)

@@ -1,7 +1,7 @@
 bl_info = {
     "name":        "FlatOut 2 TrackAI Exporter",
     "author":      "ravenDS (github.com/ravenDS)",
-    "version":     (2, 0, 1),
+    "version":     (2, 1, 0),
     "blender":     (3, 6, 0),
     "location":    "File > Export > FlatOut 2 TrackAI (.bin)",
     "description": "Export FlatOut 2 AI path data (trackai.bin + .bed)",
@@ -271,6 +271,20 @@ def build_section_nodes(centers, lefts, rights, targets, n, is_closed,
             mid = _read_vec3_prop(e, 'fo2_mid', mid)
             target = _read_vec3_prop(e, 'fo2_target', target)
 
+            # apply movement delta: derive import location from fo2_center,
+            # compare to current obj.location, apply delta to all positions
+            import_bl = (center[0], center[2], center[1])  # fo2_to_blender
+            delta_bl = (e.location[0] - import_bl[0],
+                        e.location[1] - import_bl[1],
+                        e.location[2] - import_bl[2])
+            delta_fo2 = (delta_bl[0], delta_bl[2], delta_bl[1])  # blender_to_fo2
+            if abs(delta_fo2[0]) > 1e-6 or abs(delta_fo2[1]) > 1e-6 or abs(delta_fo2[2]) > 1e-6:
+                center = (center[0] + delta_fo2[0], center[1] + delta_fo2[1], center[2] + delta_fo2[2])
+                left = (left[0] + delta_fo2[0], left[1] + delta_fo2[1], left[2] + delta_fo2[2])
+                right = (right[0] + delta_fo2[0], right[1] + delta_fo2[1], right[2] + delta_fo2[2])
+                mid = (mid[0] + delta_fo2[0], mid[1] + delta_fo2[1], mid[2] + delta_fo2[2])
+                target = (target[0] + delta_fo2[0], target[1] + delta_fo2[1], target[2] + delta_fo2[2])
+
             # direction
             forward = _read_vec3_prop(e, 'fo2_forward', forward)
             right_dir = _read_vec3_prop(e, 'fo2_right_dir', right_dir)
@@ -428,36 +442,33 @@ def export_trackai(filepath, context, options):
 
     # splines.ai
     if options.get('export_splines_ai', True):
-        splines_raw = root_col.get('fo2_splines_ai', '')
-        if splines_raw:
-            out_path = os.path.join(base_dir, "splines.ai")
-            with open(out_path, 'w', newline='\n') as f:
-                f.write(splines_raw)
-            print(f"[TrackAI Export] Wrote splines.ai (verbatim, {len(splines_raw)} chars)")
-        else:
-            _export_splines_from_empties(root_col, base_dir)
+        if not _export_splines_from_empties(root_col, base_dir):
+            splines_raw = root_col.get('fo2_splines_ai', '')
+            if splines_raw:
+                out_path = os.path.join(base_dir, "splines.ai")
+                with open(out_path, 'w', newline='\n') as f:
+                    f.write(splines_raw)
+                print(f"[TrackAI Export] Wrote splines.ai (verbatim, {len(splines_raw)} chars)")
 
     # splitpoints.bed
     if options.get('export_splitpoints_bed', True):
-        splitpoints_raw = root_col.get('fo2_splitpoints_bed', '')
-        if splitpoints_raw:
-            out_path = os.path.join(base_dir, "splitpoints.bed")
-            with open(out_path, 'w', newline='\n') as f:
-                f.write(splitpoints_raw)
-            print(f"[TrackAI Export] Wrote splitpoints.bed (verbatim)")
-        else:
-            _export_splitpoints_from_objects(root_col, base_dir)
+        if not _export_splitpoints_from_objects(root_col, base_dir):
+            splitpoints_raw = root_col.get('fo2_splitpoints_bed', '')
+            if splitpoints_raw:
+                out_path = os.path.join(base_dir, "splitpoints.bed")
+                with open(out_path, 'w', newline='\n') as f:
+                    f.write(splitpoints_raw)
+                print(f"[TrackAI Export] Wrote splitpoints.bed (verbatim)")
 
     # startpoints.bed
     if options.get('export_startpoints_bed', True):
-        startpoints_raw = root_col.get('fo2_startpoints_bed', '')
-        if startpoints_raw:
-            out_path = os.path.join(base_dir, "startpoints.bed")
-            with open(out_path, 'w', newline='\n') as f:
-                f.write(startpoints_raw)
-            print(f"[TrackAI Export] Wrote startpoints.bed (verbatim)")
-        else:
-            _export_startpoints_from_objects(root_col, base_dir)
+        if not _export_startpoints_from_objects(root_col, base_dir):
+            startpoints_raw = root_col.get('fo2_startpoints_bed', '')
+            if startpoints_raw:
+                out_path = os.path.join(base_dir, "startpoints.bed")
+                with open(out_path, 'w', newline='\n') as f:
+                    f.write(startpoints_raw)
+                print(f"[TrackAI Export] Wrote startpoints.bed (verbatim)")
 
     print(f"[TrackAI Export] Complete: {filepath}")
     return {'FINISHED'}
@@ -478,11 +489,11 @@ def _gather_startpoint_empties(root_col):
     items = []
     for obj in sp_col.objects:
         idx = obj.get('fo2_startpoint_index', -1)
-        pos = obj.get('fo2_startpoint_position')
         rot = obj.get('fo2_startpoint_rotation')
-        if idx >= 0 and pos and rot and len(pos) == 3 and len(rot) == 9:
-            items.append((idx, tuple(float(v) for v in pos),
-                          tuple(float(v) for v in rot)))
+        if idx >= 0 and rot and len(rot) == 9:
+            # Use current Blender location converted to FO2 space
+            pos = blender_to_fo2(obj.location)
+            items.append((idx, pos, tuple(float(v) for v in rot)))
     items.sort(key=lambda x: x[0])
     return items
 
@@ -500,14 +511,22 @@ def _gather_splitpoint_objects(root_col):
     items = []
     for obj in sp_col.objects:
         idx = obj.get('fo2_splitpoint_index', -1)
-        pos = obj.get('fo2_splitpoint_position')
-        left = obj.get('fo2_splitpoint_left')
-        right = obj.get('fo2_splitpoint_right')
-        if idx >= 0 and pos and left and right:
-            items.append((idx,
-                          tuple(float(v) for v in pos),
-                          tuple(float(v) for v in left),
-                          tuple(float(v) for v in right)))
+        pos_orig = obj.get('fo2_splitpoint_position')
+        left_orig = obj.get('fo2_splitpoint_left')
+        right_orig = obj.get('fo2_splitpoint_right')
+        if idx >= 0 and pos_orig and left_orig and right_orig:
+            # Mesh origin is at world origin; obj.location is the movement delta
+            delta = blender_to_fo2(obj.location)
+            pos = (float(pos_orig[0]) + delta[0],
+                   float(pos_orig[1]) + delta[1],
+                   float(pos_orig[2]) + delta[2])
+            left = (float(left_orig[0]) + delta[0],
+                    float(left_orig[1]) + delta[1],
+                    float(left_orig[2]) + delta[2])
+            right = (float(right_orig[0]) + delta[0],
+                     float(right_orig[1]) + delta[1],
+                     float(right_orig[2]) + delta[2])
+            items.append((idx, pos, left, right))
     items.sort(key=lambda x: x[0])
     return items
 
@@ -530,6 +549,16 @@ def _gather_section_node_data(section_cols):
             idx = int(e.get('fo2_node_index', 0))
             seq = int(e.get('fo2_seq_index', 0))
             if center and left and right:
+                # apply movement delta from empty location
+                import_bl = (center[0], center[2], center[1])
+                delta_bl = (e.location[0] - import_bl[0],
+                            e.location[1] - import_bl[1],
+                            e.location[2] - import_bl[2])
+                delta_fo2 = (delta_bl[0], delta_bl[2], delta_bl[1])
+                if abs(delta_fo2[0]) > 1e-6 or abs(delta_fo2[1]) > 1e-6 or abs(delta_fo2[2]) > 1e-6:
+                    center = (center[0] + delta_fo2[0], center[1] + delta_fo2[1], center[2] + delta_fo2[2])
+                    left = (left[0] + delta_fo2[0], left[1] + delta_fo2[1], left[2] + delta_fo2[2])
+                    right = (right[0] + delta_fo2[0], right[1] + delta_fo2[1], right[2] + delta_fo2[2])
                 nodes.append({
                     'center': center, 'left': left, 'right': right,
                     'index': idx, 'seq_index': seq, 'sec_idx': sec_i,
@@ -772,34 +801,47 @@ def _write_extra_data(f, root_col, section_cols):
 # COMPANION FILE GENERATION (when no stored raw data)
 
 def _export_splines_from_empties(root_col, base_dir):
-    """Generate splines.ai from AISpline empties if no verbatim data stored."""
+    """Generate splines.ai from AISpline empties. Returns True if written."""
     spline_col = None
     for child in root_col.children:
         if child.name == "TrackAI_AISplines":
             spline_col = child
             break
     if not spline_col:
-        return
+        return False
 
-    # Group empties by spline name
+    # group empties by spline name
     splines = {}
     for obj in spline_col.objects:
         name = obj.get('fo2_spline_name', '')
         if not name:
             continue
         idx = obj.get('fo2_spline_index', 0)
-        pos = obj.get('fo2_spline_pos')
-        if pos and len(pos) == 3:
-            fo2_pos = tuple(float(v) for v in pos)
+
+        # delta approach: stored game coords + movement delta
+        orig_pos = obj.get('fo2_spline_position')
+        if orig_pos and len(orig_pos) == 3:
+            # derive import-time Blender location from stored FO2 position
+            import_loc = (orig_pos[0], orig_pos[2], orig_pos[1])  # fo2_to_blender
+            # compute how much the user moved this empty in Blender
+            delta_bl = (obj.location[0] - import_loc[0],
+                        obj.location[1] - import_loc[1],
+                        obj.location[2] - import_loc[2])
+            # convert delta to game space (swap Y/Z)
+            delta_game = (delta_bl[0], delta_bl[2], delta_bl[1])
+            fo2_pos = (orig_pos[0] + delta_game[0],
+                       orig_pos[1] + delta_game[1],
+                       orig_pos[2] + delta_game[2])
         else:
-            # Read from Blender location
+            # fallback: direct conversion from Blender location
             fo2_pos = blender_to_fo2(obj.location)
+
         if name not in splines:
             splines[name] = []
         splines[name].append((idx, fo2_pos))
 
     if not splines:
-        return
+        return False
 
     out_path = os.path.join(base_dir, "splines.ai")
     with open(out_path, 'w', newline='\n') as f:
@@ -810,84 +852,151 @@ def _export_splines_from_empties(root_col, base_dir):
             f.write(f"\t\tCount = {len(pts)},\n")
             f.write(f"\t\tControlPoints = {{")
             for i, (idx, pos) in enumerate(pts):
-                f.write(f"\n\t\t\t[{i+1}] = {{ {pos[0]}, {pos[1]}, {pos[2]}}},")
+                f.write(f"\n\t\t\t[{i+1}] = {{ {pos[0]:.6f}, {pos[1]:.6f}, {pos[2]:.6f} }},")
             f.write(f"\n\t\t}},\n\t}},\n")
         f.write("\n}\n")
     print(f"[TrackAI Export] Generated splines.ai from empties")
+    return True
 
 
 def _export_splitpoints_from_objects(root_col, base_dir):
-    """Generate splitpoints.bed from splitpoint objects."""
+    """Generate splitpoints.bed from splitpoint objects using delta approach. Returns True if written."""
     split_col = None
     for child in root_col.children:
         if child.name == "TrackAI_Splitpoints":
             split_col = child
             break
     if not split_col:
-        return
+        return False
 
     splitpoints = []
     for obj in split_col.objects:
-        pos = obj.get('fo2_splitpoint_pos')
-        left = obj.get('fo2_splitpoint_left')
-        right = obj.get('fo2_splitpoint_right')
-        if pos and left and right:
-            splitpoints.append((
-                tuple(float(v) for v in pos),
-                tuple(float(v) for v in left),
-                tuple(float(v) for v in right),
-            ))
+        idx = obj.get('fo2_splitpoint_index', -1)
+        if idx < 0:
+            continue
+
+        # try delta approach using .bed coords
+        bed_pos = obj.get('fo2_bed_splitpoint_position')
+        bed_left = obj.get('fo2_bed_splitpoint_left')
+        bed_right = obj.get('fo2_bed_splitpoint_right')
+
+        if bed_pos and bed_left and bed_right:
+            # splitpoint mesh origin is at world origin, so delta = obj.location
+            delta_bl = (obj.location[0], obj.location[1], obj.location[2])
+            # convert delta to game space (swap Y/Z)
+            delta_game = (delta_bl[0], delta_bl[2], delta_bl[1])
+            # apply delta to all three .bed points
+            pos = (bed_pos[0] + delta_game[0],
+                   bed_pos[1] + delta_game[1],
+                   bed_pos[2] + delta_game[2])
+            left = (bed_left[0] + delta_game[0],
+                    bed_left[1] + delta_game[1],
+                    bed_left[2] + delta_game[2])
+            right = (bed_right[0] + delta_game[0],
+                     bed_right[1] + delta_game[1],
+                     bed_right[2] + delta_game[2])
+        else:
+            # fallback: read binary coords from custom properties
+            bin_pos = obj.get('fo2_splitpoint_position')
+            bin_left = obj.get('fo2_splitpoint_left')
+            bin_right = obj.get('fo2_splitpoint_right')
+            if bin_pos and bin_left and bin_right:
+                pos = tuple(float(v) for v in bin_pos)
+                left = tuple(float(v) for v in bin_left)
+                right = tuple(float(v) for v in bin_right)
+            else:
+                continue
+
+        splitpoints.append((idx, pos, left, right))
 
     if not splitpoints:
-        return
+        return False
+
+    # sort by index
+    splitpoints.sort(key=lambda x: x[0])
 
     out_path = os.path.join(base_dir, "splitpoints.bed")
     with open(out_path, 'w', newline='\n') as f:
         f.write(f"Count = {len(splitpoints)}\n\nSplitpoints = {{")
-        for i, (pos, left, right) in enumerate(splitpoints):
+        for i, (idx, pos, left, right) in enumerate(splitpoints):
             f.write(f"\n\t[{i+1}] = {{")
-            f.write(f"\n\t\tPosition = {{ {pos[0]}, {pos[1]}, {pos[2]} }},")
-            f.write(f"\n\t\tLeft = {{ {left[0]}, {left[1]}, {left[2]} }},")
-            f.write(f"\n\t\tRight = {{ {right[0]}, {right[1]}, {right[2]} }},")
+            f.write(f"\n\t\tPosition = {{ {pos[0]:.6f}, {pos[1]:.6f}, {pos[2]:.6f} }},")
+            f.write(f"\n\t\tLeft = {{ {left[0]:.6f}, {left[1]:.6f}, {left[2]:.6f} }},")
+            f.write(f"\n\t\tRight = {{ {right[0]:.6f}, {right[1]:.6f}, {right[2]:.6f} }},")
             f.write(f"\n\n\t}},")
         f.write("\n}\n")
-    print(f"[TrackAI Export] Generated splitpoints.bed from objects")
+    print(f"[TrackAI Export] Generated splitpoints.bed ({len(splitpoints)} entries)")
+    return True
 
 
 def _export_startpoints_from_objects(root_col, base_dir):
-    """Generate startpoints.bed from startpoint empties."""
+    """Generate startpoints.bed from startpoint empties using delta approach. Returns True if written."""
     start_col = None
     for child in root_col.children:
         if child.name == "TrackAI_Startpoints":
             start_col = child
             break
     if not start_col:
-        return
+        return False
 
     startpoints = []
     for obj in start_col.objects:
-        rot = obj.get('fo2_startpoint_rotation')
-        if rot and len(rot) == 9:
-            pos = blender_to_fo2(obj.location)
-            startpoints.append((pos, tuple(float(v) for v in rot)))
+        idx = obj.get('fo2_startpoint_index', -1)
+        if idx < 0:
+            continue
+
+        # Try delta approach using .bed coords
+        bed_pos = obj.get('fo2_bed_startpoint_position')
+        bed_rot = obj.get('fo2_bed_startpoint_rotation')
+        bin_pos = obj.get('fo2_startpoint_position')
+
+        if bed_pos and bed_rot and bin_pos and len(bed_pos) == 3 and len(bed_rot) == 9 and len(bin_pos) == 3:
+            # Derive import-time Blender location from stored binary position
+            import_loc = (bin_pos[0], bin_pos[2], bin_pos[1])  # fo2_to_blender
+            # Compute movement delta in Blender space
+            delta_bl = (obj.location[0] - import_loc[0],
+                        obj.location[1] - import_loc[1],
+                        obj.location[2] - import_loc[2])
+            # Convert delta to game space (swap Y/Z)
+            delta_game = (delta_bl[0], delta_bl[2], delta_bl[1])
+            pos = (bed_pos[0] + delta_game[0],
+                   bed_pos[1] + delta_game[1],
+                   bed_pos[2] + delta_game[2])
+            rot = tuple(float(v) for v in bed_rot)
+        else:
+            # Fallback: no .bed data, use binary rotation and Blender location
+            rot_raw = obj.get('fo2_startpoint_rotation')
+            if rot_raw and len(rot_raw) == 9:
+                pos = blender_to_fo2(obj.location)
+                rot = tuple(float(v) for v in rot_raw)
+            else:
+                continue
+
+        startpoints.append((idx, pos, rot))
 
     if not startpoints:
-        return
+        return False
+
+    # Sort by index
+    startpoints.sort(key=lambda x: x[0])
 
     out_path = os.path.join(base_dir, "startpoints.bed")
     with open(out_path, 'w', newline='\n') as f:
         f.write(f"Count = {len(startpoints)}\n\nStartpoints = {{")
-        for i, (pos, rot) in enumerate(startpoints):
+        for i, (idx, pos, rot) in enumerate(startpoints):
+            # Clamp near-zero values like the C++ tool does
+            rot_c = tuple(0.0 if abs(v) < 0.001 else v for v in rot)
             f.write(f"\n\t[{i+1}] = {{")
-            f.write(f"\n\t\tPosition = {{ {pos[0]}, {pos[1]}, {pos[2]} }},")
+            f.write(f"\n\t\tPosition = {{ {pos[0]:.6f}, {pos[1]:.6f}, {pos[2]:.6f} }},")
             f.write(f"\n\t\tOrientation = {{")
-            f.write(f"\n\t\t\t[\"x\"]={{{rot[0]},{rot[1]},{rot[2]}}},")
-            f.write(f"\n\t\t\t[\"y\"]={{{rot[3]},{rot[4]},{rot[5]}}},")
-            f.write(f"\n\t\t\t[\"z\"]={{{rot[6]},{rot[7]},{rot[8]}}},")
+            f.write(f"\n\t\t\t[\"x\"]={{{rot_c[0]:.6f},{rot_c[1]:.6f},{rot_c[2]:.6f}}},")
+            f.write(f"\n\t\t\t[\"y\"]={{{rot_c[3]:.6f},{rot_c[4]:.6f},{rot_c[5]:.6f}}},")
+            f.write(f"\n\t\t\t[\"z\"]={{{rot_c[6]:.6f},{rot_c[7]:.6f},{rot_c[8]:.6f}}},")
             f.write(f"\n\t\t}},")
             f.write(f"\n\n\t}},")
         f.write("\n}\n")
-    print(f"[TrackAI Export] Generated startpoints.bed from objects")
+    print(f"[TrackAI Export] Generated startpoints.bed ({len(startpoints)} entries)")
+    return True
 
 
 # OPERATOR
