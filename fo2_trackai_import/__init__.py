@@ -675,7 +675,7 @@ def create_startpoints(startpoints, scale, collection, bed_startpoints=None):
         empty['fo2_startpoint_index'] = i
         empty['fo2_startpoint_position'] = list(sp.position)
         empty['fo2_startpoint_rotation'] = list(sp.rotation)
-        # Store .bed coords if available (matched by index)
+        # store .bed coords if available (matched by index)
         if bed_startpoints and i < len(bed_startpoints):
             bed = bed_startpoints[i]
             empty['fo2_bed_startpoint_position'] = list(bed['position'])
@@ -699,7 +699,7 @@ def create_splitpoints(splitpoints, scale, collection, bed_splitpoints=None):
         obj['fo2_splitpoint_position'] = list(sp.position)
         obj['fo2_splitpoint_left'] = list(sp.left)
         obj['fo2_splitpoint_right'] = list(sp.right)
-        # Store .bed coords if available (matched by index)
+        # store .bed coords if available (matched by index)
         if bed_splitpoints and i < len(bed_splitpoints):
             bed = bed_splitpoints[i]
             obj['fo2_bed_splitpoint_position'] = list(bed['position'])
