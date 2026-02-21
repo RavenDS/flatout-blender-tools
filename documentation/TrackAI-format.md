@@ -1,4 +1,4 @@
-# FlatOut 2 — Track File Format Specification
+# FlatOut 2 — TrackAI File Format Specification
 
 Research by ravenDS (https://github.com/RavenDS/flatout-blender-tools)
 21/02/2026
