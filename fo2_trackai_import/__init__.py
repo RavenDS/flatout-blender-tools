@@ -1,7 +1,7 @@
 bl_info = {
     "name":        "FlatOut 2 TrackAI Importer",
     "author":      "ravenDS",
-    "version":     (2, 1, 0),
+    "version":     (2, 2, 0),
     "blender":     (3, 6, 0),
     "location":    "File > Import > FlatOut 2 TrackAI (.bin)",
     "description": "Import FlatOut 2 AI path data (trackai.bin +.bed)",
@@ -305,13 +305,13 @@ def _parse_extra_data(result):
         tag4, offset = read_u32(extra, offset)   # 0x00020376
         reserved, offset = read_u32(extra, offset)  # 0
 
-        # Skip leaf entries (total_nodes × 32 bytes)
+        # skip leaf entries (total_nodes × 32 bytes)
         leaf_end = offset + total_nodes * 32
         if leaf_end > len(extra):
             print(f"[TrackAI]   WARNING: AI BVH leaf data truncated")
             return
 
-        # Extract leaf ordering (list of node_ref values) for round-trip
+        # extract leaf ordering (list of node_ref values) for round-trip
         leaf_order = []
         for i in range(total_nodes):
             node_ref = struct.unpack_from('<I', extra, offset + i * 32)[0]
@@ -675,7 +675,7 @@ def create_startpoints(startpoints, scale, collection, bed_startpoints=None):
         empty['fo2_startpoint_index'] = i
         empty['fo2_startpoint_position'] = list(sp.position)
         empty['fo2_startpoint_rotation'] = list(sp.rotation)
-        # store .bed coords if available (matched by index)
+        # Store .bed coords if available (matched by index)
         if bed_startpoints and i < len(bed_startpoints):
             bed = bed_startpoints[i]
             empty['fo2_bed_startpoint_position'] = list(bed['position'])
@@ -699,7 +699,7 @@ def create_splitpoints(splitpoints, scale, collection, bed_splitpoints=None):
         obj['fo2_splitpoint_position'] = list(sp.position)
         obj['fo2_splitpoint_left'] = list(sp.left)
         obj['fo2_splitpoint_right'] = list(sp.right)
-        # store .bed coords if available (matched by index)
+        # Store .bed coords if available (matched by index)
         if bed_splitpoints and i < len(bed_splitpoints):
             bed = bed_splitpoints[i]
             obj['fo2_bed_splitpoint_position'] = list(bed['position'])
@@ -781,9 +781,6 @@ def import_trackai(filepath, context, options):
         root_col['fo2_ai_bvh_leaf_order'] = ai_data.ai_bvh_leaf_order
 
     for sec_idx, section in enumerate(ai_data.sections):
-        if not section.nodes:
-            continue
-
         color_idx = sec_idx % len(SECTION_COLORS)
         color = SECTION_COLORS[color_idx]
         bnd_color = BOUNDARY_COLORS[color_idx]
@@ -797,6 +794,11 @@ def import_trackai(filepath, context, options):
         sec_col['fo2_section_index'] = sec_idx
         if section.footer:
             sec_col['fo2_footer'] = base64.b64encode(section.footer).decode('ascii')
+
+        if not section.nodes:
+            sec_col['fo2_is_closed'] = False
+            print(f"[TrackAI] Created empty section '{sec_name}' (0 nodes, footer preserved)")
+            continue
 
         # determine if this is a closed loop
         # closed: last node's linked-list index wraps back to the first node

@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "fo2_trackai_import"
-version = "2.1.0"
+version = "2.2.0"
 name = "FlatOut 2 TrackAI Importer"
 tagline = "Import FlatOut 2 AI path data (trackai.bin + .bed)"
 maintainer = "ravenDS <https://github.com/RavenDS>"

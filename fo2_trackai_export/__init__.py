@@ -1,7 +1,7 @@
 bl_info = {
     "name":        "FlatOut 2 TrackAI Exporter",
     "author":      "ravenDS (github.com/ravenDS)",
-    "version":     (2, 1, 0),
+    "version":     (2, 2, 0),
     "blender":     (3, 6, 0),
     "location":    "File > Export > FlatOut 2 TrackAI (.bin)",
     "description": "Export FlatOut 2 AI path data (trackai.bin + .bed)",
@@ -391,9 +391,18 @@ def export_trackai(filepath, context, options):
             targets = sample_curve_points(target_obj)
 
             if not centers:
-                print(f"[TrackAI Export] WARNING: No center points for {sec_name}")
                 centers = lefts or rights
                 if not centers:
+                    # Empty section (0 nodes) — still write header + footer
+                    if footer_b64:
+                        footer_bytes = base64.b64decode(footer_b64)
+                    else:
+                        footer_bytes = struct.pack('<IfIII', sec_i if sec_i > 0 else 0, 0.5, 0, 0, 2)
+                    write_u32(f, TAG_SPLINE_SECTION)
+                    write_u32(f, 0)
+                    f.write(footer_bytes)
+                    write_u32(f, TAG_SECTION_SEP)
+                    print(f"[TrackAI Export] Section '{sec_name}': 0 nodes (empty)")
                     continue
 
             # match boundary count to center count
@@ -810,7 +819,7 @@ def _export_splines_from_empties(root_col, base_dir):
     if not spline_col:
         return False
 
-    # group empties by spline name
+    # Group empties by spline name
     splines = {}
     for obj in spline_col.objects:
         name = obj.get('fo2_spline_name', '')
@@ -818,22 +827,22 @@ def _export_splines_from_empties(root_col, base_dir):
             continue
         idx = obj.get('fo2_spline_index', 0)
 
-        # delta approach: stored game coords + movement delta
+        # Delta approach: stored game coords + movement delta
         orig_pos = obj.get('fo2_spline_position')
         if orig_pos and len(orig_pos) == 3:
-            # derive import-time Blender location from stored FO2 position
+            # Derive import-time Blender location from stored FO2 position
             import_loc = (orig_pos[0], orig_pos[2], orig_pos[1])  # fo2_to_blender
-            # compute how much the user moved this empty in Blender
+            # Compute how much the user moved this empty in Blender
             delta_bl = (obj.location[0] - import_loc[0],
                         obj.location[1] - import_loc[1],
                         obj.location[2] - import_loc[2])
-            # convert delta to game space (swap Y/Z)
+            # Convert delta to game space (swap Y/Z)
             delta_game = (delta_bl[0], delta_bl[2], delta_bl[1])
             fo2_pos = (orig_pos[0] + delta_game[0],
                        orig_pos[1] + delta_game[1],
                        orig_pos[2] + delta_game[2])
         else:
-            # fallback: direct conversion from Blender location
+            # Fallback: direct conversion from Blender location
             fo2_pos = blender_to_fo2(obj.location)
 
         if name not in splines:
@@ -875,17 +884,17 @@ def _export_splitpoints_from_objects(root_col, base_dir):
         if idx < 0:
             continue
 
-        # try delta approach using .bed coords
+        # Try delta approach using .bed coords
         bed_pos = obj.get('fo2_bed_splitpoint_position')
         bed_left = obj.get('fo2_bed_splitpoint_left')
         bed_right = obj.get('fo2_bed_splitpoint_right')
 
         if bed_pos and bed_left and bed_right:
-            # splitpoint mesh origin is at world origin, so delta = obj.location
+            # Splitpoint mesh origin is at world origin, so delta = obj.location
             delta_bl = (obj.location[0], obj.location[1], obj.location[2])
-            # convert delta to game space (swap Y/Z)
+            # Convert delta to game space (swap Y/Z)
             delta_game = (delta_bl[0], delta_bl[2], delta_bl[1])
-            # apply delta to all three .bed points
+            # Apply delta to all three .bed points
             pos = (bed_pos[0] + delta_game[0],
                    bed_pos[1] + delta_game[1],
                    bed_pos[2] + delta_game[2])
@@ -896,7 +905,7 @@ def _export_splitpoints_from_objects(root_col, base_dir):
                      bed_right[1] + delta_game[1],
                      bed_right[2] + delta_game[2])
         else:
-            # fallback: read binary coords from custom properties
+            # Fallback: read binary coords from custom properties
             bin_pos = obj.get('fo2_splitpoint_position')
             bin_left = obj.get('fo2_splitpoint_left')
             bin_right = obj.get('fo2_splitpoint_right')
@@ -912,7 +921,7 @@ def _export_splitpoints_from_objects(root_col, base_dir):
     if not splitpoints:
         return False
 
-    # sort by index
+    # Sort by index
     splitpoints.sort(key=lambda x: x[0])
 
     out_path = os.path.join(base_dir, "splitpoints.bed")
