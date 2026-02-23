@@ -1,7 +1,7 @@
 bl_info = {
     "name":        "FlatOut 2 TrackAI Exporter",
     "author":      "ravenDS (github.com/ravenDS)",
-    "version":     (2, 2, 0),
+    "version":     (2, 2, 1),
     "blender":     (3, 6, 0),
     "location":    "File > Export > FlatOut 2 TrackAI (.bin)",
     "description": "Export FlatOut 2 AI path data (trackai.bin + .bed)",
@@ -17,7 +17,7 @@ import math
 import base64
 from bpy.props import (StringProperty, BoolProperty, FloatProperty)
 from bpy_extras.io_utils import ExportHelper
-from mathutils import Vector
+from mathutils import Vector, Matrix
 
 
 # CONSTANTS
@@ -91,6 +91,80 @@ def vec_dist(a, b):
 
 def vec_len(v):
     return math.sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2])
+
+
+def _blender_3x3_to_fo2_node_rot(mat):
+    """Extract FO2 node rotation, forward, right_dir from Blender 3x3 matrix.
+
+    Import builds Blender matrix with columns: [right_bl, fwd_bl, up_bl]
+    where each FO2 dir (x,y,z) becomes Blender (x,z,y).
+
+    Returns (rotation_9f, forward_3f, right_dir_3f) in FO2 space.
+    """
+    m = mat
+    # Blender columns
+    right_bl = (m[0][0], m[1][0], m[2][0])
+    fwd_bl   = (m[0][1], m[1][1], m[2][1])
+    up_bl    = (m[0][2], m[1][2], m[2][2])
+    # Convert to FO2: bl(x,y,z) → fo2(x,z,y)
+    right_fo2 = (right_bl[0], right_bl[2], right_bl[1])
+    fwd_fo2   = (fwd_bl[0], fwd_bl[2], fwd_bl[1])
+    up_fo2    = (up_bl[0], up_bl[2], up_bl[1])
+    # Node binary rotation: columns = [right, up, fwd]
+    rotation = (
+        right_fo2[0], up_fo2[0], fwd_fo2[0],
+        right_fo2[1], up_fo2[1], fwd_fo2[1],
+        right_fo2[2], up_fo2[2], fwd_fo2[2],
+    )
+    return rotation, fwd_fo2, right_fo2
+
+
+def _blender_3x3_to_fo2_startpoint_rot(mat):
+    """Extract FO2 startpoint rotation from Blender 3x3 matrix.
+
+    Import builds Blender matrix with columns: [right_bl, fwd_bl, up_bl]
+    FO2 startpoint rotation: rows = [right_fo2, up_fo2, fwd_fo2]
+
+    Returns tuple of 9 floats.
+    """
+    m = mat
+    right_fo2 = (m[0][0], m[2][0], m[1][0])
+    fwd_fo2   = (m[0][1], m[2][1], m[1][1])
+    up_fo2    = (m[0][2], m[2][2], m[1][2])
+    return (
+        right_fo2[0], right_fo2[1], right_fo2[2],
+        up_fo2[0],    up_fo2[1],    up_fo2[2],
+        fwd_fo2[0],   fwd_fo2[1],   fwd_fo2[2],
+    )
+
+
+def _fo2_startpoint_rot_to_blender_3x3(rot):
+    """Convert FO2 startpoint rotation (9 floats) to Blender 3x3 Matrix."""
+    r = rot
+    return Matrix((
+        (r[0], r[6], r[3]),
+        (r[2], r[8], r[5]),
+        (r[1], r[7], r[4]),
+    ))
+
+
+def _rot_matrix_changed(obj):
+    """Check if Blender rotation changed vs import time.
+
+    Compares current matrix_world.to_3x3() against the stored
+    fo2_import_rot_matrix (set at import time from the same Blender value).
+    Returns True if changed or if no import matrix stored (from-scratch data).
+    """
+    stored = obj.get('fo2_import_rot_matrix')
+    if not stored or len(stored) != 9:
+        return True  # no reference → treat as new/changed
+    current = obj.matrix_world.to_3x3()
+    s = [float(v) for v in stored]
+    for i in range(3):
+        for j in range(3):
+            if abs(current[i][j] - s[i * 3 + j]) > 1e-6:
+                return True
+    return False
 
 
 # FIND TRACKAI ROOT COLLECTION
@@ -350,12 +424,97 @@ def build_section_nodes(centers, lefts, rights, targets, n, is_closed,
 
 # MAIN EXPORT
 
+def _sync_transforms_to_props(root_col):
+    """Update stored custom properties from current Blender transforms.
+
+    Only updates when the user actually changed the rotation (compared
+    against fo2_import_rot_matrix stored at import time). The existing
+    write routines read from custom props and stay untouched.
+
+    - Node empties: updates fo2_rotation, fo2_forward, fo2_right_dir
+    - Startpoint empties: updates fo2_startpoint_rotation, and applies
+      a rotation delta to fo2_bed_startpoint_rotation if present
+    """
+    # --- node empties ---
+    for child in root_col.children:
+        sec_idx = child.get('fo2_section_index', -1)
+        if sec_idx < 0:
+            continue
+        for obj in child.objects:
+            if obj.get('fo2_forward') is None or obj.get('fo2_right_dir') is None:
+                continue  # not a node empty
+
+            # Position: update fo2_center from Blender location,
+            # apply same offset to left/right/mid/target
+            old_center = _read_vec3_prop(obj, 'fo2_center', None)
+            if old_center:
+                new_center = blender_to_fo2(obj.location)
+                dx = new_center[0] - old_center[0]
+                dy = new_center[1] - old_center[1]
+                dz = new_center[2] - old_center[2]
+                obj['fo2_center'] = list(new_center)
+                if abs(dx) > 1e-6 or abs(dy) > 1e-6 or abs(dz) > 1e-6:
+                    for key in ('fo2_left', 'fo2_right', 'fo2_mid', 'fo2_target'):
+                        old = _read_vec3_prop(obj, key, None)
+                        if old:
+                            obj[key] = [old[0] + dx, old[1] + dy, old[2] + dz]
+
+            # Rotation: only update if user actually changed it
+            if not _rot_matrix_changed(obj):
+                continue
+            mat = obj.matrix_world.to_3x3()
+            rotation, forward, right_dir = _blender_3x3_to_fo2_node_rot(mat)
+            obj['fo2_rotation'] = list(rotation)
+            obj['fo2_forward'] = list(forward)
+            obj['fo2_right_dir'] = list(right_dir)
+
+    # --- startpoint empties ---
+    sp_col = None
+    for child in root_col.children:
+        if child.name == "TrackAI_Startpoints":
+            sp_col = child
+            break
+    if not sp_col:
+        return
+
+    for obj in sp_col.objects:
+        if obj.get('fo2_startpoint_index', -1) < 0:
+            continue
+
+        # Position: update from Blender location
+        obj['fo2_startpoint_position'] = list(blender_to_fo2(obj.location))
+        if not _rot_matrix_changed(obj):
+            continue  # unchanged
+
+        current_bl = obj.matrix_world.to_3x3()
+        new_rot = _blender_3x3_to_fo2_startpoint_rot(current_bl)
+
+        # .bed rotation delta
+        old_rot_raw = obj.get('fo2_startpoint_rotation')
+        bed_rot_raw = obj.get('fo2_bed_startpoint_rotation')
+        if old_rot_raw and bed_rot_raw and len(old_rot_raw) == 9 and len(bed_rot_raw) == 9:
+            old_rot = tuple(float(v) for v in old_rot_raw)
+            import_bl = _fo2_startpoint_rot_to_blender_3x3(old_rot)
+            delta_bl = current_bl @ import_bl.transposed()
+            bed_bl = _fo2_startpoint_rot_to_blender_3x3(tuple(float(v) for v in bed_rot_raw))
+            new_bed_bl = delta_bl @ bed_bl
+            obj['fo2_bed_startpoint_rotation'] = list(_blender_3x3_to_fo2_startpoint_rot(new_bed_bl))
+
+        # Update binary rotation prop (AFTER reading old value for delta above)
+        obj['fo2_startpoint_rotation'] = list(new_rot)
+
+    print("[TrackAI Export] Synced Blender transforms → custom properties")
+
+
 def export_trackai(filepath, context, options):
     root_col = find_trackai_root(context)
     if root_col is None:
         raise ValueError("No TrackAI collection found in scene")
 
     print(f"[TrackAI Export] Found root: {root_col.name}")
+
+    # Sync current Blender transforms into custom properties
+    _sync_transforms_to_props(root_col)
 
     # gather section collections by fo2_section_index 
     section_cols = []

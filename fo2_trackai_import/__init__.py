@@ -1,7 +1,7 @@
 bl_info = {
     "name":        "FlatOut 2 TrackAI Importer",
     "author":      "ravenDS",
-    "version":     (2, 2, 0),
+    "version":     (2, 2, 1),
     "blender":     (3, 6, 0),
     "location":    "File > Import > FlatOut 2 TrackAI (.bin)",
     "description": "Import FlatOut 2 AI path data (trackai.bin +.bed)",
@@ -468,6 +468,20 @@ def fo2_dir_to_blender(d):
     return Vector((d[0], d[2], d[1]))
 
 
+def fo2_startpoint_rot_to_blender_matrix(rot):
+    """Convert FO2 startpoint rotation (9 floats, rows=[right,up,fwd]) to Blender 3x3 Matrix.
+
+    Each FO2 direction (x,y,z) becomes Blender (x,z,y).
+    Blender matrix columns: [right_bl, fwd_bl, up_bl].
+    """
+    r = rot
+    return Matrix((
+        (r[0], r[6], r[3]),
+        (r[2], r[8], r[5]),
+        (r[1], r[7], r[4]),
+    ))
+
+
 # BLENDER SCENE CREATION
 
 # color palette for spline sections
@@ -627,6 +641,14 @@ def create_node_empties(name, nodes, scale, collection):
         except Exception:
             pass  # keep default orientation
 
+        # Store import-time Blender rotation for change detection on export
+        m = empty.matrix_world.to_3x3()
+        empty['fo2_import_rot_matrix'] = [
+            m[0][0], m[0][1], m[0][2],
+            m[1][0], m[1][1], m[1][2],
+            m[2][0], m[2][1], m[2][2],
+        ]
+
         # store metadata as custom properties.
         # Blender custom properties use signed int32 internally, so u32 values above 0x7FFFFFFF (like 0xFFFFFFFF sentinel) must be reinterpreted as signed to avoid OverflowError.
         def _i(v):
@@ -669,9 +691,25 @@ def create_startpoints(startpoints, scale, collection, bed_startpoints=None):
     for i, sp in enumerate(startpoints):
         pos = fo2_to_blender(sp.position, scale)
         empty = bpy.data.objects.new(f"Startpoint{i+1}", None)
-        empty.empty_display_type = 'SINGLE_ARROW'
+        empty.empty_display_type = 'ARROWS'
         empty.empty_display_size = 3.0
         empty.location = pos
+
+        # Apply rotation from binary data
+        try:
+            rot_mat = fo2_startpoint_rot_to_blender_matrix(sp.rotation)
+            empty.matrix_world = Matrix.Translation(pos) @ rot_mat.to_4x4()
+        except Exception:
+            pass  # keep default orientation
+
+        # Store import-time Blender rotation for change detection on export
+        m = empty.matrix_world.to_3x3()
+        empty['fo2_import_rot_matrix'] = [
+            m[0][0], m[0][1], m[0][2],
+            m[1][0], m[1][1], m[1][2],
+            m[2][0], m[2][1], m[2][2],
+        ]
+
         empty['fo2_startpoint_index'] = i
         empty['fo2_startpoint_position'] = list(sp.position)
         empty['fo2_startpoint_rotation'] = list(sp.rotation)
