@@ -1,0 +1,20 @@
+schema_version = "1.0.0"
+
+id = "fo2_collision_io"
+version = "1.0.0"
+name = "FlatOut 2 Collision Import/Export"
+tagline = "Import/export FlatOut 2 track collision (track_cdb2.gen) with shadowmap preservation"
+maintainer = "ravenDS <https://github.com/RavenDS>"
+type = "add-on"
+
+website = "https://github.com/RavenDS/flatout-blender-tools"
+tags = ["Import-Export"]
+
+blender_version_min = "4.2.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
+
+[permissions]
+files = "Import/export collision files"
+
+
