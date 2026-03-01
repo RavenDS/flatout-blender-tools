@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "fo2_collision_io"
-version = "1.0.0"
+version = "1.1.0"
 name = "FlatOut 2 Collision Import/Export"
 tagline = "Import/export FlatOut 2 track collision (track_cdb2.gen) with shadowmap preservation"
 maintainer = "ravenDS <https://github.com/RavenDS>"

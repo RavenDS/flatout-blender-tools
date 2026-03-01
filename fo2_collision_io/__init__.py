@@ -354,13 +354,9 @@ def _read_header_from_collection(col):
 
 # BLENDER MESH BUILDING (IMPORT)
 
-def _create_collision_material(name, color, surface_id, lo_flags=0, hi_flags=0, bitmask=0xF):
+def _create_collision_material(name, color):
     mat = bpy.data.materials.new(name)
     mat.diffuse_color = color
-    mat["fo2_surface_id"] = surface_id
-    mat["fo2_lo_flags"] = lo_flags
-    mat["fo2_hi_flags"] = hi_flags
-    mat["fo2_bitmask"] = bitmask
     return mat
 
 
@@ -376,6 +372,9 @@ def build_collision_mesh(cdb, collection, group_by_material=True):
     for (surface_id, lo_flags, hi_flags, bitmask) in groups:
         surface_counts[surface_id] = surface_counts.get(surface_id, 0) + 1
 
+    # shared materials: one per surface_id (visual only, no collision flags)
+    surface_materials = {}
+
     # track sub-collections per surface
     sub_collections = {}
     variant_idx = {}
@@ -386,7 +385,7 @@ def build_collision_mesh(cdb, collection, group_by_material=True):
         base_name = f"col_{surface_id}_{sname}"
         needs_subcol = surface_counts[surface_id] > 1
 
-        # pick an unique object name
+        # pick a unique object name
         if needs_subcol:
             idx = variant_idx.get(surface_id, 0)
             variant_idx[surface_id] = idx + 1
@@ -394,7 +393,12 @@ def build_collision_mesh(cdb, collection, group_by_material=True):
         else:
             name = base_name
 
-        color = SURFACE_COLORS.get(_surface_category(surface_id), (0.5, 0.5, 0.5, 1.0))
+        # get or create shared material for this surface type
+        if surface_id not in surface_materials:
+            color = SURFACE_COLORS.get(_surface_category(surface_id), (0.5, 0.5, 0.5, 1.0))
+            surface_materials[surface_id] = _create_collision_material(
+                f"col_{surface_id}_{sname}", color)
+        mat = surface_materials[surface_id]
 
         vert_map = {}
         verts = []
@@ -412,8 +416,6 @@ def build_collision_mesh(cdb, collection, group_by_material=True):
         mesh = bpy.data.meshes.new(name)
         mesh.from_pydata(verts, [], faces)
         mesh.update()
-        mat = _create_collision_material(name, color, surface_id,
-                                       lo_flags=lo_flags, hi_flags=hi_flags, bitmask=bitmask)
         mesh.materials.append(mat)
 
         # store per-vertex shadow UV data as a UV map (from original 4 extra bytes)
@@ -440,6 +442,12 @@ def build_collision_mesh(cdb, collection, group_by_material=True):
         obj = bpy.data.objects.new(name, mesh)
         obj["fo2_has_shadow"] = has_any_shadow
 
+        # collision properties stored on the object (not the material)
+        obj["fo2_surface_id"] = surface_id
+        obj["fo2_lo_flags"] = lo_flags
+        obj["fo2_hi_flags"] = hi_flags
+        obj["fo2_bitmask"] = bitmask
+
         if needs_subcol:
             if surface_id not in sub_collections:
                 subcol = bpy.data.collections.new(base_name)
@@ -449,7 +457,8 @@ def build_collision_mesh(cdb, collection, group_by_material=True):
         else:
             collection.objects.link(obj)
 
-    print(f"Created {len(groups)} collision mesh objects in {len(sub_collections)} sub-collections")
+    print(f"Created {len(groups)} collision mesh objects ({len(surface_materials)} shared materials) "
+          f"in {len(sub_collections)} sub-collections")
 
 
 # SHADOWMAP
@@ -573,44 +582,60 @@ def _find_collision_meshes():
     return col, meshes
 
 
-def _get_material_flags(mat):
-    """Read collision flags from a Blender material.
+# default bitmask per surface_id, from cross-track analysis (125K triangles).
+# surfaces with mixed bitmasks use the dominant one (>90% occurrence).
+_DEFAULT_BITMASK = {
+    # bm=11 (0xB) — shadow terrain / road
+    2: 0xB, 3: 0xB, 4: 0xB, 5: 0xB, 6: 0xB, 7: 0xB,    # tarmac/Asphalt/Cement
+    8: 0xB, 9: 0xB, 10: 0xB, 11: 0xB, 12: 0xB, 13: 0xB,  # hard/Medium/Soft
+    14: 0xB, 15: 0xB,                                       # derby surfaces
+    16: 0xB, 17: 0xB, 18: 0xB, 19: 0xB,                    # snow/Dirt
+    23: 0xB, 24: 0xB,                                       # grass/forest (dominant)
+    # bm=3 (0x3) — non-shadow objects/walls
+    1: 0x3,                                                  # nocollision
+    20: 0x3, 21: 0x3, 22: 0x3,                              # bridge/curb/bank
+    25: 0x3, 26: 0x3, 27: 0x3,                              # sand/rock/mould
+    31: 0x3, 32: 0x3, 33: 0x3, 34: 0x3,                    # concrete/rock/metal/wood
+    37: 0x3,                                                 # rubber
+    # bm=1 (0x1) — reset/fence
+    35: 0x1,                                                 # tree
+    # bm=6 (0x6) — special
+    38: 0x6,                                                 # water
+}
+
+
+def _get_collision_flags(obj, mat):
+    """Read collision flags from a Blender object.
 
     Returns (surface_id, lo_flags, hi_flags, bitmask).
     hi_flags is None when it must be computed per-triangle from geometry.
     """
-    if mat is None:
+    if obj is None:
         return 27, 4, None, 0x3
 
-    # try custom properties first (set by our importer)
-    sid = mat.get("fo2_surface_id")
-    lo = mat.get("fo2_lo_flags")
-    hi = mat.get("fo2_hi_flags")
-    bm = mat.get("fo2_bitmask")
+    sid = obj.get("fo2_surface_id")
+    lo = obj.get("fo2_lo_flags")
+    hi = obj.get("fo2_hi_flags")
+    bm = obj.get("fo2_bitmask")
 
-    # all four present → full roundtrip, use as-is
     if sid is not None and lo is not None and hi is not None and bm is not None:
         return int(sid), int(lo), int(hi), int(bm)
 
-    # try the original plugin's PropertyGroup (mat.fo2.collision_*)
-    try:
-        fo2 = mat.fo2
-        sid_pg = fo2.collision_surface
-        flags_bv = fo2.collision_flags  # 8-bool vector
-        bm_bv = fo2.collision_bitmask   # 4-bool vector
-        lo_pg = sum((1 << i) for i in range(6) if flags_bv[i])
-        hi_pg = sum((1 << i) for i in range(2) if flags_bv[6 + i])
-        bm_pg = sum((1 << i) for i in range(4) if bm_bv[i])
-        return sid_pg, lo_pg, hi_pg, bm_pg
-    except (AttributeError, TypeError, IndexError):
-        pass
+    # Derive missing bitmask from fo2_has_shadow or surface_id
+    if bm is None:
+        has_shadow = obj.get("fo2_has_shadow")
+        if has_shadow is not None:
+            bm = 0xB if has_shadow else 0x3
+        elif sid is not None:
+            bm = _DEFAULT_BITMASK.get(int(sid), 0x3)
+        else:
+            bm = 0x3
 
-    # partial properties – use what exists, default/compute the rest
     return (
         int(sid) if sid is not None else 27,
         int(lo) if lo is not None else 4,
-        int(hi) if hi is not None else None,   # None → compute per-triangle
-        int(bm) if bm is not None else 0x3,
+        int(hi) if hi is not None else None,
+        int(bm),
     )
 
 
@@ -699,19 +724,32 @@ def _collect_export_triangles(meshes, inv_mult):
     for obj in meshes:
         mdata = cast(bpy.types.Mesh, obj.data)
 
+        # Triangulate only if mesh has non-triangle faces
+        needs_triangulate = any(len(p.vertices) != 3 for p in mdata.polygons)
+        if needs_triangulate:
+            import bmesh as _bmesh
+            bm = _bmesh.new()
+            bm.from_mesh(mdata)
+            _bmesh.ops.triangulate(bm, faces=bm.faces)
+            tri_mesh = bpy.data.meshes.new(".fo2_tmp_triangulate")
+            bm.to_mesh(tri_mesh)
+            bm.free()
+        else:
+            tri_mesh = mdata
+
         # check fo2_has_shadow property to determine shadow UV handling:
         #   true  + UV layer  = read imported UVs (preserve)
         #   true  + no layer  = auto-compute UVs on export
         #   false / missing   = no shadow UVs (stride 3)
         wants_shadow = obj.get("fo2_has_shadow", False)
-        uv_layer = mdata.uv_layers.get("fo2_shadow_uv") if wants_shadow else None
+        uv_layer = tri_mesh.uv_layers.get("fo2_shadow_uv") if wants_shadow else None
 
         # build per-vertex shadow UV lookup from loop data
         vert_shadow = {}  # blender vert index -> (u16, v16) or "skip"
         if wants_shadow and uv_layer:
-            for poly in mdata.polygons:
+            for poly in tri_mesh.polygons:
                 for li in poly.loop_indices:
-                    vi = mdata.loops[li].vertex_index
+                    vi = tri_mesh.loops[li].vertex_index
                     if vi in vert_shadow:
                         continue
                     uv = uv_layer.data[li].uv
@@ -724,21 +762,21 @@ def _collect_export_triangles(meshes, inv_mult):
                         vert_shadow[vi] = (u16, v16)
         elif not wants_shadow:
             # mark all vertices as skip (no shadow for this mesh)
-            for poly in mdata.polygons:
+            for poly in tri_mesh.polygons:
                 for vi in poly.vertices:
                     if vi not in vert_shadow:
                         vert_shadow[vi] = "skip"
 
-        for poly in mdata.polygons:
+        for poly in tri_mesh.polygons:
             if len(poly.vertices) != 3:
                 continue
-            mat = mdata.materials[poly.material_index] if mdata.materials else None
-            sid, lo_flags, hi_flags, bitmask = _get_material_flags(mat)
+            mat = tri_mesh.materials[poly.material_index] if tri_mesh.materials else None
+            sid, lo_flags, hi_flags, bitmask = _get_collision_flags(obj, mat)
 
             sverts = []
             seq_indices = []
             for vi in poly.vertices:
-                wco = obj.matrix_world @ mdata.vertices[vi].co
+                wco = obj.matrix_world @ tri_mesh.vertices[vi].co
                 gco = _z_up_to_y_up(wco)
 
                 # get shadow UV for this vertex
@@ -790,6 +828,16 @@ def _collect_export_triangles(meshes, inv_mult):
                 surface_id=sid, lo_flags=lo_flags, hi_flags=hi_flags, bitmask=bitmask,
                 aabb_min=tuple(min(sv[i] for sv in sverts) for i in range(3)),
                 aabb_max=tuple(max(sv[i] for sv in sverts) for i in range(3))))
+
+        if needs_triangulate:
+            bpy.data.meshes.remove(tri_mesh)
+
+        # Write all computed properties back to object
+        obj["fo2_surface_id"] = sid
+        obj["fo2_lo_flags"] = lo_flags
+        obj["fo2_bitmask"] = bitmask
+        if obj.get("fo2_has_shadow") is None:
+            obj["fo2_has_shadow"] = bool(bitmask & 8)
 
     # auto-compute shadow UVs for vertices from fo2_has_shadow=True meshes that don't already have UVs
     # vertices marked "skip" (from fo2_has_shadow=False or imported sentinel -1,-1 UVs) are never touched
