@@ -1,0 +1,15 @@
+schema_version = "1.0.0"
+
+id = "fo2_bgm_hierarchy"
+version = "1.2.0"
+name = "FlatOut 2 BGM Hierarchy"
+tagline = "Reorganize scene hierarchy for car BGM export"
+maintainer = "ravenDS <https://github.com/RavenDS>"
+type = "add-on"
+
+website = "https://github.com/RavenDS/flatout-blender-tools"
+tags = ["Import-Export"]
+
+blender_version_min = "4.2.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
