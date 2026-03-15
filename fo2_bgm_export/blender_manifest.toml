@@ -1,0 +1,15 @@
+schema_version = "1.0.0"
+
+id = "fo2_bgm_export"
+version = "1.4.0"
+name = "FlatOut 2 Car BGM (Export)"
+tagline = "Export FlatOut 2 Car Model (body.bgm + crash.dat + body.ini + camera.ini)"
+maintainer = "ravenDS <https://github.com/RavenDS>"
+type = "add-on"
+
+website = "https://github.com/RavenDS/flatout-blender-tools"
+tags = ["Import-Export"]
+
+blender_version_min = "4.2.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
