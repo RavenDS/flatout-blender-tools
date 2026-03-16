@@ -1,7 +1,7 @@
 bl_info = {
     "name": "FlatOut 2 BGM Import (Car)",
     "author": "ravenDS",
-    "version": (1, 4, 0),
+    "version": (1, 4, 2),
     "blender": (3, 6, 0),
     "location": "File > Import > FlatOut 2 Car BGM (.bgm)",
     "description": "Import FlatOut 2 BGM car model files",
@@ -685,6 +685,15 @@ def create_blender_material(bgm_mat: BGMMaterial, bgm_dir: str, shared_dir: str,
 
     # store shader metadata as custom properties
     bl_mat["bgm_shader_id"] = bgm_mat.nShaderId
+    # sync the enum property so the panel shows the correct shader immediately
+    try:
+        bl_mat.fo2_shader_id = str(bgm_mat.nShaderId)
+    except Exception:
+        pass
+    try:
+        bl_mat.fo2_texture = tex_name
+    except Exception:
+        pass
     bl_mat["bgm_alpha"] = bgm_mat.nAlpha
     bl_mat["bgm_v92"] = bgm_mat.v92
     bl_mat["bgm_num_textures"] = bgm_mat.nNumTextures
@@ -1912,6 +1921,183 @@ class ImportBGM(bpy.types.Operator, ImportHelper):
         return {'FINISHED'}
 
 
+# SHADER ID PANEL
+
+# SHADER ID PANEL
+
+# SHADER ID PANEL
+
+FO2_SHADER_NAMES = {
+    0:  "Static Prelit",
+    1:  "Terrain",
+    2:  "Terrain Specular",
+    3:  "Dynamic Diffuse",
+    4:  "Dynamic Specular",
+    5:  "Car Body",
+    6:  "Car Window",
+    7:  "Car Diffuse",
+    8:  "Car Metal",
+    9:  "Car Tire",
+    10: "Car Lights",
+    11: "Car Shear",
+    12: "Car Scale",
+    13: "Shadow Project",
+    14: "Car Lights Unlit",
+    15: "Default",
+    16: "Vertex Color",
+    17: "Shadow Sampler",
+    18: "Grass",
+    19: "Tree Trunk",
+    20: "Tree Branch",
+    21: "Tree Leaf",
+    22: "Particle",
+    23: "Sunflare",
+    24: "Intensitymap",
+    25: "Water",
+    26: "Skinning",
+    27: "Tree LOD (Default)",
+    28: "Dummy (PS2 Streak)",
+    29: "Clouds (UV Scroll)",
+    30: "Car Body LOD",
+    31: "Vertex Color Static",
+    32: "Car Window Damaged",
+    33: "Skin Shadow",
+    34: "Reflecting Window (Static)",
+    35: "Reflecting Window (Dynamic)",
+    36: "Deprecated Static Window",
+    37: "Skybox",
+    38: "Ghost Body",
+    39: "Static Nonlit",
+    40: "Dynamic Nonlit",
+    41: "Racemap",
+}
+
+FO2_SHADER_ITEMS = [
+    (str(k), f"{k} – {v}", "")
+    for k, v in sorted(FO2_SHADER_NAMES.items())
+]
+
+
+# shaders that explicitly force alpha on or off regardless of material name
+# none = leave alpha untouched when this shader is selected
+FO2_SHADER_FORCED_ALPHA = {
+    6:  1,    # car window — always alpha
+    9:  1,    # car tire/rim — alpha=1 (rim rule)
+    10: 1,    # car lights — always alpha
+    12: 0,    # car scale — FORCENOALPHA (scaleshock/shearhock)
+    14: 1,    # car lights unlit — same family as lights
+    32: 1,    # car window damaged — same family as window
+    34: 1,    # reflecting window (static)
+    35: 1,    # reflecting window (dynamic)
+    36: 1,    # deprecated static window
+}
+
+
+def _shader_update(self, context):
+    """Write enum selection back to bgm_shader_id.
+    Only update alpha when the shader explicitly forces a value."""
+    sid = int(self.fo2_shader_id)
+    self["bgm_shader_id"] = sid
+    forced = FO2_SHADER_FORCED_ALPHA.get(sid)
+    if forced is not None:
+        self["bgm_alpha"] = forced
+
+
+class FO2_OT_ToggleMatProp(bpy.types.Operator):
+    """Toggle a 0/1 integer custom property on the active material"""
+    bl_idname  = "fo2.toggle_mat_prop"
+    bl_label   = "Toggle FO2 Material Property"
+    bl_options = {'REGISTER', 'UNDO', 'INTERNAL'}
+
+    prop_name: bpy.props.StringProperty()
+
+    def execute(self, context):
+        mat = context.material
+        if mat is None:
+            return {'CANCELLED'}
+        mat[self.prop_name] = 0 if mat.get(self.prop_name, 0) else 1
+        return {'FINISHED'}
+
+
+class FO2_OT_EditMatInt(bpy.types.Operator):
+    """Edit an integer custom property on the active material"""
+    bl_idname  = "fo2.edit_mat_int"
+    bl_label   = "Edit FO2 Material Int Property"
+    bl_options = {'REGISTER', 'UNDO', 'INTERNAL'}
+
+    prop_name: bpy.props.StringProperty()
+    value: bpy.props.IntProperty(name="Value")
+
+    def invoke(self, context, event):
+        mat = context.material
+        if mat is None:
+            return {'CANCELLED'}
+        self.value = int(mat.get(self.prop_name, 0))
+        return context.window_manager.invoke_props_dialog(self)
+
+    def draw(self, context):
+        self.layout.prop(self, "value", text=self.prop_name)
+
+    def execute(self, context):
+        mat = context.material
+        if mat is None:
+            return {'CANCELLED'}
+        mat[self.prop_name] = self.value
+        return {'FINISHED'}
+
+
+def _texture_update(self, context):
+    self["bgm_texture"]   = self.fo2_texture
+    self["bgm_texture_0"] = self.fo2_texture
+
+
+class FO2_PT_ShaderPanel(bpy.types.Panel):
+    """FO2 shader ID panel in Material Properties"""
+    bl_label       = "FO2 Shader"
+    bl_idname      = "MATERIAL_PT_fo2_shader"
+    bl_space_type  = 'PROPERTIES'
+    bl_region_type = 'WINDOW'
+    bl_context     = "material"
+
+    @classmethod
+    def poll(cls, context):
+        return context.material is not None
+
+    def draw(self, context):
+        mat    = context.material
+        layout = self.layout
+
+        layout.prop(mat, "fo2_shader_id", text="Shader")
+        layout.prop(mat, "fo2_texture", text="BGM Texture")
+
+        layout.separator()
+
+        # alpha stored as int 0/1, show as checkbox
+        row = layout.row()
+        row.label(text="Alpha:")
+        alpha_val = bool(mat.get("bgm_alpha", 0))
+        op = row.operator("fo2.toggle_mat_prop", text="", icon='CHECKBOX_HLT' if alpha_val else 'CHECKBOX_DEHLT', emboss=False)
+        op.prop_name = "bgm_alpha"
+
+        # Use Colormap
+        row = layout.row()
+        row.label(text="Use Colormap:")
+        cm_val = bool(mat.get("bgm_use_colormap", 0))
+        op = row.operator("fo2.toggle_mat_prop", text="", icon='CHECKBOX_HLT' if cm_val else 'CHECKBOX_DEHLT', emboss=False)
+        op.prop_name = "bgm_use_colormap"
+
+        layout.separator()
+
+        # v92, v74, v102 — integer fields
+        col = layout.column(align=True)
+        col.label(text="v92:")
+        col.operator("fo2.edit_mat_int", text=str(mat.get("bgm_v92", 0))).prop_name = "bgm_v92"
+        col.label(text="v74:")
+        col.operator("fo2.edit_mat_int", text=str(mat.get("bgm_v74", 0))).prop_name = "bgm_v74"
+        col.label(text="v102:")
+        col.operator("fo2.edit_mat_int", text=str(mat.get("bgm_v102", 0))).prop_name = "bgm_v102"
+
+
 # REGISTRATION
 
 def menu_func_import(self, context):
@@ -1919,6 +2105,20 @@ def menu_func_import(self, context):
 
 
 def register():
+    bpy.types.Material.fo2_shader_id = bpy.props.EnumProperty(
+        name="FO2 Shader",
+        items=FO2_SHADER_ITEMS,
+        default='8',
+        update=_shader_update,
+    )
+    bpy.types.Material.fo2_texture = bpy.props.StringProperty(
+        name="FO2 Texture",
+        default="",
+        update=_texture_update,
+    )
+    bpy.utils.register_class(FO2_OT_ToggleMatProp)
+    bpy.utils.register_class(FO2_OT_EditMatInt)
+    bpy.utils.register_class(FO2_PT_ShaderPanel)
     bpy.utils.register_class(ImportBGM)
     bpy.types.TOPBAR_MT_file_import.append(menu_func_import)
 
@@ -1926,6 +2126,11 @@ def register():
 def unregister():
     bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
     bpy.utils.unregister_class(ImportBGM)
+    bpy.utils.unregister_class(FO2_PT_ShaderPanel)
+    bpy.utils.unregister_class(FO2_OT_EditMatInt)
+    bpy.utils.unregister_class(FO2_OT_ToggleMatProp)
+    del bpy.types.Material.fo2_texture
+    del bpy.types.Material.fo2_shader_id
 
 
 if __name__ == "__main__":
