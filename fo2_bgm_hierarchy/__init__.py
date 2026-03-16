@@ -22,7 +22,7 @@ Two ways to use:
 bl_info = {
     "name": "FlatOut 2 BGM Hierarchy Reorganiser",
     "author": "ravenDS",
-    "version": (1, 2, 2),
+    "version": (1, 2, 3),
     "blender": (3, 6, 0),
     "location": "View3D > Object > FO2: Reorganise",
     "description": "Flatten any scene hierarchy into the layout the BGM exporter expects",
@@ -533,9 +533,7 @@ def do_reorganise_scene():
             obj.data.name = obj.name
 
     # step 12: ensure all BGM custom properties exist on meshes + materials
-    all_mesh_objs = [obj for obj in bpy.data.objects
-                     if obj.type == 'MESH' and obj.parent
-                     and obj.parent in (fo2_body, scene.objects.get("fo2_body_crash"))]
+    all_mesh_objs = [obj for obj in bpy.data.objects if obj.type == 'MESH']
     _sanitize_mesh_and_material_props(all_mesh_objs)
 
     print(f"[FO2 Reorganise] Done: {renamed} objects promoted, "

@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "fo2_bgm_hierarchy"
-version = "1.2.2"
+version = "1.2.3"
 name = "FlatOut 2 BGM Hierarchy"
 tagline = "Reorganize scene hierarchy for car BGM export"
 maintainer = "ravenDS <https://github.com/RavenDS>"
