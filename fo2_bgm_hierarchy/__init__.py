@@ -22,7 +22,7 @@ Two ways to use:
 bl_info = {
     "name": "FlatOut 2 BGM Hierarchy Reorganiser",
     "author": "ravenDS",
-    "version": (2, 0, 0),
+    "version": (1, 2, 2),
     "blender": (3, 6, 0),
     "location": "View3D > Object > FO2: Reorganise",
     "description": "Flatten any scene hierarchy into the layout the BGM exporter expects",
@@ -40,7 +40,184 @@ from bpy.props import StringProperty
 _FLAG_FILE = os.path.join(tempfile.gettempdir(), "fo2_reorganise_pending")
 
 
-# helpers
+# shader / material property helpers (ported from export plugin)
+
+SHADER_CAR_METAL       = 8
+SHADER_CAR_BODY        = 5
+SHADER_CAR_WINDOW      = 6
+SHADER_CAR_DIFFUSE     = 7
+SHADER_CAR_TIRE        = 9
+SHADER_CAR_LIGHTS      = 10
+SHADER_CAR_SHEAR       = 11
+SHADER_CAR_SCALE       = 12
+SHADER_SHADOW_PROJECT  = 13
+SHADER_SKINNING        = 26
+
+
+def _get_texture_name_from_material(bl_mat) -> str:
+    """Extract diffuse texture filename from the node tree."""
+    if not bl_mat or not bl_mat.use_nodes:
+        return ""
+    for node in bl_mat.node_tree.nodes:
+        if node.type == 'TEX_IMAGE' and node.image:
+            fp = (node.image.filepath or "").replace('\\', '/').lstrip('/')
+            name = fp.rsplit('/', 1)[-1] if fp else node.image.name
+            if name:
+                name = re.sub(r'\.\d{3}$', '', name)
+                base, ext = os.path.splitext(name)
+                return base + ('.tga' if ext else '.tga')
+    return ""
+
+
+def _get_shader_for_material(mat_name: str, tex_name: str) -> tuple:
+    """Returns (shader_id, alpha, v92, tex_override)."""
+    name  = mat_name.lower()
+    shader, alpha, v92 = SHADER_CAR_METAL, 0, 0
+    tex_override = None
+
+    if name.startswith("shadow") or name.endswith("shadow"):
+        shader       = SHADER_SHADOW_PROJECT
+        tex_override = "shadow.tga"
+    elif name.startswith("body"):
+        shader       = SHADER_CAR_BODY
+        tex_override = "skin1.tga"
+    elif name.startswith("interior"):
+        shader = SHADER_CAR_DIFFUSE
+    elif name.startswith("grille"):
+        shader, alpha = SHADER_CAR_DIFFUSE, 1
+    elif name.startswith("window"):
+        shader = SHADER_CAR_WINDOW
+    elif name.startswith("shear"):
+        shader = SHADER_CAR_SHEAR
+    elif name.startswith("scaleshock") or name.startswith("shearhock"):
+        shader, alpha = SHADER_CAR_SCALE, 0
+    elif name.startswith("shock") or name.startswith("spring") or name.startswith("scale"):
+        shader = SHADER_CAR_SCALE
+    elif name.startswith("tire"):
+        shader = SHADER_CAR_DIFFUSE
+    elif name.startswith("rim"):
+        shader, alpha = SHADER_CAR_TIRE, 1
+    elif name.startswith("light"):
+        shader, v92 = SHADER_CAR_LIGHTS, 2
+    elif name.startswith("terrain") or name.startswith("groundplane"):
+        shader, alpha = SHADER_CAR_DIFFUSE, 1
+    elif name.startswith("male") or name.startswith("female"):
+        shader = SHADER_SKINNING
+
+    tex_lower = tex_name.lower() if tex_name else ""
+    if tex_lower in ("lights.tga", "windows.tga", "shock.tga"):
+        alpha = 1
+    if name.endswith("_alpha"):
+        alpha = 1
+    if name.endswith("_noalpha"):
+        alpha = 0
+
+    return shader, alpha, v92, tex_override
+
+
+def _sanitize_mesh_and_material_props(mesh_objects):
+    """Ensure all BGM custom properties exist on meshes and their materials."""
+    # mesh object properties
+    for obj in mesh_objects:
+        changed = False
+        if "bgm_flags" not in obj or obj["bgm_flags"] is None:
+            obj["bgm_flags"] = 0;  changed = True
+        if "bgm_group" not in obj or obj["bgm_group"] is None:
+            obj["bgm_group"] = -1; changed = True
+        if "bgm_name2" not in obj:
+            if not obj.name.endswith("_crash"):
+                obj["bgm_name2"] = "";  changed = True
+        elif obj.name.endswith("_crash"):
+            del obj["bgm_name2"]
+            changed = True
+        obj["bgm_is_crash"] = obj.name.endswith("_crash")
+        if changed:
+            obj.update_tag()
+
+    # material properties
+    used_shader_ids = set()
+    for obj in mesh_objects:
+        for slot in obj.material_slots:
+            if slot.material and "bgm_shader_id" in slot.material:
+                try:
+                    used_shader_ids.add(int(slot.material["bgm_shader_id"]))
+                except (TypeError, ValueError):
+                    pass
+
+    def _next_unused_shader_id():
+        sid = 0
+        while sid in used_shader_ids:
+            sid += 1
+        used_shader_ids.add(sid)
+        return sid
+
+    seen = set()
+    for obj in mesh_objects:
+        for slot in obj.material_slots:
+            bl_mat = slot.material
+            if not bl_mat or id(bl_mat) in seen:
+                continue
+            seen.add(id(bl_mat))
+
+            tex_name = bl_mat.get("bgm_texture", "") or _get_texture_name_from_material(bl_mat)
+            if tex_name:
+                base, ext = os.path.splitext(tex_name)
+                if ext.lower() != '.tga':
+                    tex_name = base + '.tga'
+            else:
+                tex_name = re.sub(r'\.\d{3}$', '', bl_mat.name) + '.tga'
+
+            changed = False
+
+            if "bgm_alpha" not in bl_mat:
+                bl_mat["bgm_alpha"] = 0; changed = True
+            if "bgm_num_textures" not in bl_mat:
+                bl_mat["bgm_num_textures"] = 1; changed = True
+            if "bgm_shader_id" not in bl_mat:
+                shader_id, alpha, v92, tex_override = _get_shader_for_material(
+                    re.sub(r'\.\d{3}$', '', bl_mat.name), tex_name)
+                if tex_override:
+                    tex_name = tex_override
+                bl_mat["bgm_shader_id"] = shader_id
+                bl_mat["bgm_alpha"]     = alpha
+                bl_mat["bgm_v92"]       = v92
+                used_shader_ids.add(shader_id)
+                changed = True
+            else:
+                try:
+                    used_shader_ids.add(int(bl_mat["bgm_shader_id"]))
+                except (TypeError, ValueError):
+                    pass
+
+            if "bgm_texture" not in bl_mat:
+                bl_mat["bgm_texture"] = tex_name;   changed = True
+            if "bgm_texture_0" not in bl_mat:
+                bl_mat["bgm_texture_0"] = tex_name; changed = True
+            if "bgm_texture_1" not in bl_mat:
+                bl_mat["bgm_texture_1"] = "";       changed = True
+            if "bgm_texture_2" not in bl_mat:
+                bl_mat["bgm_texture_2"] = "";       changed = True
+            if "bgm_use_colormap" not in bl_mat:
+                bl_mat["bgm_use_colormap"] = 0;     changed = True
+            if "bgm_v102" not in bl_mat:
+                bl_mat["bgm_v102"] = 0;             changed = True
+            if "bgm_v74" not in bl_mat:
+                bl_mat["bgm_v74"] = 0;              changed = True
+            if "bgm_v92" not in bl_mat:
+                bl_mat["bgm_v92"] = 0;              changed = True
+
+            if changed:
+                print(f"[FO2 Reorganise] Initialised BGM props on material: {bl_mat.name}")
+
+            # Sync RNA properties AFTER all custom props are written
+            try:
+                bl_mat.fo2_shader_id = str(int(bl_mat.get("bgm_shader_id", 8)))
+            except Exception:
+                pass
+            try:
+                bl_mat.fo2_texture = str(bl_mat.get("bgm_texture", ""))
+            except Exception:
+                pass
 
 def depth_of(obj):
     d, p = 0, obj.parent
@@ -354,6 +531,12 @@ def do_reorganise_scene():
     for obj in bpy.data.objects:
         if obj.type == 'MESH' and obj.parent and obj.parent.type == 'EMPTY':
             obj.data.name = obj.name
+
+    # step 12: ensure all BGM custom properties exist on meshes + materials
+    all_mesh_objs = [obj for obj in bpy.data.objects
+                     if obj.type == 'MESH' and obj.parent
+                     and obj.parent in (fo2_body, scene.objects.get("fo2_body_crash"))]
+    _sanitize_mesh_and_material_props(all_mesh_objs)
 
     print(f"[FO2 Reorganise] Done: {renamed} objects promoted, "
           f"{removed} containers removed")
