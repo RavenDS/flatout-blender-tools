@@ -1,7 +1,7 @@
 bl_info = {
     "name":        "FlatOut 2 BGM Export (Car)",
     "author":      "ravenDS",
-    "version":     (1, 4, 1),
+    "version":     (1, 4, 2),
     "blender":     (3, 6, 0),
     "location":    "File > Export > FlatOut 2 BGM Car (.bgm)",
     "description": "Export FlatOut 2 car model (BGM) files. Based on reverse-egineering work by Chloe (FlatOutW32BGMTool)",
@@ -436,7 +436,8 @@ def invert_4x4(m):
 
 def build_buffers_for_material(obj, mat_index, flags, vertex_size,
                                inv_scale, buf_id_start,
-                               fo2_mesh_matrix_inv=None):
+                               fo2_mesh_matrix_inv=None,
+                               mesh_override=None):
     """Build a vertex buffer and index buffer for all faces of `mat_index` on the given Blender mesh object.
 
     If fo2_mesh_matrix_inv is provided (4x4 list-of-lists), positions and 
@@ -444,7 +445,7 @@ def build_buffers_for_material(obj, mat_index, flags, vertex_size,
 
     Returns (FO2VertexBuffer, FO2IndexBuffer, vertex_count, poly_count) or None if no faces.
     """
-    mesh = obj.data
+    mesh = mesh_override if mesh_override is not None else obj.data
     mat_world = obj.matrix_world
 
     has_normal = (flags & VERTEX_NORMAL) != 0
@@ -547,7 +548,7 @@ def build_buffers_for_material(obj, mat_index, flags, vertex_size,
 
             if key not in vert_map:
                 vert_map[key] = len(unique_verts)
-                unique_verts.append((fo2_pos, fo2_nrm, fo2_uv, fo2_color))
+                unique_verts.append((fo2_pos, fo2_nrm, fo2_uv, fo2_color, vi))
 
             face_indices.append(vert_map[key])
 
@@ -567,7 +568,9 @@ def build_buffers_for_material(obj, mat_index, flags, vertex_size,
 
     # pack vertex data
     vdata = bytearray()
-    for pos, nrm, uv, color in unique_verts:
+    blender_vis = []  # blender vertex index for each unique vertex
+    for pos, nrm, uv, color, bvi in unique_verts:
+        blender_vis.append(bvi)
         # position (3 floats, always present)
         vdata += struct.pack('<3f', *pos)
         # normal (3 floats)
@@ -589,7 +592,7 @@ def build_buffers_for_material(obj, mat_index, flags, vertex_size,
                            vertex_count, bytes(vdata))
     ibuf = FO2IndexBuffer(buf_id_start + 1, len(indices), bytes(idata))
 
-    return vbuf, ibuf, vertex_count, poly_count
+    return vbuf, ibuf, vertex_count, poly_count, blender_vis
 
 
 # BUILD FO2 MATERIAL FROM BLENDER MATERIAL
@@ -772,10 +775,10 @@ def write_crash_dat(filepath: str, crash_data: list):
                 for i in range(vcount):
                     off = i * vsize
                     # positions are first 3 floats (offset 0)
-                    base_pos = base_vdata[off:off + 12]
+                    base_pos  = base_vdata[off:off + 12]
                     crash_pos = crash_vdata[off:off + 12]
                     # normals are next 3 floats (offset 12)
-                    base_nrm = base_vdata[off + 12:off + 24]
+                    base_nrm  = base_vdata[off + 12:off + 24]
                     crash_nrm = crash_vdata[off + 12:off + 24]
                     f.write(base_pos)
                     f.write(crash_pos)
@@ -954,18 +957,14 @@ def write_bgm(filepath: str, context, options: dict):
     temp_meshes = []  # track temp meshes for cleanup
 
     for obj in mesh_objects:
-        # triangulate if needed
+        # triangulate if needed — produce a temp mesh, never swap obj.data
         if auto_triangulate:
             work_mesh, is_temp = triangulate_mesh(obj)
         else:
             work_mesh, is_temp = obj.data, False
         if is_temp:
             temp_meshes.append(work_mesh)
-            # temporarily swap mesh data
-            orig_mesh = obj.data
-            obj.data = work_mesh
-        else:
-            orig_mesh = None
+        orig_mesh = None  # unused now, kept for cleanup compat
 
         # ensure split normals (removed in Blender 4.1+)
         if hasattr(work_mesh, 'calc_normals_split'):
@@ -1041,11 +1040,12 @@ def write_bgm(filepath: str, context, options: dict):
 
             result = build_buffers_for_material(
                 obj, mat_idx, flags, vsize, inv_scale, stream_id_counter,
-                fo2_mesh_matrix_inv=fo2_mesh_matrix_inv)
+                fo2_mesh_matrix_inv=fo2_mesh_matrix_inv,
+                mesh_override=work_mesh)
             if not result:
                 continue
 
-            vbuf, ibuf, vert_count, poly_count = result
+            vbuf, ibuf, vert_count, poly_count, blender_vis = result
 
             # create surface
             surface = FO2Surface()
@@ -1073,7 +1073,7 @@ def write_bgm(filepath: str, context, options: dict):
             fo2_surfaces.append(surface)
             fo2_vbufs.append(vbuf)
             fo2_ibufs.append(ibuf)
-            surface_build_info.append((mat_idx, flags, vsize, vbuf.data, vert_count))
+            surface_build_info.append((mat_idx, flags, vsize, vbuf.data, vert_count, blender_vis))
             stream_id_counter += 2
 
         # finalize model AABB
@@ -1100,61 +1100,39 @@ def write_bgm(filepath: str, context, options: dict):
                     crash_work_mesh, crash_is_temp = crash_obj.data, False
                 if crash_is_temp:
                     temp_meshes.append(crash_work_mesh)
-                    crash_orig_mesh = crash_obj.data
-                    crash_obj.data = crash_work_mesh
-                else:
-                    crash_orig_mesh = None
 
-                if hasattr(crash_work_mesh, 'calc_normals_split'):
-                    crash_work_mesh.calc_normals_split()
+                crash_mat_world = crash_obj.matrix_world
+                crash_verts = crash_work_mesh.vertices
 
                 crash_surfaces = []
-                for base_mat_idx, flags, vsize, base_vdata, base_vcount in surface_build_info:
-                    # find matching material slot in crash mesh
-                    base_bl_mat = obj.material_slots[base_mat_idx].material
-                    crash_mat_idx = -1
-                    for ci, cs in enumerate(crash_obj.material_slots):
-                        if cs.material == base_bl_mat:
-                            crash_mat_idx = ci
-                            break
-                    if crash_mat_idx < 0:
-                        # try matching by name (material might be duplicated)
-                        mat_base_name = re.sub(r'\.\d{3}$', '', base_bl_mat.name)
-                        for ci, cs in enumerate(crash_obj.material_slots):
-                            if cs.material and re.sub(r'\.\d{3}$', '', cs.material.name) == mat_base_name:
-                                crash_mat_idx = ci
-                                break
-                    if crash_mat_idx < 0:
-                        # no matching materialn use base data as crash (no damage)
-                        crash_surfaces.append((base_vdata, base_vdata, vsize, base_vcount))
-                        continue
+                for base_mat_idx, flags, vsize, base_vdata, base_vcount, blender_vis in surface_build_info:
+                    has_normal = bool(flags & VERTEX_NORMAL)
+                    crash_vdata = bytearray(base_vdata)  # start with base (preserves UVs/colors)
 
-                    # build crash vertex buffer (discards index buffer)
-                    crash_result = build_buffers_for_material(
-                        crash_obj, crash_mat_idx, flags, vsize,
-                        inv_scale, 99999,  # dummy stream ID, won't be stored
-                        fo2_mesh_matrix_inv=fo2_mesh_matrix_inv)
+                    for buf_idx, bvi in enumerate(blender_vis):
+                        off = buf_idx * vsize
+                        # position from crash mesh vertex
+                        if bvi < len(crash_verts):
+                            world_co = crash_mat_world @ crash_verts[bvi].co
+                        else:
+                            # topology mismatch — keep base position
+                            world_co = obj.matrix_world @ work_mesh.vertices[bvi].co
+                        crash_pos = blender_to_fo2_pos(world_co, inv_scale)
+                        if fo2_mesh_matrix_inv:
+                            M = fo2_mesh_matrix_inv
+                            px, py, pz = crash_pos
+                            crash_pos = (
+                                M[0][0]*px + M[0][1]*py + M[0][2]*pz + M[0][3],
+                                M[1][0]*px + M[1][1]*py + M[1][2]*pz + M[1][3],
+                                M[2][0]*px + M[2][1]*py + M[2][2]*pz + M[2][3],
+                            )
+                        struct.pack_into('<3f', crash_vdata, off, *crash_pos)
+                        # normal: keep base normal (crash normals aren't used by the engine)
 
-                    if not crash_result:
-                        crash_surfaces.append((base_vdata, base_vdata, vsize, base_vcount))
-                        continue
-
-                    crash_vbuf, _, crash_vcount, _ = crash_result
-
-                    if crash_vcount != base_vcount:
-                        print(f"[crash.dat] WARNING: vertex count mismatch for "
-                              f"{model_name} mat {base_mat_idx}: "
-                              f"base={base_vcount} crash={crash_vcount}, "
-                              f"using base data for both")
-                        crash_surfaces.append((base_vdata, base_vdata, vsize, base_vcount))
-                    else:
-                        crash_surfaces.append((base_vdata, crash_vbuf.data, vsize, base_vcount))
+                    crash_surfaces.append((base_vdata, bytes(crash_vdata), vsize, base_vcount))
 
                 if crash_surfaces:
                     all_crash_data.append((model_name, crash_surfaces))
-
-                if crash_orig_mesh is not None:
-                    crash_obj.data = crash_orig_mesh
 
             # build compact mesh
             cm = FO2CompactMesh()
@@ -1176,10 +1154,6 @@ def write_bgm(filepath: str, context, options: dict):
 
             fo2_models.append(model)
             fo2_compact_meshes.append(cm)
-
-        # restore original mesh if we triangulated
-        if orig_mesh is not None:
-            obj.data = orig_mesh
 
     # cleanup temp meshes
     for tm in temp_meshes:
@@ -1271,7 +1245,10 @@ def write_bgm(filepath: str, context, options: dict):
     # write crash.dat if crash data was collected
     if all_crash_data:
         bgm_base = os.path.splitext(filepath)[0]
-        crash_dat_path = bgm_base + "_crash.dat"
+        if options.get('overwrite_crash_dat', False):
+            crash_dat_path = os.path.join(os.path.dirname(filepath), "crash.dat")
+        else:
+            crash_dat_path = bgm_base + "_crash.dat"
         write_crash_dat(crash_dat_path, all_crash_data)
 
     # convert TGAs to DDS if requested
@@ -1639,6 +1616,14 @@ class ExportBGM(bpy.types.Operator, ExportHelper):
                     "fo2_collision_full / bottom / top empties in the scene",
     )
 
+    # crash dat
+    overwrite_crash_dat: BoolProperty(
+        name="Overwrite crash.dat",
+        default=False,
+        description="Write crash data to crash.dat in the same folder, "
+                    "overwriting any existing file",
+    )
+
     # cameras
     export_camera_ini: BoolProperty(
         name="Export Cameras (camera.ini)",
@@ -1677,6 +1662,7 @@ class ExportBGM(bpy.types.Operator, ExportHelper):
         box = layout.box()
         box.label(text="Collision", icon='MOD_WIREFRAME')
         box.prop(self, "export_body_ini")
+        box.prop(self, "overwrite_crash_dat")
 
         # cameras
         box = layout.box()
@@ -1692,6 +1678,7 @@ class ExportBGM(bpy.types.Operator, ExportHelper):
             'dds_format': self.dds_format,
             'delete_tgas': self.delete_tgas,
             'export_body_ini': self.export_body_ini,
+            'overwrite_crash_dat': self.overwrite_crash_dat,
             'export_camera_ini': self.export_camera_ini,
         }
         result = write_bgm(self.filepath, context, options)
