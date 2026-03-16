@@ -1646,6 +1646,7 @@ class ExportBGM(bpy.types.Operator, ExportHelper):
         box.label(text="Options", icon='PREFERENCES')
         box.prop(self, "use_priorities")
         box.prop(self, "auto_triangulate")
+        box.prop(self, "overwrite_crash_dat")
 
         # texture conversion
         box = layout.box()
@@ -1662,7 +1663,6 @@ class ExportBGM(bpy.types.Operator, ExportHelper):
         box = layout.box()
         box.label(text="Collision", icon='MOD_WIREFRAME')
         box.prop(self, "export_body_ini")
-        box.prop(self, "overwrite_crash_dat")
 
         # cameras
         box = layout.box()
