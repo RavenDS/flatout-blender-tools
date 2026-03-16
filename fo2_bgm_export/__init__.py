@@ -1,7 +1,7 @@
 bl_info = {
     "name":        "FlatOut 2 BGM Export (Car)",
     "author":      "ravenDS",
-    "version":     (1, 4, 0),
+    "version":     (1, 4, 1),
     "blender":     (3, 6, 0),
     "location":    "File > Export > FlatOut 2 BGM Car (.bgm)",
     "description": "Export FlatOut 2 car model (BGM) files. Based on reverse-egineering work by Chloe (FlatOutW32BGMTool)",
@@ -92,7 +92,9 @@ def get_shader_for_material(mat_name: str, tex_name: str) -> tuple:
     tex_override = None
 
     # name-prefix rules (order matters, first match wins)
-    if name.startswith("body"):
+    if name.startswith("shadow") or name.endswith("shadow"):
+        shader = SHADER_SHADOW_PROJECT
+    elif name.startswith("body"):
         shader = SHADER_CAR_BODY
         tex_override = "skin1.tga"
     elif name.startswith("interior"):
@@ -100,8 +102,6 @@ def get_shader_for_material(mat_name: str, tex_name: str) -> tuple:
     elif name.startswith("grille"):
         shader = SHADER_CAR_DIFFUSE
         alpha = 1
-    elif name.startswith("shadow"):
-        shader = SHADER_SHADOW_PROJECT
     elif name.startswith("window"):
         shader = SHADER_CAR_WINDOW
     elif name.startswith("shear"):
@@ -146,7 +146,7 @@ def get_vertex_format(shader_id: int) -> tuple:
 
     FO2 BGM vertex layouts:
       body/skinning:  pos(12) + normal(12) + color(4) + uv(8)  = 36  flags 0x152
-      shadow:         pos(12)                                   = 12  flags 0x002
+      shadow:         pos(12)                                  = 12  flags 0x002
       everything else: pos(12) + normal(12) + uv(8)            = 32  flags 0x112
     """
     if shader_id in (SHADER_CAR_BODY, SHADER_SKINNING):
@@ -162,7 +162,7 @@ def get_vertex_format(shader_id: int) -> tuple:
 # COORDINATE TRANSFORMS
 #
 # Blender -> FO2:  fo2 = (bl_x, bl_z, bl_y)
-#(car front faces Blender +Y. FO2 Y<->Z swap, no negations.)
+# (car front faces Blender +Y. FO2 Y<->Z swap, no negations.)
 
 def blender_to_fo2_pos(co, inv_scale: float = 1.0):
     """Convert a Blender world position to FO2 vertex position.
@@ -607,7 +607,13 @@ def build_fo2_material(bl_mat) -> FO2Material:
     tex_name = bl_mat.get("bgm_texture", "") or get_texture_name_from_material(bl_mat)
 
     # check for stored custom properties from the importer first
-    if "bgm_shader_id" in bl_mat and "bgm_alpha" in bl_mat:
+    # only use them if bgm_shader_id is actually set to a non-empty value
+    has_stored_shader = (
+        "bgm_shader_id" in bl_mat
+        and bl_mat["bgm_shader_id"] is not None
+        and str(bl_mat["bgm_shader_id"]).strip() != ""
+    )
+    if has_stored_shader and "bgm_alpha" in bl_mat:
         mat.shader_id = int(bl_mat["bgm_shader_id"])
         mat.alpha = int(bl_mat["bgm_alpha"])
         # Preserve v92 if stored
@@ -784,6 +790,7 @@ def write_bgm(filepath: str, context, options: dict):
     global_scale = options.get('global_scale', 1.0)
     inv_scale = 1.0 / global_scale if global_scale != 0 else 1.0
     use_priorities = options.get('use_priorities', True)
+    auto_triangulate = options.get('auto_triangulate', True)
 
     root = find_root_empty(context)
     mesh_objects, empty_objects = collect_objects_under(root, context)
@@ -948,7 +955,10 @@ def write_bgm(filepath: str, context, options: dict):
 
     for obj in mesh_objects:
         # triangulate if needed
-        work_mesh, is_temp = triangulate_mesh(obj)
+        if auto_triangulate:
+            work_mesh, is_temp = triangulate_mesh(obj)
+        else:
+            work_mesh, is_temp = obj.data, False
         if is_temp:
             temp_meshes.append(work_mesh)
             # temporarily swap mesh data
@@ -1084,7 +1094,10 @@ def write_bgm(filepath: str, context, options: dict):
             model_name = re.sub(r'\.\d{3}$', '', obj.name)
             crash_obj = crash_mesh_map.get(model_name)
             if crash_obj and surface_build_info:
-                crash_work_mesh, crash_is_temp = triangulate_mesh(crash_obj)
+                if auto_triangulate:
+                    crash_work_mesh, crash_is_temp = triangulate_mesh(crash_obj)
+                else:
+                    crash_work_mesh, crash_is_temp = crash_obj.data, False
                 if crash_is_temp:
                     temp_meshes.append(crash_work_mesh)
                     crash_orig_mesh = crash_obj.data
@@ -1589,6 +1602,12 @@ class ExportBGM(bpy.types.Operator, ExportHelper):
                     "(lights drawn after body, etc.)",
         default=True,
     )
+    auto_triangulate: BoolProperty(
+        name="Auto-Triangulate Meshes",
+        description="Automatically triangulate any mesh with quads or n-gons before "
+                    "export. The original mesh is not modified",
+        default=True,
+    )
 
     # texture conversion
     convert_tga_to_dds: BoolProperty(
@@ -1641,6 +1660,7 @@ class ExportBGM(bpy.types.Operator, ExportHelper):
         box = layout.box()
         box.label(text="Options", icon='PREFERENCES')
         box.prop(self, "use_priorities")
+        box.prop(self, "auto_triangulate")
 
         # texture conversion
         box = layout.box()
@@ -1667,6 +1687,7 @@ class ExportBGM(bpy.types.Operator, ExportHelper):
         options = {
             'global_scale': self.global_scale,
             'use_priorities': self.use_priorities,
+            'auto_triangulate': self.auto_triangulate,
             'convert_tga_to_dds': self.convert_tga_to_dds,
             'dds_format': self.dds_format,
             'delete_tgas': self.delete_tgas,
