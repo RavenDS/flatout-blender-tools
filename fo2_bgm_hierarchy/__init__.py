@@ -350,25 +350,10 @@ def do_reorganise_scene():
             if child.type == 'MESH' and child.data and clean_data:
                 child.data.name = clean_data
 
-    # step 11: rename mesh objects to match their parent empty's name (this is broken somehow)
-    crash_root = scene.objects.get("fo2_body_crash")
-    renamed_meshes = 0
-    for obj in list(bpy.data.objects):
-        if obj.type != 'MESH':
-            continue
-        p = obj.parent
-        if p is None:
-            continue
-        pp = p.parent
-        if pp != fo2_body and pp != crash_root:
-            continue
-        target = p.name
-        print(f"[FO2 Reorganise] Renaming mesh '{obj.name}' → '{target}'")
-        obj.name = target
-        if obj.data:
-            obj.data.name = target
-        renamed_meshes += 1
-    print(f"[FO2 Reorganise] Renamed {renamed_meshes} mesh objects")
+    # step 11: rename mesh data to match their object name
+    for obj in bpy.data.objects:
+        if obj.type == 'MESH' and obj.parent and obj.parent.type == 'EMPTY':
+            obj.data.name = obj.name
 
     print(f"[FO2 Reorganise] Done: {renamed} objects promoted, "
           f"{removed} containers removed")
@@ -482,6 +467,10 @@ class FO2_OT_ReorganiseCurrentScene(bpy.types.Operator):
 
 
 # Registration
+
+def menu_func_import(self, context):
+    self.layout.operator(FO2_OT_ReorganiseBGM.bl_idname,
+                         text="FO2 Reorganise BGM Hierarchy (.blend)")
 
 def menu_func_object(self, context):
     self.layout.operator(FO2_OT_ReorganiseCurrentScene.bl_idname)
