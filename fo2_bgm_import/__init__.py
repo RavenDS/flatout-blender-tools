@@ -1,7 +1,7 @@
 bl_info = {
     "name": "FlatOut 2 BGM Import (Car)",
     "author": "ravenDS",
-    "version": (1, 4, 2),
+    "version": (1, 4, 3),
     "blender": (3, 6, 0),
     "location": "File > Import > FlatOut 2 Car BGM (.bgm)",
     "description": "Import FlatOut 2 BGM car model files",
@@ -1609,19 +1609,34 @@ def parse_camera_ini(filepath: str) -> list:
                     cam.fov = v
                 break
 
-        # TrackerData (flat block, no sub-indices)
-        m = _re.search(r'TrackerData\s*=\s*\{([^}]*)\}', block, _re.DOTALL)
+        # TrackerData — manually extract the block content using brace counting
+        # (can't use [^}] because Stiffness contains inner braces)
+        m = _re.search(r'TrackerData\s*=\s*\{', block)
         if m:
-            td = m.group(1)
-            sv = first_vec3_in(td, 'Stiffness')
-            if sv:
-                cam.tracker_stiffness = sv
-            gv = first_float_in(td, 'MinGround')
-            if gv is not None:
-                cam.tracker_min_ground = gv
-            cv = first_float_in(td, 'ClampGround')
-            if cv is not None:
-                cam.tracker_clamp_ground = cv
+            depth = 0
+            start = m.end() - 1
+            i = start
+            while i < len(block):
+                if block[i] == '{':
+                    depth += 1
+                elif block[i] == '}':
+                    depth -= 1
+                    if depth == 0:
+                        td = block[start + 1 : i]
+                        break
+                i += 1
+            else:
+                td = ""
+            if td:
+                sv = first_vec3_in(td, 'Stiffness')
+                if sv:
+                    cam.tracker_stiffness = sv
+                gv = first_float_in(td, 'MinGround')
+                if gv is not None:
+                    cam.tracker_min_ground = gv
+                cv = first_float_in(td, 'ClampGround')
+                if cv is not None:
+                    cam.tracker_clamp_ground = cv
 
         entries.append(cam)
 
