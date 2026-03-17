@@ -1,7 +1,7 @@
 bl_info = {
     "name":        "FlatOut 2 BGM Export (Car)",
     "author":      "ravenDS",
-    "version":     (1, 4, 2),
+    "version":     (1, 4, 3),
     "blender":     (3, 6, 0),
     "location":    "File > Export > FlatOut 2 BGM Car (.bgm)",
     "description": "Export FlatOut 2 car model (BGM) files. Based on reverse-egineering work by Chloe (FlatOutW32BGMTool)",
@@ -548,7 +548,7 @@ def build_buffers_for_material(obj, mat_index, flags, vertex_size,
 
             if key not in vert_map:
                 vert_map[key] = len(unique_verts)
-                unique_verts.append((fo2_pos, fo2_nrm, fo2_uv, fo2_color, vi))
+                unique_verts.append((fo2_pos, fo2_nrm, fo2_uv, fo2_color, vi, loop_idx))
 
             face_indices.append(vert_map[key])
 
@@ -568,9 +568,9 @@ def build_buffers_for_material(obj, mat_index, flags, vertex_size,
 
     # pack vertex data
     vdata = bytearray()
-    blender_vis = []  # blender vertex index for each unique vertex
-    for pos, nrm, uv, color, bvi in unique_verts:
-        blender_vis.append(bvi)
+    blender_vis = []  # (bvi, loop_idx) for each unique vertex
+    for pos, nrm, uv, color, bvi, loop_idx in unique_verts:
+        blender_vis.append((bvi, loop_idx))
         # position (3 floats, always present)
         vdata += struct.pack('<3f', *pos)
         # normal (3 floats)
@@ -1103,20 +1103,36 @@ def write_bgm(filepath: str, context, options: dict):
 
                 crash_mat_world = crash_obj.matrix_world
                 crash_verts = crash_work_mesh.vertices
+                crash_loops = crash_work_mesh.loops
+                crash_loop_count = len(crash_loops)
+                base_loop_count  = len(work_mesh.loops)
+
+                # determine lookup strategy:
+                # 1. loop_idx in range -> crash was built from same topology, use loop vertex
+                # 2. bvi in range (same vert count) -> same vertex ordering, direct index
+                # 3. fallback -> keep base position (no crash deformation)
+
+                same_loop_count = (crash_loop_count == base_loop_count)
+                same_vert_count = (len(crash_verts) == len(work_mesh.vertices))
 
                 crash_surfaces = []
                 for base_mat_idx, flags, vsize, base_vdata, base_vcount, blender_vis in surface_build_info:
-                    has_normal = bool(flags & VERTEX_NORMAL)
-                    crash_vdata = bytearray(base_vdata)  # start with base (preserves UVs/colors)
+                    crash_vdata = bytearray(base_vdata)
 
-                    for buf_idx, bvi in enumerate(blender_vis):
+                    for buf_idx, (bvi, loop_idx) in enumerate(blender_vis):
                         off = buf_idx * vsize
-                        # position from crash mesh vertex
-                        if bvi < len(crash_verts):
+
+                        if same_loop_count and loop_idx < crash_loop_count:
+                            # primary: use the crash vertex at the same loop position
+                            crash_vi = crash_loops[loop_idx].vertex_index
+                            world_co = crash_mat_world @ crash_verts[crash_vi].co
+                        elif same_vert_count:
+                            # fallback: same vertex count, assume same ordering
                             world_co = crash_mat_world @ crash_verts[bvi].co
                         else:
-                            # topology mismatch — keep base position
+                            # no correspondence — keep base position
                             world_co = obj.matrix_world @ work_mesh.vertices[bvi].co
+
                         crash_pos = blender_to_fo2_pos(world_co, inv_scale)
                         if fo2_mesh_matrix_inv:
                             M = fo2_mesh_matrix_inv
@@ -1127,7 +1143,6 @@ def write_bgm(filepath: str, context, options: dict):
                                 M[2][0]*px + M[2][1]*py + M[2][2]*pz + M[2][3],
                             )
                         struct.pack_into('<3f', crash_vdata, off, *crash_pos)
-                        # normal: keep base normal (crash normals aren't used by the engine)
 
                     crash_surfaces.append((base_vdata, bytes(crash_vdata), vsize, base_vcount))
 
