@@ -1,7 +1,7 @@
 bl_info = {
     "name": "FlatOut 2 BGM Import (Car)",
     "author": "ravenDS",
-    "version": (1, 4, 3),
+    "version": (1, 5, 0),
     "blender": (3, 6, 0),
     "location": "File > Import > FlatOut 2 Car BGM (.bgm)",
     "description": "Import FlatOut 2 BGM car model files",
@@ -38,6 +38,9 @@ VERTEX_COLOR    = 0x040
 VERTEX_UV       = 0x100
 VERTEX_UV2      = 0x200
 VERTEX_INT16    = 0x2000
+
+FOUC_VERTEX_FLAGS = 0x2242
+FOUC_VERTEX_SCALE = 1.0 / 1024.0  # int16 * this = metres
 
 
 @dataclass
@@ -92,6 +95,7 @@ class Surface:
     num_streams_used: int = 0
     stream_id: list = field(default_factory=lambda: [0, 0])
     stream_offset: list = field(default_factory=lambda: [0, 0])
+    fouc_vertex_multiplier: list = field(default_factory=lambda: [0.0, 0.0, 0.0, FOUC_VERTEX_SCALE])
 
 
 @dataclass
@@ -150,8 +154,8 @@ class CrashNode:
     surfaces: list = field(default_factory=list)  # list[CrashSurface]
 
 
-def parse_crash_dat(filepath: str) -> list:
-    """Parse a FO2 crash.dat file. Returns list of CrashNode."""
+def parse_crash_dat(filepath: str, is_fouc: bool = False) -> list:
+    """Parse a FO2 or FOUC crash.dat file. Returns list of CrashNode."""
     nodes = []
     try:
         with open(filepath, 'rb') as f:
@@ -170,26 +174,51 @@ def parse_crash_dat(filepath: str) -> list:
         for j in range(num_surfaces):
             surf = CrashSurface()
             num_verts = struct.unpack_from('<I', r.read(4), 0)[0]
-            num_verts_bytes = struct.unpack_from('<I', r.read(4), 0)[0]
             surf.vertex_count = num_verts
-            surf.vertex_size = num_verts_bytes // num_verts if num_verts > 0 else 0
-            surf.vertex_data = r.read(num_verts_bytes)
 
-            # read crash weights: 12 floats per vertex
-            surf.weights = []
-            for k in range(num_verts):
-                raw = struct.unpack_from('<12f', r.read(48), 0)
-                w = CrashWeight(
-                    base_pos=raw[0:3],
-                    crash_pos=raw[3:6],
-                    base_normal=raw[6:9],
-                    crash_normal=raw[9:12],
-                )
-                surf.weights.append(w)
+            if is_fouc:
+                # FOUC: no vbuffer, weights are tCrashDataWeightsFOUC (40 bytes each)
+                # int16[3] basePos, int16[3] crashPos,
+                # uint8[4] baseUnkBump1, uint8[4] crashUnkBump1,
+                # uint8[4] baseUnkBump2, uint8[4] crashUnkBump2,
+                # uint8[4] baseNormals, uint8[4] crashNormals,
+                # uint16[2] baseUV
+                surf.vertex_size = 0
+                surf.vertex_data = b''
+                surf.weights = []
+                SCALE = FOUC_VERTEX_SCALE
+                for k in range(num_verts):
+                    raw = r.read(40)
+                    bp = struct.unpack_from('<3h', raw, 0)
+                    cp = struct.unpack_from('<3h', raw, 6)
+                    bn = struct.unpack_from('<4B', raw, 28)
+                    cn = struct.unpack_from('<4B', raw, 32)
+                    w = CrashWeight(
+                        base_pos=(bp[0]*SCALE, bp[1]*SCALE, bp[2]*SCALE),
+                        crash_pos=(cp[0]*SCALE, cp[1]*SCALE, cp[2]*SCALE),
+                        base_normal=((bn[0]-128)/128.0, (bn[1]-128)/128.0, (bn[2]-128)/128.0),
+                        crash_normal=((cn[0]-128)/128.0, (cn[1]-128)/128.0, (cn[2]-128)/128.0),
+                    )
+                    surf.weights.append(w)
+            else:
+                # FO2: vcount, vbytes, vbuffer, then 48-byte weights
+                num_verts_bytes = struct.unpack_from('<I', r.read(4), 0)[0]
+                surf.vertex_size = num_verts_bytes // num_verts if num_verts > 0 else 0
+                surf.vertex_data = r.read(num_verts_bytes)
+                surf.weights = []
+                for k in range(num_verts):
+                    raw = struct.unpack_from('<12f', r.read(48), 0)
+                    w = CrashWeight(
+                        base_pos=raw[0:3],
+                        crash_pos=raw[3:6],
+                        base_normal=raw[6:9],
+                        crash_normal=raw[9:12],
+                    )
+                    surf.weights.append(w)
             node.surfaces.append(surf)
         nodes.append(node)
 
-    print(f"[crash.dat] Parsed {len(nodes)} crash nodes")
+    print(f"[crash.dat] Parsed {len(nodes)} crash nodes ({'FOUC' if is_fouc else 'FO2'})")
     return nodes
 
 
@@ -258,6 +287,7 @@ class BGMParser:
     def __init__(self, filepath: str):
         self.filepath = filepath
         self.version = 0
+        self.is_fouc = False
         self.materials: list[BGMMaterial] = []
         self.vertex_buffers: dict[int, VertexBuffer] = {}
         self.index_buffers: dict[int, IndexBuffer] = {}
@@ -309,6 +339,8 @@ class BGMParser:
             if data_type == 1:
                 vb = VertexBuffer(buf_id=i)
                 vb.fouc_extra_format = r.i32()
+                if vb.fouc_extra_format > 0:
+                    self.is_fouc = True
                 vb.vertex_count = r.u32()
                 vb.vertex_size = r.u32()
                 vb.flags = r.u32()
@@ -346,6 +378,8 @@ class BGMParser:
             if self.version < 0x20000:
                 s.center = r.vec3f()
                 s.radius = r.vec3f()
+            if self.is_fouc:
+                s.fouc_vertex_multiplier = [r.f32() for _ in range(4)]
             s.num_streams_used = r.i32()
             if s.num_streams_used < 1 or s.num_streams_used > 2:
                 print(f"[BGM] ERROR: Invalid stream count {s.num_streams_used} for surface {i}")
@@ -422,32 +456,55 @@ def extract_vertices(parser: BGMParser, surface: Surface) -> list:
     flags = vb.flags if not vb.is_vegetation else surface.flags
     stride = vb.vertex_size
     base_offset = surface.stream_offset[0]
+    is_fouc = parser.is_fouc or (vb.fouc_extra_format > 0)
     vertices = []
+
     for i in range(surface.vertex_count):
         v = ParsedVertex()
         offset = base_offset + i * stride
-        flt_offset = 0
-        v.x, v.y, v.z = struct.unpack_from('<3f', vb.data, offset)
-        flt_offset += 3
-        if flags & VERTEX_NORMAL:
-            bp = offset + flt_offset * 4
-            v.nx, v.ny, v.nz = struct.unpack_from('<3f', vb.data, bp)
+
+        if is_fouc:
+            # tVertexDataFOUC: int16[3] pos, uint16 pad, uint8[4] tangents,
+            #                  uint8[4] bitangents, uint8[4] normals, uint8[4] colors,
+            #                  int16[2] UV1, int16[2] UV2  — all 32 bytes
+            scale = surface.fouc_vertex_multiplier[3] if surface.fouc_vertex_multiplier[3] != 0 else FOUC_VERTEX_SCALE
+            px, py, pz = struct.unpack_from('<3h', vb.data, offset)
+            v.x, v.y, v.z = px * scale, py * scale, pz * scale
+            nrm = struct.unpack_from('<4B', vb.data, offset + 16)
+            v.nx = (nrm[0] - 128) / 128.0
+            v.ny = (nrm[1] - 128) / 128.0
+            v.nz = (nrm[2] - 128) / 128.0
             v.has_normal = True
-            flt_offset += 3
-        if flags & VERTEX_COLOR:
-            bp = offset + flt_offset * 4
-            c = struct.unpack_from('<I', vb.data, bp)[0]
-            v.r = (c & 0xFF) / 255.0
-            v.g = ((c >> 8) & 0xFF) / 255.0
-            v.b = ((c >> 16) & 0xFF) / 255.0
-            v.a = ((c >> 24) & 0xFF) / 255.0
+            col = struct.unpack_from('<4B', vb.data, offset + 20)
+            v.r, v.g, v.b, v.a = col[0]/255.0, col[1]/255.0, col[2]/255.0, col[3]/255.0
             v.has_color = True
-            flt_offset += 1
-        if (flags & VERTEX_UV) or (flags & VERTEX_UV2):
-            bp = offset + flt_offset * 4
-            v.u, v.v = struct.unpack_from('<2f', vb.data, bp)
+            uv = struct.unpack_from('<2h', vb.data, offset + 24)
+            v.u, v.v = uv[0] / 2048.0, uv[1] / 2048.0
             v.has_uv = True
-            flt_offset += 2
+        else:
+            flt_offset = 0
+            v.x, v.y, v.z = struct.unpack_from('<3f', vb.data, offset)
+            flt_offset += 3
+            if flags & VERTEX_NORMAL:
+                bp = offset + flt_offset * 4
+                v.nx, v.ny, v.nz = struct.unpack_from('<3f', vb.data, bp)
+                v.has_normal = True
+                flt_offset += 3
+            if flags & VERTEX_COLOR:
+                bp = offset + flt_offset * 4
+                c = struct.unpack_from('<I', vb.data, bp)[0]
+                v.r = (c & 0xFF) / 255.0
+                v.g = ((c >> 8) & 0xFF) / 255.0
+                v.b = ((c >> 16) & 0xFF) / 255.0
+                v.a = ((c >> 24) & 0xFF) / 255.0
+                v.has_color = True
+                flt_offset += 1
+            if (flags & VERTEX_UV) or (flags & VERTEX_UV2):
+                bp = offset + flt_offset * 4
+                v.u, v.v = struct.unpack_from('<2f', vb.data, bp)
+                v.has_uv = True
+                flt_offset += 2
+
         vertices.append(v)
     return vertices
 
@@ -606,12 +663,44 @@ def find_texture_file(tex_name: str, bgm_dir: str, shared_dir: str,
 
 # BLENDER MATERIAL CREATION
 
+def _find_sibling_texture(base_tex_name: str, suffix: str, bgm_dir: str,
+                           shared_dir: str, auto_shared_dir: str,
+                           convert_dds: bool) -> str:
+    """Find a sidecar texture like skin1_normal.dds / skin1_specular.dds.
+    base_tex_name is e.g. 'skin1.tga'. Returns resolved path or ''."""
+    import os as _os
+    stem = _os.path.splitext(base_tex_name)[0]
+    for ext in ('.dds', '.tga', '.png'):
+        candidate = stem + suffix + ext
+        path = find_texture_file(candidate, bgm_dir, shared_dir,
+                                  auto_shared_dir, convert_dds)
+        if path:
+            return path
+    return ""
+
+
+def _load_or_find_image(tex_path: str) -> 'bpy.types.Image | None':
+    """Load an image, reusing existing if already in bpy.data.images."""
+    img_basename = os.path.basename(tex_path)
+    for existing in bpy.data.images:
+        if existing.filepath and os.path.basename(existing.filepath) == img_basename:
+            return existing
+    try:
+        return bpy.data.images.load(tex_path)
+    except RuntimeError:
+        print(f"[BGM] WARNING: Could not load texture: {tex_path}")
+        return None
+
+
 def create_blender_material(bgm_mat: BGMMaterial, bgm_dir: str, shared_dir: str,
                             use_alpha: bool, alpha_mode: str = 'BLEND',
                             transparency_overlap: bool = False,
                             auto_shared_dir: str = "",
                             convert_dds: bool = False,
-                            use_backface_culling: bool = True) -> bpy.types.Material:
+                            use_backface_culling: bool = True,
+                            is_fouc: bool = False,
+                            import_normal_maps: bool = True,
+                            import_specular_maps: bool = False) -> bpy.types.Material:
     """Create a Blender material with Principled BSDF from a BGM material."""
     mat_name = bgm_mat.name if bgm_mat.name else "bgm_unnamed"
     bl_mat = bpy.data.materials.new(name=mat_name)
@@ -645,24 +734,9 @@ def create_blender_material(bgm_mat: BGMMaterial, bgm_dir: str, shared_dir: str,
                                       auto_shared_dir, convert_dds)
 
         if tex_path:
-            # load image
-            img = None
-            # check if already loaded
-            img_basename = os.path.basename(tex_path)
-            for existing in bpy.data.images:
-                if existing.filepath and os.path.basename(existing.filepath) == img_basename:
-                    img = existing
-                    break
-            if img is None:
-                try:
-                    img = bpy.data.images.load(tex_path)
-                except RuntimeError:
-                    print(f"[BGM] WARNING: Could not load texture: {tex_path}")
-                    img = None
+            img = _load_or_find_image(tex_path)
 
             if img:
-                # always load the alpha channel so it's available in the node tree
-                # whether we actually *use* it is decided per-material below
                 img.alpha_mode = 'STRAIGHT'
 
                 tex_node = nodes.new('ShaderNodeTexImage')
@@ -670,10 +744,38 @@ def create_blender_material(bgm_mat: BGMMaterial, bgm_dir: str, shared_dir: str,
                 tex_node.location = (-400, 0)
                 links.new(tex_node.outputs['Color'], bsdf.inputs['Base Color'])
 
-                # wire alpha only when the master switch is on AND this specific material has alpha enabled (bgm_mat.nAlpha != 0)
                 mat_has_alpha = use_alpha and (bgm_mat.nAlpha != 0)
                 if mat_has_alpha:
                     links.new(tex_node.outputs['Alpha'], bsdf.inputs['Alpha'])
+
+                # FOUC: look for _normal and _specular sidecar textures
+                if is_fouc:
+                    if import_normal_maps:
+                        nrm_path = _find_sibling_texture(
+                            tex_name, '_normal', bgm_dir, shared_dir, auto_shared_dir, convert_dds)
+                        if nrm_path:
+                            nrm_img = _load_or_find_image(nrm_path)
+                            if nrm_img:
+                                nrm_img.colorspace_settings.name = 'Non-Color'
+                                nrm_node = nodes.new('ShaderNodeTexImage')
+                                nrm_node.image = nrm_img
+                                nrm_node.location = (-700, -200)
+                                nrm_map = nodes.new('ShaderNodeNormalMap')
+                                nrm_map.location = (-400, -200)
+                                links.new(nrm_node.outputs['Color'], nrm_map.inputs['Color'])
+                                links.new(nrm_map.outputs['Normal'], bsdf.inputs['Normal'])
+
+                    if import_specular_maps:
+                        spec_path = _find_sibling_texture(
+                            tex_name, '_specular', bgm_dir, shared_dir, auto_shared_dir, convert_dds)
+                        if spec_path:
+                            spec_img = _load_or_find_image(spec_path)
+                            if spec_img:
+                                spec_img.colorspace_settings.name = 'Non-Color'
+                                spec_node = nodes.new('ShaderNodeTexImage')
+                                spec_node.image = spec_img
+                                spec_node.location = (-700, -500)
+                                links.new(spec_node.outputs['Color'], bsdf.inputs['Specular IOR Level'])
         else:
             # Texture not found — leave a placeholder
             tex_display = tga_to_dds(tex_name)
@@ -790,6 +892,8 @@ def build_blender_meshes(context, parser: BGMParser, options: dict):
     split_by_group = options.get('split_by_group', False)
     validate_meshes = options.get('validate_meshes', False)
     convert_dds = options.get('convert_dds', False)
+    import_normal_maps  = options.get('import_normal_maps', True)
+    import_specular_maps = options.get('import_specular_maps', False)
     use_backface_culling = options.get('use_backface_culling', True)
 
     # auto-detect a shared texture directory one level up (e.g. data/cars/shared)
@@ -825,7 +929,7 @@ def build_blender_meshes(context, parser: BGMParser, options: dict):
             crash_dat_path = ''
     crash_nodes = []
     if crash_dat_path and os.path.isfile(crash_dat_path):
-        crash_nodes = parse_crash_dat(crash_dat_path)
+        crash_nodes = parse_crash_dat(crash_dat_path, is_fouc=parser.is_fouc)
         print(f"[BGM Import] Loaded crash data from: {crash_dat_path}")
     # build lookup: model_name -> CrashNode (crash node name = model_name + "_crash")
     crash_by_model = {}
@@ -840,7 +944,10 @@ def build_blender_meshes(context, parser: BGMParser, options: dict):
         bl_mat = create_blender_material(bgm_mat, bgm_dir, shared_dir, use_alpha,
                                             alpha_mode, transparency_overlap,
                                             auto_shared_dir, convert_dds,
-                                            use_backface_culling)
+                                            use_backface_culling,
+                                            is_fouc=parser.is_fouc,
+                                            import_normal_maps=import_normal_maps,
+                                            import_specular_maps=import_specular_maps)
         blender_materials[i] = bl_mat
 
     # collect surfaces per mesh (and crash surfaces if crash.dat exists)
@@ -890,6 +997,7 @@ def build_blender_meshes(context, parser: BGMParser, options: dict):
     root_empty = bpy.data.objects.new("fo2_body", None)
     root_empty.empty_display_type = 'PLAIN_AXES'
     root_empty.empty_display_size = 0.5
+    root_empty["bgm_is_fouc"] = parser.is_fouc
     fo2_body_coll.objects.link(root_empty)
 
     # create crash root empty and "FO2 Body Crash" collection (if crash.dat exists)
@@ -1771,6 +1879,19 @@ class ImportBGM(bpy.types.Operator, ImportHelper):
                     "and save it next to the BGM file. The material will reference "
                     "the converted TGA",
     )
+    import_normal_maps: BoolProperty(
+        name="Import Normal Maps (FOUC)",
+        default=True,
+        description="For FlatOut UC models, detect and wire <texture>_normal sidecar "
+                    "textures into the material's Normal input",
+    )
+    import_specular_maps: BoolProperty(
+        name="Import Specular Maps (FOUC)",
+        default=False,
+        description="For FlatOut UC models, detect and wire <texture>_specular sidecar "
+                    "textures into the material's Specular input. Disable for a cleaner "
+                    "viewport look",
+    )
     crash_dat_path: StringProperty(
         name="Crash Data (.dat)",
         subtype='FILE_PATH',
@@ -1854,6 +1975,8 @@ class ImportBGM(bpy.types.Operator, ImportHelper):
         box.prop(self, "shared_texture_dir")
         box.prop(self, "crash_dat_path")
         box.prop(self, "convert_dds")
+        box.prop(self, "import_normal_maps")
+        box.prop(self, "import_specular_maps")
         box.prop(self, "use_alpha")
         box.prop(self, "use_backface_culling")
         row = box.row()
@@ -1894,6 +2017,8 @@ class ImportBGM(bpy.types.Operator, ImportHelper):
             'validate_meshes': self.validate_meshes,
             'convert_dds': self.convert_dds,
             'use_backface_culling': self.use_backface_culling,
+            'import_normal_maps': self.import_normal_maps,
+            'import_specular_maps': self.import_specular_maps,
         }
 
         objects = build_blender_meshes(context, parser, options)
@@ -1903,6 +2028,12 @@ class ImportBGM(bpy.types.Operator, ImportHelper):
             return {'CANCELLED'}
 
         self.report({'INFO'}, f"Imported {len(objects)} objects from {os.path.basename(filepath)}")
+
+        # Set scene game mode to match the imported file
+        try:
+            context.scene.fo2_game_mode = 'FOUC' if parser.is_fouc else 'FO2'
+        except Exception:
+            pass
 
         # body.ini
         if self.import_body_ini:
@@ -1987,9 +2118,72 @@ FO2_SHADER_NAMES = {
     41: "Racemap",
 }
 
+FOUC_SHADER_NAMES = {
+    0:  "Static Prelit",
+    1:  "Terrain",
+    2:  "Terrain Specular",
+    3:  "Dynamic Diffuse",
+    4:  "Dynamic Specular",
+    5:  "Car Body",
+    6:  "Car Window",
+    7:  "Car Diffuse",
+    8:  "Car Metal",
+    9:  "Car Tire Rim",
+    10: "Car Lights",
+    11: "Car Shear",
+    12: "Car Scale",
+    13: "Shadow Project",
+    14: "Car Lights Unlit",
+    15: "Default",
+    16: "Vertex Color",
+    17: "Shadow Sampler",
+    18: "Grass",
+    19: "Tree Trunk",
+    20: "Tree Branch",
+    21: "Tree Leaf",
+    22: "Particle",
+    23: "Sunflare",
+    24: "Intensitymap",
+    25: "Water",
+    26: "Skinning",
+    27: "Tree LOD (Default)",
+    28: "Deprecated (PS2 Streak)",
+    29: "Clouds (UV Scroll)",
+    30: "Car Body LOD",
+    31: "Deprecated Vertex Color Static",
+    32: "Car Window Damaged",
+    33: "Skin Shadow (Deprecated)",
+    34: "Reflecting Window (Static)",
+    35: "Reflecting Window (Dynamic)",
+    36: "Deprecated Static Window",
+    37: "Skybox",
+    38: "Horizon",
+    39: "Ghost Body",
+    40: "Static Nonlit",
+    41: "Dynamic Nonlit",
+    42: "Skid Marks",
+    43: "Car Interior",
+    44: "Car Tire",
+    45: "Puddle",
+    46: "Ambient Shadow",
+    47: "Local Water",
+    48: "Static Specular/Hilight",
+    49: "Lightmapped Planar Reflection",
+    50: "Racemap",
+    51: "HDR Default (Runtime)",
+    52: "Ambient Particle",
+    53: "Videoscreen (Dynamic)",
+    54: "Videoscreen (Static)",
+}
+
 FO2_SHADER_ITEMS = [
-    (str(k), f"{k} – {v}", "")
+    (str(k), f"{k} \u2013 {v}", "")
     for k, v in sorted(FO2_SHADER_NAMES.items())
+]
+
+FOUC_SHADER_ITEMS = [
+    (str(k), f"{k} \u2013 {v}", "")
+    for k, v in sorted(FOUC_SHADER_NAMES.items())
 ]
 
 
@@ -2066,9 +2260,17 @@ def _texture_update(self, context):
     self["bgm_texture_0"] = self.fo2_texture
 
 
+def _get_shader_items(self, context):
+    """Dynamic shader items based on game mode scene property."""
+    scene = context.scene if context else None
+    if scene and getattr(scene, "fo2_game_mode", "FO2") == "FOUC":
+        return FOUC_SHADER_ITEMS
+    return FO2_SHADER_ITEMS
+
+
 class FO2_PT_ShaderPanel(bpy.types.Panel):
-    """FO2 shader ID panel in Material Properties"""
-    bl_label       = "FO2 Shader"
+    """FlatOut shader ID panel in Material Properties"""
+    bl_label       = "FlatOut Shader"
     bl_idname      = "MATERIAL_PT_fo2_shader"
     bl_space_type  = 'PROPERTIES'
     bl_region_type = 'WINDOW'
@@ -2081,6 +2283,11 @@ class FO2_PT_ShaderPanel(bpy.types.Panel):
     def draw(self, context):
         mat    = context.material
         layout = self.layout
+
+        # Game mode toggle at top of panel
+        scene = context.scene
+        row = layout.row(align=True)
+        row.prop(scene, "fo2_game_mode", expand=True)
 
         layout.prop(mat, "fo2_shader_id", text="Shader")
         layout.prop(mat, "fo2_texture", text="BGM Texture")
@@ -2120,14 +2327,19 @@ def menu_func_import(self, context):
 
 
 def register():
+    bpy.types.Scene.fo2_game_mode = bpy.props.EnumProperty(
+        name="Game",
+        items=[('FO2', "FlatOut 2", ""), ('FOUC', "FlatOut UC", "")],
+        default='FO2',
+    )
     bpy.types.Material.fo2_shader_id = bpy.props.EnumProperty(
-        name="FO2 Shader",
-        items=FO2_SHADER_ITEMS,
-        default='8',
+        name="Shader",
+        items=_get_shader_items,
+        default=None,
         update=_shader_update,
     )
     bpy.types.Material.fo2_texture = bpy.props.StringProperty(
-        name="FO2 Texture",
+        name="FlatOut Texture",
         default="",
         update=_texture_update,
     )
@@ -2144,6 +2356,9 @@ def unregister():
     bpy.utils.unregister_class(FO2_PT_ShaderPanel)
     bpy.utils.unregister_class(FO2_OT_EditMatInt)
     bpy.utils.unregister_class(FO2_OT_ToggleMatProp)
+    del bpy.types.Material.fo2_texture
+    del bpy.types.Material.fo2_shader_id
+    del bpy.types.Scene.fo2_game_mode
     del bpy.types.Material.fo2_texture
     del bpy.types.Material.fo2_shader_id
 

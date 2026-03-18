@@ -1,7 +1,7 @@
 bl_info = {
     "name":        "FlatOut 2 BGM Export (Car)",
     "author":      "ravenDS",
-    "version":     (1, 4, 4),
+    "version":     (1, 5, 0),
     "blender":     (3, 6, 0),
     "location":    "File > Export > FlatOut 2 BGM Car (.bgm)",
     "description": "Export FlatOut 2 car model (BGM) files. Based on reverse-egineering work by Chloe (FlatOutW32BGMTool)",
@@ -25,7 +25,10 @@ from . import tga2dds as _tga2dds
 
 # CONSTANTS
 
-BGM_VERSION_FO2 = 0x20000
+BGM_VERSION_FO2  = 0x20000
+BGM_VERSION_FOUC = 0x20002  # same version number but detected via fouc_extra in streams
+
+FOUC_VERTEX_SCALE = 0.000977  # int16 * this = metres (1/1024)
 
 # identifiers
 MATC_ID = 0x4354414D  # "MATC"
@@ -153,14 +156,21 @@ def get_shader_for_material(mat_name: str, tex_name: str) -> tuple:
 
 # VERTEX FORMAT PER SHADER
 
-def get_vertex_format(shader_id: int) -> tuple:
+def get_vertex_format(shader_id: int, is_fouc: bool = False) -> tuple:
     """Return (flags, vertex_size_bytes) for a given shader.
 
     FO2 BGM vertex layouts:
       body/skinning:  pos(12) + normal(12) + color(4) + uv(8)  = 36  flags 0x152
       shadow:         pos(12)                                  = 12  flags 0x002
       everything else: pos(12) + normal(12) + uv(8)            = 32  flags 0x112
+
+    FOUC BGM: one universal layout for everything:
+      int16[3] pos + uint16 pad + uint8[4] tangents + uint8[4] bitangents
+      + uint8[4] normals + uint8[4] colors + int16[2] UV1 + int16[2] UV2 = 32 bytes
+      flags 0x2242
     """
+    if is_fouc:
+        return FOUC_VERTEX_FLAGS, 32
     if shader_id in (SHADER_CAR_BODY, SHADER_SKINNING):
         flags = VERTEX_POSITION | VERTEX_NORMAL | VERTEX_COLOR | VERTEX_UV
         return flags, 36
@@ -169,6 +179,40 @@ def get_vertex_format(shader_id: int) -> tuple:
     else:
         flags = VERTEX_POSITION | VERTEX_NORMAL | VERTEX_UV
         return flags, 32
+
+
+FOUC_VERTEX_FLAGS = 0x2242
+FOUC_VERTEX_SCALE_INV = 1.0 / FOUC_VERTEX_SCALE  # 1024.0
+
+
+def pack_fouc_vertex(fo2_pos, fo2_nrm, fo2_uv) -> bytes:
+    """Pack a single FOUC vertex (32 bytes).
+    fo2_pos: (x,y,z) in FO2 world units
+    fo2_nrm: (nx,ny,nz) normalized
+    fo2_uv:  (u,v) 0..1 range
+    """
+    # position: float -> int16 via scale
+    px = max(-32767, min(32767, int(round(fo2_pos[0] * FOUC_VERTEX_SCALE_INV))))
+    py = max(-32767, min(32767, int(round(fo2_pos[1] * FOUC_VERTEX_SCALE_INV))))
+    pz = max(-32767, min(32767, int(round(fo2_pos[2] * FOUC_VERTEX_SCALE_INV))))
+    # normals: float -1..1 -> uint8 0..255, 4th byte = 255
+    def enc_nrm(v): return max(0, min(255, int(round(v * 128.0 + 128.0))))
+    nx, ny, nz = enc_nrm(fo2_nrm[0]), enc_nrm(fo2_nrm[1]), enc_nrm(fo2_nrm[2])
+    # UV: float → int16 (scale 1024)
+    UV_SCALE = 2048.0
+    u = max(-32767, min(32767, int(round(fo2_uv[0] * UV_SCALE))))
+    v = max(-32767, min(32767, int(round(fo2_uv[1] * UV_SCALE))))
+    # pack: int16[3] pos + uint16 pad + uint8[4] tang + uint8[4] bitang +
+    #       uint8[4] norm + uint8[4] color + int16[2] UV1 + int16[2] UV2
+    return struct.pack('<3hH4B4B4B4B2h2h',
+        px, py, pz, 0,
+        128, 128, 128, 255,   # tangents (neutral)
+        128, 128, 128, 255,   # bitangents (neutral)
+        nx, ny, nz, 255,      # normals
+        255, 255, 255, 255,   # vertex color (white)
+        u, v,                 # UV1
+        0, 0,                 # UV2
+    )
 
 
 # COORDINATE TRANSFORMS
@@ -294,16 +338,17 @@ class FO2Material:
 
 
 class FO2VertexBuffer:
-    def __init__(self, buf_id, flags, vertex_size, vertex_count, data_bytes):
+    def __init__(self, buf_id, flags, vertex_size, vertex_count, data_bytes, fouc_extra=0):
         self.id = buf_id
         self.flags = flags
         self.vertex_size = vertex_size
         self.vertex_count = vertex_count
         self.data = data_bytes  # raw bytes
+        self.fouc_extra = fouc_extra
 
     def write(self, f):
         f.write(struct.pack('<i', 1))             # type = vertex buffer
-        f.write(struct.pack('<i', 0))             # foucExtraFormat = 0 (FO2)
+        f.write(struct.pack('<i', self.fouc_extra))
         f.write(struct.pack('<I', self.vertex_count))
         f.write(struct.pack('<I', self.vertex_size))
         f.write(struct.pack('<I', self.flags))
@@ -335,6 +380,8 @@ class FO2Surface:
         self.num_streams_used = 2
         self.stream_id = [0, 0]
         self.stream_offset = [0, 0]
+        self.fouc_vertex_multiplier = [0.0, 0.0, 0.0, FOUC_VERTEX_SCALE]
+        self.is_fouc = False
 
     def write(self, f):
         f.write(struct.pack('<i', self.is_vegetation))
@@ -344,7 +391,8 @@ class FO2Surface:
         f.write(struct.pack('<i', self.poly_count))
         f.write(struct.pack('<i', self.poly_mode))
         f.write(struct.pack('<i', self.num_indices_used))
-        # FO2 does NOT write vCenter/vRadius for surfaces (only FO1 does)
+        if self.is_fouc:
+            f.write(struct.pack('<4f', *self.fouc_vertex_multiplier))
         f.write(struct.pack('<i', self.num_streams_used))
         for j in range(self.num_streams_used):
             f.write(struct.pack('<I', self.stream_id[j]))
@@ -449,7 +497,8 @@ def invert_4x4(m):
 def build_buffers_for_material(obj, mat_index, flags, vertex_size,
                                inv_scale, buf_id_start,
                                fo2_mesh_matrix_inv=None,
-                               mesh_override=None):
+                               mesh_override=None,
+                               is_fouc=False):
     """Build a vertex buffer and index buffer for all faces of `mat_index` on the given Blender mesh object.
 
     If fo2_mesh_matrix_inv is provided (4x4 list-of-lists), positions and 
@@ -463,6 +512,11 @@ def build_buffers_for_material(obj, mat_index, flags, vertex_size,
     has_normal = (flags & VERTEX_NORMAL) != 0
     has_color  = (flags & VERTEX_COLOR)  != 0
     has_uv     = (flags & VERTEX_UV)     != 0
+
+    # FOUC vertex format always has normals and UVs regardless of flags
+    if is_fouc:
+        has_normal = True
+        has_uv     = True
 
     # get UV layer
     uv_layer = mesh.uv_layers.active if has_uv else None
@@ -583,17 +637,20 @@ def build_buffers_for_material(obj, mat_index, flags, vertex_size,
     blender_vis = []  # (bvi, loop_idx) for each unique vertex
     for pos, nrm, uv, color, bvi, loop_idx in unique_verts:
         blender_vis.append((bvi, loop_idx))
-        # position (3 floats, always present)
-        vdata += struct.pack('<3f', *pos)
-        # normal (3 floats)
-        if has_normal:
-            vdata += struct.pack('<3f', *nrm)
-        # vertex color (1 uint32, RGBA little-endian)
-        if has_color:
-            vdata += struct.pack('<4B', color[0], color[1], color[2], color[3])
-        # UV (2 floats)
-        if has_uv:
-            vdata += struct.pack('<2f', *uv)
+        if is_fouc:
+            vdata += pack_fouc_vertex(pos, nrm, uv)
+        else:
+            # position (3 floats, always present)
+            vdata += struct.pack('<3f', *pos)
+            # normal (3 floats)
+            if has_normal:
+                vdata += struct.pack('<3f', *nrm)
+            # vertex color (1 uint32, RGBA little-endian)
+            if has_color:
+                vdata += struct.pack('<4B', color[0], color[1], color[2], color[3])
+            # UV (2 floats)
+            if has_uv:
+                vdata += struct.pack('<2f', *uv)
 
     # pack index data (uint16)
     idata = bytearray()
@@ -754,48 +811,73 @@ def triangulate_mesh(obj):
     return new_mesh, True
 
 
-def write_crash_dat(filepath: str, crash_data: list):
-    """Write a FO2 crash.dat file.
+def write_crash_dat(filepath: str, crash_data: list, is_fouc: bool = False):
+    """Write a FO2 or FOUC crash.dat file.
 
-    crash_data: list of (model_name, surfaces_list)
-      surfaces_list: list of (base_vbuf_bytes, crash_vbuf_bytes, vertex_size, vertex_count)
+    FO2 surface entry:  vcount + vbytes + vbuf + 48B weights × vcount
+    FOUC surface entry: vcount + 40B weights × vcount (no vbuf, int16 positions)
     """
     if not crash_data:
         print("[BGM Export] No crash data found, skipping crash.dat")
         return
 
-    print(f"[BGM Export] Writing crash.dat: {filepath}")
+    print(f"[BGM Export] Writing crash.dat: {filepath} ({'FOUC' if is_fouc else 'FO2'})")
     with open(filepath, 'wb') as f:
         f.write(struct.pack('<I', len(crash_data)))
 
         for model_name, surfaces in crash_data:
-            # null-terminated name: model_name + "_crash"
             name = model_name + "_crash"
             f.write(name.encode('ascii') + b'\x00')
 
             f.write(struct.pack('<I', len(surfaces)))
             for base_vdata, crash_vdata, vsize, vcount in surfaces:
-                # vertex count
                 f.write(struct.pack('<I', vcount))
-                # vertex data size in bytes
-                f.write(struct.pack('<I', vcount * vsize))
-                # BASE vertex buffer (not crash)
-                f.write(base_vdata)
 
-                # crash weights: 48 bytes per vertex
-                # (basePos[3], crashPos[3], baseNorm[3], crashNorm[3])
-                for i in range(vcount):
-                    off = i * vsize
-                    # positions are first 3 floats (offset 0)
-                    base_pos  = base_vdata[off:off + 12]
-                    crash_pos = crash_vdata[off:off + 12]
-                    # normals are next 3 floats (offset 12)
-                    base_nrm  = base_vdata[off + 12:off + 24]
-                    crash_nrm = crash_vdata[off + 12:off + 24]
-                    f.write(base_pos)
-                    f.write(crash_pos)
-                    f.write(base_nrm)
-                    f.write(crash_nrm)
+                if is_fouc:
+                    # FOUC: 40 bytes per vertex, no vbuf
+                    # int16[3] basePos, int16[3] crashPos,
+                    # uint8[4] baseUnkBump1, uint8[4] crashUnkBump1,
+                    # uint8[4] baseUnkBump2, uint8[4] crashUnkBump2,
+                    # uint8[4] baseNorm, uint8[4] crashNorm,
+                    # uint16[2] baseUV
+                    SCALE_INV = FOUC_VERTEX_SCALE_INV
+                    for i in range(vcount):
+                        off = i * vsize  # vsize=32 for FOUC
+                        # read int16 positions from packed vdata
+                        bpx,bpy,bpz = struct.unpack_from('<3h', base_vdata, off)
+                        cpx,cpy,cpz = struct.unpack_from('<3h', crash_vdata, off)
+                        # tangents at off+8, bitangents at off+12, normals at off+16
+                        base_tang  = base_vdata[off+8:off+12]
+                        crash_tang = crash_vdata[off+8:off+12]
+                        base_bitng = base_vdata[off+12:off+16]
+                        crash_bitng= crash_vdata[off+12:off+16]
+                        base_nrm   = base_vdata[off+16:off+20]
+                        crash_nrm  = crash_vdata[off+16:off+20]
+                        # UV1 at off+24
+                        base_uv = base_vdata[off+24:off+28]
+                        f.write(struct.pack('<3h', bpx, bpy, bpz))     # base pos
+                        f.write(struct.pack('<3h', cpx, cpy, cpz))     # crash pos
+                        f.write(base_tang)                             # base unk bump1
+                        f.write(crash_tang)                            # crash unk bump1
+                        f.write(base_bitng)                            # base unk bump2
+                        f.write(crash_bitng)                           # crash unk bump2
+                        f.write(base_nrm)                              # base normals
+                        f.write(crash_nrm)                             # crash normals
+                        f.write(base_uv)                               # base UV (no crash UV)
+                else:
+                    # FO2: vcount, vbytes, vbuf, then 48-byte weights
+                    f.write(struct.pack('<I', vcount * vsize))
+                    f.write(base_vdata)
+                    for i in range(vcount):
+                        off = i * vsize
+                        base_pos  = base_vdata[off:off + 12]
+                        crash_pos = crash_vdata[off:off + 12]
+                        base_nrm  = base_vdata[off + 12:off + 24]
+                        crash_nrm = crash_vdata[off + 12:off + 24]
+                        f.write(base_pos)
+                        f.write(crash_pos)
+                        f.write(base_nrm)
+                        f.write(crash_nrm)
 
     print(f"[BGM Export] crash.dat done: {len(crash_data)} nodes")
 
@@ -806,6 +888,7 @@ def write_bgm(filepath: str, context, options: dict):
     inv_scale = 1.0 / global_scale if global_scale != 0 else 1.0
     use_priorities = options.get('use_priorities', True)
     auto_triangulate = options.get('auto_triangulate', True)
+    is_fouc = options.get('game_mode', 'FO2') == 'FOUC'
 
     root = find_root_empty(context)
     mesh_objects, empty_objects = collect_objects_under(root, context)
@@ -1048,16 +1131,18 @@ def write_bgm(filepath: str, context, options: dict):
 
             fo2_mat_id = bl_mat_to_fo2_id.get(slot.material, 0)
             fo2_mat = fo2_materials[fo2_mat_id]
-            flags, vsize = get_vertex_format(fo2_mat.shader_id)
+            flags, vsize = get_vertex_format(fo2_mat.shader_id, is_fouc=is_fouc)
 
             result = build_buffers_for_material(
                 obj, mat_idx, flags, vsize, inv_scale, stream_id_counter,
                 fo2_mesh_matrix_inv=fo2_mesh_matrix_inv,
-                mesh_override=work_mesh)
+                mesh_override=work_mesh,
+                is_fouc=is_fouc)
             if not result:
                 continue
 
             vbuf, ibuf, vert_count, poly_count, blender_vis = result
+            vbuf.fouc_extra = 22 if is_fouc else 0
 
             # create surface
             surface = FO2Surface()
@@ -1068,12 +1153,20 @@ def write_bgm(filepath: str, context, options: dict):
             surface.num_indices_used = poly_count * 3
             surface.stream_id = [stream_id_counter, stream_id_counter + 1]
             surface.stream_offset = [0, 0]
+            surface.is_fouc = is_fouc
 
             # update AABB from vertex buffer positions
             vdata = vbuf.data
             for vi in range(vert_count):
                 off = vi * vsize
-                px, py, pz = struct.unpack_from('<3f', vdata, off)
+                if is_fouc:
+                    # FOUC: int16 positions at offset 0, scale by FOUC_VERTEX_SCALE
+                    ix, iy, iz = struct.unpack_from('<3h', vdata, off)
+                    px = ix * FOUC_VERTEX_SCALE
+                    py = iy * FOUC_VERTEX_SCALE
+                    pz = iz * FOUC_VERTEX_SCALE
+                else:
+                    px, py, pz = struct.unpack_from('<3f', vdata, off)
                 aabb_min[0] = min(aabb_min[0], px)
                 aabb_min[1] = min(aabb_min[1], py)
                 aabb_min[2] = min(aabb_min[2], pz)
@@ -1154,7 +1247,14 @@ def write_bgm(filepath: str, context, options: dict):
                                 M[1][0]*px + M[1][1]*py + M[1][2]*pz + M[1][3],
                                 M[2][0]*px + M[2][1]*py + M[2][2]*pz + M[2][3],
                             )
-                        struct.pack_into('<3f', crash_vdata, off, *crash_pos)
+                        if is_fouc:
+                            # FOUC: int16 positions at offset 0
+                            ix = max(-32767, min(32767, int(round(crash_pos[0] * FOUC_VERTEX_SCALE_INV))))
+                            iy = max(-32767, min(32767, int(round(crash_pos[1] * FOUC_VERTEX_SCALE_INV))))
+                            iz = max(-32767, min(32767, int(round(crash_pos[2] * FOUC_VERTEX_SCALE_INV))))
+                            struct.pack_into('<3h', crash_vdata, off, ix, iy, iz)
+                        else:
+                            struct.pack_into('<3f', crash_vdata, off, *crash_pos)
 
                     crash_surfaces.append((base_vdata, bytes(crash_vdata), vsize, base_vcount))
 
@@ -1230,7 +1330,7 @@ def write_bgm(filepath: str, context, options: dict):
 
     with open(filepath, 'wb') as f:
         # file version
-        f.write(struct.pack('<I', BGM_VERSION_FO2))
+        f.write(struct.pack('<I', BGM_VERSION_FO2))  # version (same for FO2 and FOUC)
 
         # materials
         f.write(struct.pack('<I', len(fo2_materials)))
@@ -1276,7 +1376,7 @@ def write_bgm(filepath: str, context, options: dict):
             crash_dat_path = os.path.join(os.path.dirname(filepath), "crash.dat")
         else:
             crash_dat_path = bgm_base + "_crash.dat"
-        write_crash_dat(crash_dat_path, all_crash_data)
+        write_crash_dat(crash_dat_path, all_crash_data, is_fouc=is_fouc)
 
     # convert TGAs to DDS if requested
     if options.get('convert_tga_to_dds', False):
@@ -1583,13 +1683,24 @@ def write_camera_ini(filepath: str, context, inv_scale: float):
 # BLENDER OPERATOR
 
 class ExportBGM(bpy.types.Operator, ExportHelper):
-    """Export FlatOut 2 BGM car model"""
+    """Export FlatOut BGM car model"""
     bl_idname = "export_scene.fo2_bgm"
-    bl_label = "Export FO2 BGM"
+    bl_label = "Export FlatOut BGM"
     bl_options = {'PRESET', 'UNDO'}
 
     filename_ext = ".bgm"
     filter_glob: StringProperty(default="*.bgm", options={'HIDDEN'})
+
+    # game mode
+    game_mode: EnumProperty(
+        name="Game",
+        description="Target game format",
+        items=[
+            ('FO2',  "FlatOut 2",             "Export as FlatOut 2 BGM (float vertices)"),
+            ('FOUC', "FlatOut UC",            "Export as FlatOut Ultimate Carnage BGM (int16 vertices)"),
+        ],
+        default='FO2',
+    )
 
     # transform
     global_scale: FloatProperty(
@@ -1660,8 +1771,22 @@ class ExportBGM(bpy.types.Operator, ExportHelper):
                     "from Blender camera data and written back to the objects",
     )
 
+    def invoke(self, context, event):
+        # Auto-detect game mode from scene or fo2_body empty
+        root = context.scene.objects.get("fo2_body")
+        if root and root.get("bgm_is_fouc"):
+            self.game_mode = 'FOUC'
+        elif hasattr(context.scene, 'fo2_game_mode'):
+            self.game_mode = context.scene.fo2_game_mode
+        return super().invoke(context, event)
+
     def draw(self, context):
         layout = self.layout
+
+        # game mode
+        box = layout.box()
+        box.label(text="Game", icon='WORLD')
+        box.prop(self, "game_mode", expand=True)
 
         # transform
         box = layout.box()
@@ -1698,6 +1823,7 @@ class ExportBGM(bpy.types.Operator, ExportHelper):
 
     def execute(self, context):
         options = {
+            'game_mode': self.game_mode,
             'global_scale': self.global_scale,
             'use_priorities': self.use_priorities,
             'auto_triangulate': self.auto_triangulate,
@@ -1713,7 +1839,7 @@ class ExportBGM(bpy.types.Operator, ExportHelper):
             self.report({'ERROR'}, "No objects found to export")
         else:
             self.report({'INFO'},
-                        f"Exported BGM to {os.path.basename(self.filepath)}")
+                        f"Exported {'FOUC' if self.game_mode == 'FOUC' else 'FO2'} BGM to {os.path.basename(self.filepath)}")
         return result
 
 
