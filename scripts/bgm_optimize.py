@@ -21,6 +21,12 @@ Operations (can be combined; -clean always runs before -optimize):
          and one shared ibuf.  Matches the layout of original FO2 files.
       <name>_crash.dat vertex arrays are remapped to match the new vertex ordering
 
+  -menucar
+      Reorder surfaces to FO2 menucar draw order
+
+  -full
+      Shortcut for -clean & -optimize
+
 Usage:
   bgm_process.py <input.bgm> [output.bgm] -clean [-optimize]
   bgm_process.py <input.bgm> [output.bgm] -optimize [-clean]
@@ -537,24 +543,127 @@ def op_optimize(streams, surfaces):
             streams_orig, surfaces_orig)
 
 
-# main
+# menucar surface ordering
+
+# priority by material name prefix, lower number renders first (observed on FO2 menucar files)
+# stable sort: ties preserve original order.
+def _menucar_sort_key(name):
+    n = name.lower()
+    if n.startswith('body'):                                         return 0
+    if n.startswith('common'):                                       return 1
+    if n.startswith('interior'):                                     return 2
+    if n.startswith('window'):                                       return 3
+    if n.startswith('light'):                                        return 4
+    if n in ('shear', 'shearhock', 'shearshock', 'shearspring'):    return 5
+    if n.startswith('scalespring') or n.startswith('shearspring'):  return 6
+    if n.startswith('scaleshock') or n.startswith('shearshock') \
+            or n.startswith('shearhock'):                            return 7
+    if n.startswith('scale') or n.startswith('shock') \
+            or n.startswith('spring'):                               return 8
+    if n.startswith('tire'):                                         return 9
+    if n.startswith('rim'):                                          return 10
+    if n.startswith('ground'):                                       return 10  # same group as rim, stable sort preserves relative order
+    return 99
+
+
+def op_menucar(surfaces, models, materials_raw, version):
+    """Reorder surfaces within each model to match FO2 menucar draw order.
+
+    Surface ordering (stable within each group):
+      body -> common -> interior -> window* -> light* ->
+      shear* -> scalespring* -> scaleshock* -> scale*/shock*/spring* ->
+      tire* -> rim* -> ground* -> (everything else)
+
+    Surfaces not owned by any model are left in place at the end.
+    """
+    import struct
+
+    # parse material names from raw blobs (name = null-terminated string after 4-byte identifier)
+    def mat_name(blob):
+        off = 4  # skip identifier
+        end = blob.index(0, off)
+        return blob[off:end].decode('ascii', errors='replace')
+
+    mat_names = [mat_name(b) for b in materials_raw]
+
+    print(f"\n── Menucar surface ordering ──")
+
+    # build set of surface indices owned by at least one model
+    owned = set()
+    for m in models:
+        owned.update(m['surfaces'])
+
+    # for each model, stable-sort its surface list by material name priority
+    total_moved = 0
+    for mi, m in enumerate(models):
+        orig = list(m['surfaces'])
+        # Sort by (priority, original_position) for stable sort within group
+        sorted_surfs = sorted(
+            orig,
+            key=lambda si: _menucar_sort_key(
+                mat_names[surfaces[si]['mid']] if surfaces[si]['mid'] < len(mat_names) else ''
+            )
+        )
+        moved = sum(1 for a, b in zip(orig, sorted_surfs) if a != b)
+        total_moved += moved
+        if moved:
+            old_names = [mat_names[surfaces[si]['mid']] for si in orig]
+            new_names = [mat_names[surfaces[si]['mid']] for si in sorted_surfs]
+            print(f"  Model '{m['name']}': reordered {moved} surfaces")
+            for oi, (o, n) in enumerate(zip(old_names, new_names)):
+                if o != n:
+                    print(f"    [{oi}] {o} → {n}")
+        m['surfaces'] = sorted_surfs
+
+    if total_moved == 0:
+        print("  Already in correct order — nothing to do.")
+    else:
+        print(f"  Total surfaces reordered: {total_moved}")
+
+    # rebuild the flat surfaces list so its order matches the model surface lists
+    # surfaces appear in the order they are first referenced by a model, unowned surfaces are appended at the end
+
+    new_order = []
+    seen = set()
+    for m in models:
+        for si in m['surfaces']:
+            if si not in seen:
+                new_order.append(si)
+                seen.add(si)
+    for si in range(len(surfaces)):
+        if si not in seen:
+            new_order.append(si)
+
+    # build old->new index map and remap model surface lists
+
+    old_to_new = {old: new for new, old in enumerate(new_order)}
+    new_surfaces = [surfaces[i] for i in new_order]
+    for m in models:
+        m['surfaces'] = [old_to_new[si] for si in m['surfaces']]
+
+    return new_surfaces, models
+
+
 
 def main():
     args = sys.argv[1:]
 
-    do_clean    = '-clean'    in args
-    do_optimize = '-optimize' in args
-    flags       = {'-clean', '-optimize'}
-    pos_args    = [a for a in args if a not in flags]
+    do_full      = '-full'       in args
+    do_clean     = '-clean'      in args or do_full
+    do_optimize  = '-optimize'   in args or do_full
+    do_menucar   = '-menucar'    in args
+    flags        = {'-clean', '-optimize', '-full', '-menucar'}
+    pos_args     = [a for a in args if a not in flags]
 
-    if not (do_clean or do_optimize) or not pos_args:
-        print("Usage: bgm_process.py <input.bgm> [output.bgm] -clean [-optimize]")
-        print("       bgm_process.py <input.bgm> [output.bgm] -optimize [-clean]")
+    if not (do_clean or do_optimize or do_menucar) or not pos_args:
+        print("Usage: bgm_process.py <input.bgm> [output.bgm] <flags>")
         print()
         print("  -clean     Remove unreferenced (orphan) streams")
         print("  -optimize  Vertex deduplication + stream merging")
+        print("  -full      Shortcut for -clean -optimize")
+        print("  -menucar   Reorder surfaces to FO2 menucar draw order")
         print()
-        print("Both flags may be combined, -clean always runs first.")
+        print("Flags can be combined; execution order: -clean -> -menucar -> -optimize")
         sys.exit(1)
 
     inp = pos_args[0]
@@ -568,6 +677,8 @@ def main():
         stem, ext = os.path.splitext(inp)
         if do_optimize:
             out = stem + '_opt' + ext
+        elif do_menucar and not do_clean:
+            out = stem + '_mc' + ext
         else:
             out = stem + '_clean' + ext
 
@@ -577,15 +688,19 @@ def main():
           f"  {len(streams)} streams  {len(surfaces)} surfaces"
           f"  {len(models)} models")
 
-    # crash.dat 
+    # crash.dat
     crash_src, crash_suffix = _find_crash_dat(inp)
-    opt_crash_info = None   # (surf_seen, surf_vs, surf_original_vc, streams_orig, surfaces_orig)
+    opt_crash_info = None
 
-    # clean (always before optimize)
+    # -clean (always first)
     if do_clean:
         streams, surfaces = op_strip(streams, surfaces)
 
-    # optimize
+    # -menuorder (after clean, before optimize)
+    if do_menucar:
+        surfaces, models = op_menucar(surfaces, models, materials_raw, version)
+
+    # -optimize (always last)
     if do_optimize:
         (streams, surfaces,
          surf_seen, surf_vs, surf_original_vc,
