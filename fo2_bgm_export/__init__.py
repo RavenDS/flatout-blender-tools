@@ -1,7 +1,7 @@
 bl_info = {
     "name":        "FlatOut 2 BGM Export (Car)",
     "author":      "ravenDS",
-    "version":     (1, 4, 3),
+    "version":     (1, 4, 4),
     "blender":     (3, 6, 0),
     "location":    "File > Export > FlatOut 2 BGM Car (.bgm)",
     "description": "Export FlatOut 2 car model (BGM) files. Based on reverse-egineering work by Chloe (FlatOutW32BGMTool)",
@@ -54,23 +54,35 @@ SHADER_SHADOW_PROJECT   = 13
 SHADER_SKINNING         = 26
 
 
-# MATERIAL PRIORITY TABLE  (from FlatOutW32BGMTool_gcp.toml)
-
+# MATERIAL PRIORITY TABLE
+# Higher value = drawn later. Materials not listed default to 0.
 MATERIAL_PRIORITIES = {
-    "shearshock": 1, "shearspring": 2,
+    # suspension
+    "shearshock": 1, "shearhock": 1, "shearspring": 2,
+    # lights — _b variants (inactive/base state) drawn first
+    "light_brake_b": 1, "light_brake_b_2": 1, "light_brake_2_b": 1,
+    "light_brake_l_b": 1, "light_brake_r_b": 1,
+    "light_brake_l_b_2": 1, "light_brake_r_b_2": 1,
+    "light_brake_l_2_b": 1, "light_brake_r_2_b": 1,
+    "light_reverse_b": 1, "light_reverse_b_2": 1, "light_reverse_2_b": 1,
+    "light_reverse_l_b": 1, "light_reverse_r_b": 1,
+    "light_reverse_l_b_2": 1, "light_reverse_r_b_2": 1,
+    "light_reverse_l_2_b": 1, "light_reverse_r_2_b": 1,
+    "light_front_b": 1, "light_front_b_2": 1, "light_front_2_b": 1,
+    "light_front_l_b": 1, "light_front_r_b": 1,
+    "light_front_l_b_2": 1, "light_front_r_b_2": 1,
+    "light_front_l_2_b": 1, "light_front_r_2_b": 1,
+    # lights — active/illuminated variants drawn last
+    "light_brake": 2, "light_brake_2": 2,
+    "light_brake_l": 2, "light_brake_r": 2,
+    "light_brake_l_2": 2, "light_brake_r_2": 2,
+    "light_reverse": 2, "light_reverse_2": 2,
+    "light_reverse_l": 2, "light_reverse_r": 2,
+    "light_reverse_l_2": 2, "light_reverse_r_2": 2,
+    "light_front": 2, "light_front_2": 2,
+    "light_front_l": 2, "light_front_r": 2,
+    "light_front_l_2": 2, "light_front_r_2": 2,
 }
-# Populate light priorities
-for _side in ("", "_l", "_r", "_l_2", "_r_2", "_2"):
-    for _type in ("light_brake", "light_reverse", "light_front"):
-        name_b = f"{_type}{_side}_b"
-        name_b2 = f"{_type}{_side}_b_2"
-        name_2b = f"{_type}{_side[:-2] + '_2' if _side.endswith('_2') else _side}_b"
-        MATERIAL_PRIORITIES[f"{_type}_b{_side}"] = 1
-        MATERIAL_PRIORITIES[f"{_type}{_side}_b"] = 1
-        MATERIAL_PRIORITIES[f"{_type}_b{_side}_2"] = 1
-        MATERIAL_PRIORITIES[f"{_type}{_side}_b_2"] = 1
-        # non-b variants at priority 2
-        MATERIAL_PRIORITIES[f"{_type}{_side}"] = 2
 
 
 def get_material_priority(name: str) -> int:
