@@ -5,8 +5,8 @@ Currently a **WIP**, please report all bugs/discoveries in issues.
 
 ## Blender Plugins/Addons
 * **fo2_bgm_import:** Import car _body.bgm_ & additional files (_crash.dat_, _body.ini_, _camera.ini_)
-* **fo2_bgm_export:** **WIP!** Export car _body.bgm_ & additional files (_crash.dat_, _body.ini_, _camera.ini_)
-* **fo2_bgm_hierarchy:** **WIP!** Reorganize a blender scene made with other converters into the expected fo2_bgm_export structure
+* **fo2_bgm_export:** Export car _body.bgm_ & additional files (_crash.dat_, _body.ini_, _camera.ini_)
+* **fo2_bgm_hierarchy:** Reorganize a blender scene made with other converters into the expected fo2_bgm_export structure
 * **fo2_trackai_import:** Import _trackai.bin_ & additional files (_splines.ai_, _startpoints.bed_, _splitpoints.bed_)
 * **fo2_trackai_export:** **WIP!** Export _trackai.bin_ & additional files (_splines.ai_, _startpoints.bed_, _splitpoints.bed_)
 * **fo2_collision_io:** **WIP!** Import/Export collision data _(.cdb2)_ & _shadowmap_w2.dat_
