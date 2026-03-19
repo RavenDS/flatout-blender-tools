@@ -1,7 +1,7 @@
 bl_info = {
     "name":        "FlatOut 2 BGM Export (Car)",
     "author":      "ravenDS",
-    "version":     (1, 5, 0),
+    "version":     (1, 5, 1),
     "blender":     (3, 6, 0),
     "location":    "File > Export > FlatOut 2 BGM Car (.bgm)",
     "description": "Export FlatOut 2 car model (BGM) files. Based on reverse-egineering work by Chloe (FlatOutW32BGMTool)",
@@ -25,6 +25,7 @@ from . import tga2dds as _tga2dds
 
 # CONSTANTS
 
+BGM_VERSION_FO1  = 0x00010004
 BGM_VERSION_FO2  = 0x20000
 BGM_VERSION_FOUC = 0x20002  # same version number but detected via fouc_extra in streams
 
@@ -382,6 +383,9 @@ class FO2Surface:
         self.stream_offset = [0, 0]
         self.fouc_vertex_multiplier = [0.0, 0.0, 0.0, FOUC_VERTEX_SCALE]
         self.is_fouc = False
+        self.is_fo1 = False
+        self.center = [0.0, 0.0, 0.0]   # FO1 only: per-surface AABB centre
+        self.radius = [0.0, 0.0, 0.0]   # FO1 only: per-surface AABB half-extents
 
     def write(self, f):
         f.write(struct.pack('<i', self.is_vegetation))
@@ -391,6 +395,10 @@ class FO2Surface:
         f.write(struct.pack('<i', self.poly_count))
         f.write(struct.pack('<i', self.poly_mode))
         f.write(struct.pack('<i', self.num_indices_used))
+        if self.is_fo1:
+            # version < 0x20000: center (3f) + radius (3f) written before nstreams
+            f.write(struct.pack('<3f', *self.center))
+            f.write(struct.pack('<3f', *self.radius))
         if self.is_fouc:
             f.write(struct.pack('<4f', *self.fouc_vertex_multiplier))
         f.write(struct.pack('<i', self.num_streams_used))
@@ -666,7 +674,7 @@ def build_buffers_for_material(obj, mat_index, flags, vertex_size,
 
 # BUILD FO2 MATERIAL FROM BLENDER MATERIAL
 
-def build_fo2_material(bl_mat) -> FO2Material:
+def build_fo2_material(bl_mat, is_fo1: bool = False) -> FO2Material:
     """Convert a Blender material to an FO2 material struct."""
     mat = FO2Material()
     mat.name = bl_mat.name
@@ -708,7 +716,7 @@ def build_fo2_material(bl_mat) -> FO2Material:
         # still apply texture override rules for special shaders
         if mat.shader_id == SHADER_CAR_BODY:
             tex_name = "skin1.tga"
-        elif mat.shader_id == SHADER_CAR_LIGHTS:
+        elif mat.shader_id == SHADER_CAR_LIGHTS and not is_fo1:
             mat.v92 = 2
     else:
         # infer everything from name
@@ -889,6 +897,7 @@ def write_bgm(filepath: str, context, options: dict):
     use_priorities = options.get('use_priorities', True)
     auto_triangulate = options.get('auto_triangulate', True)
     is_fouc = options.get('game_mode', 'FO2') == 'FOUC'
+    is_fo1  = options.get('game_mode', 'FO2') == 'FO1'
 
     root = find_root_empty(context)
     mesh_objects, empty_objects = collect_objects_under(root, context)
@@ -1023,7 +1032,7 @@ def write_bgm(filepath: str, context, options: dict):
         all_mat_slots.sort(key=lambda m: get_material_priority(m.name))
 
     for i, bl_mat in enumerate(all_mat_slots):
-        fo2_mat = build_fo2_material(bl_mat)
+        fo2_mat = build_fo2_material(bl_mat, is_fo1=is_fo1)
         bl_mat_to_fo2_id[bl_mat] = i
         fo2_materials.append(fo2_mat)
 
@@ -1154,8 +1163,11 @@ def write_bgm(filepath: str, context, options: dict):
             surface.stream_id = [stream_id_counter, stream_id_counter + 1]
             surface.stream_offset = [0, 0]
             surface.is_fouc = is_fouc
+            surface.is_fo1 = is_fo1
 
-            # update AABB from vertex buffer positions
+            # update model AABB and (for FO1) compute per-surface AABB
+            surf_min = [1e9, 1e9, 1e9]
+            surf_max = [-1e9, -1e9, -1e9]
             vdata = vbuf.data
             for vi in range(vert_count):
                 off = vi * vsize
@@ -1173,6 +1185,24 @@ def write_bgm(filepath: str, context, options: dict):
                 aabb_max[0] = max(aabb_max[0], px)
                 aabb_max[1] = max(aabb_max[1], py)
                 aabb_max[2] = max(aabb_max[2], pz)
+                surf_min[0] = min(surf_min[0], px)
+                surf_min[1] = min(surf_min[1], py)
+                surf_min[2] = min(surf_min[2], pz)
+                surf_max[0] = max(surf_max[0], px)
+                surf_max[1] = max(surf_max[1], py)
+                surf_max[2] = max(surf_max[2], pz)
+
+            if is_fo1:
+                surface.center = [
+                    (surf_max[0] + surf_min[0]) * 0.5,
+                    (surf_max[1] + surf_min[1]) * 0.5,
+                    (surf_max[2] + surf_min[2]) * 0.5,
+                ]
+                surface.radius = [
+                    abs(surf_max[0] - surf_min[0]) * 0.5,
+                    abs(surf_max[1] - surf_min[1]) * 0.5,
+                    abs(surf_max[2] - surf_min[2]) * 0.5,
+                ]
 
             model.surface_ids.append(len(fo2_surfaces))
             fo2_surfaces.append(surface)
@@ -1292,7 +1322,13 @@ def write_bgm(filepath: str, context, options: dict):
         fo2_obj = FO2Object()
         fo2_obj.name1 = re.sub(r'\.\d{3}$', '', empty.name)
         fo2_obj.name2 = ""
-        fo2_obj.flags = 0xE0F9
+        # FO1 originals use 0x0; FO2/FOUC use 0xE0F9.
+        # use stored flags from import; fall back to version default.
+        stored_flags = empty.get("bgm_obj_flags", None)
+        if stored_flags is not None:
+            fo2_obj.flags = int(stored_flags)
+        else:
+            fo2_obj.flags = 0x0 if is_fo1 else 0xE0F9
 
         # convert Blender matrix to FO2 column-major flat[16].
         # new mapping fo2=(bl_x,bl_z,bl_y): swap rows/cols 1<->2, no sign changes.
@@ -1330,7 +1366,8 @@ def write_bgm(filepath: str, context, options: dict):
 
     with open(filepath, 'wb') as f:
         # file version
-        f.write(struct.pack('<I', BGM_VERSION_FO2))  # version (same for FO2 and FOUC)
+        version_to_write = BGM_VERSION_FO1 if is_fo1 else BGM_VERSION_FO2
+        f.write(struct.pack('<I', version_to_write))
 
         # materials
         f.write(struct.pack('<I', len(fo2_materials)))
@@ -1696,8 +1733,9 @@ class ExportBGM(bpy.types.Operator, ExportHelper):
         name="Game",
         description="Target game format",
         items=[
-            ('FO2',  "FlatOut 2",             "Export as FlatOut 2 BGM (float vertices)"),
-            ('FOUC', "FlatOut UC",            "Export as FlatOut Ultimate Carnage BGM (int16 vertices)"),
+            ('FO1',  "FlatOut 1",  "Export as FlatOut 1 BGM (float vertices, per-surface AABB in surface block)"),
+            ('FO2',  "FlatOut 2",  "Export as FlatOut 2 BGM (float vertices)"),
+            ('FOUC', "FlatOut UC", "Export as FlatOut Ultimate Carnage BGM (int16 vertices)"),
         ],
         default='FO2',
     )
@@ -1772,9 +1810,11 @@ class ExportBGM(bpy.types.Operator, ExportHelper):
     )
 
     def invoke(self, context, event):
-        # Auto-detect game mode from scene or fo2_body empty
+        # Auto-detect game mode from fo2_body empty, then fall back to scene property
         root = context.scene.objects.get("fo2_body")
-        if root and root.get("bgm_is_fouc"):
+        if root and root.get("bgm_is_fo1"):
+            self.game_mode = 'FO1'
+        elif root and root.get("bgm_is_fouc"):
             self.game_mode = 'FOUC'
         elif hasattr(context.scene, 'fo2_game_mode'):
             self.game_mode = context.scene.fo2_game_mode

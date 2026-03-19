@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "fo2_bgm_import"
-version = "1.5.0"
+version = "1.5.1"
 name = "FlatOut 2 Car BGM (Import)"
 tagline = "Import FlatOut 2 Car Model (body.bgm + crash.dat + body.ini + camera.ini)"
 maintainer = "ravenDS <https://github.com/RavenDS>"

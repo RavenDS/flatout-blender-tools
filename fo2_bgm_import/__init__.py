@@ -1,7 +1,7 @@
 bl_info = {
     "name": "FlatOut 2 BGM Import (Car)",
     "author": "ravenDS",
-    "version": (1, 5, 0),
+    "version": (1, 5, 1),
     "blender": (3, 6, 0),
     "location": "File > Import > FlatOut 2 Car BGM (.bgm)",
     "description": "Import FlatOut 2 BGM car model files",
@@ -730,7 +730,9 @@ def create_blender_material(bgm_mat: BGMMaterial, bgm_dir: str, shared_dir: str,
             break
 
     if tex_name:
-        tex_path = find_texture_file(tex_name, bgm_dir, shared_dir,
+        # FO1 stores "body.tga" in the BGM but the actual file on disk is skin1.tga
+        tex_lookup_name = "skin1.tga" if tex_name.lower() == "body.tga" else tex_name
+        tex_path = find_texture_file(tex_lookup_name, bgm_dir, shared_dir,
                                       auto_shared_dir, convert_dds)
 
         if tex_path:
@@ -778,10 +780,9 @@ def create_blender_material(bgm_mat: BGMMaterial, bgm_dir: str, shared_dir: str,
                                 links.new(spec_node.outputs['Color'], bsdf.inputs['Specular IOR Level'])
         else:
             # Texture not found — leave a placeholder
-            tex_display = tga_to_dds(tex_name)
             print(f"[BGM] WARNING: Texture not found: {tex_name}")
             tex_node = nodes.new('ShaderNodeTexImage')
-            tex_node.label = tex_display
+            tex_node.label = tex_name
             tex_node.location = (-400, 0)
             links.new(tex_node.outputs['Color'], bsdf.inputs['Base Color'])
 
@@ -998,6 +999,8 @@ def build_blender_meshes(context, parser: BGMParser, options: dict):
     root_empty.empty_display_type = 'PLAIN_AXES'
     root_empty.empty_display_size = 0.5
     root_empty["bgm_is_fouc"] = parser.is_fouc
+    root_empty["bgm_is_fo1"]  = (parser.version < 0x20000 and not parser.is_fouc)
+    root_empty["bgm_version"] = parser.version
     fo2_body_coll.objects.link(root_empty)
 
     # create crash root empty and "FO2 Body Crash" collection (if crash.dat exists)
@@ -1052,6 +1055,7 @@ def build_blender_meshes(context, parser: BGMParser, options: dict):
 
         fo2_dummies_coll.objects.link(obj_empty)
         obj_empty.parent = dummies_empty
+        obj_empty["bgm_obj_flags"] = bgm_obj.flags
         object_empties[bgm_obj.name1] = obj_empty
 
     created_objects = []
@@ -1881,7 +1885,7 @@ class ImportBGM(bpy.types.Operator, ImportHelper):
     )
     import_normal_maps: BoolProperty(
         name="Import Normal Maps (FOUC)",
-        default=True,
+        default=False,
         description="For FlatOut UC models, detect and wire <texture>_normal sidecar "
                     "textures into the material's Normal input",
     )
@@ -1975,8 +1979,6 @@ class ImportBGM(bpy.types.Operator, ImportHelper):
         box.prop(self, "shared_texture_dir")
         box.prop(self, "crash_dat_path")
         box.prop(self, "convert_dds")
-        box.prop(self, "import_normal_maps")
-        box.prop(self, "import_specular_maps")
         box.prop(self, "use_alpha")
         box.prop(self, "use_backface_culling")
         row = box.row()
@@ -1995,6 +1997,12 @@ class ImportBGM(bpy.types.Operator, ImportHelper):
         box = layout.box()
         box.label(text="Cameras", icon='CAMERA_DATA')
         box.prop(self, "import_camera_ini")
+
+        # FOUC debug
+        box = layout.box()
+        box.label(text="FOUC Debug", icon='TOOL_SETTINGS')
+        box.prop(self, "import_normal_maps")
+        box.prop(self, "import_specular_maps")
 
     def execute(self, context):
         filepath = self.filepath
@@ -2031,7 +2039,12 @@ class ImportBGM(bpy.types.Operator, ImportHelper):
 
         # Set scene game mode to match the imported file
         try:
-            context.scene.fo2_game_mode = 'FOUC' if parser.is_fouc else 'FO2'
+            if parser.is_fouc:
+                context.scene.fo2_game_mode = 'FOUC'
+            elif parser.version < 0x20000:
+                context.scene.fo2_game_mode = 'FO1'
+            else:
+                context.scene.fo2_game_mode = 'FO2'
         except Exception:
             pass
 
@@ -2329,7 +2342,7 @@ def menu_func_import(self, context):
 def register():
     bpy.types.Scene.fo2_game_mode = bpy.props.EnumProperty(
         name="Game",
-        items=[('FO2', "FlatOut 2", ""), ('FOUC', "FlatOut UC", "")],
+        items=[('FO1', "FlatOut 1", ""), ('FO2', "FlatOut 2", ""), ('FOUC', "FlatOut UC", "")],
         default='FO2',
     )
     bpy.types.Material.fo2_shader_id = bpy.props.EnumProperty(
