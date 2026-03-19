@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FlatOut BGM Tool 2.0.1 — FlatOut BGM converter & optimizer.
+FlatOut BGM Tool 2.1.0 — FlatOut BGM converter & optimizer.
 https://github.com/RavenDS/flatout-blender-tools
 
 by ravenDS (github.com/ravenDS)
@@ -94,7 +94,9 @@ def parse_bgm(path):
     """Parse a PC BGM file.
 
     Returns (version, materials_raw, streams, surfaces, models, rest) where:
-      materials_raw : list of raw byte blobs (round-trip exact)
+      materials_raw : list of material dicts  {ident, name, n_alpha, v92,
+                                               n_num_tex, shader_id, n_use_colormap,
+                                               v74, v108, v109, v98..v101, v102, tex_names}
       streams       : list of dicts  {dt, fc, data, [vc, vs, flags] or [ic]}
       surfaces      : list of dicts  {isveg, mid, vc, flags, pc, pm, niu,
                                        extra, nst, sids, soffs}
@@ -106,25 +108,37 @@ def parse_bgm(path):
     with open(path, 'rb') as f:
         version = struct.unpack('<I', f.read(4))[0]
 
-        # materials — raw blobs for exact round-trip
+        # materials — parsed as structured dicts so shader IDs and v92 can be patched
         nm = struct.unpack('<I', f.read(4))[0]
         materials_raw = []
         for _ in range(nm):
-            start = f.tell()
-            f.read(4)                                    # identifier
-            while f.read(1) not in (b'\x00', b''):       # name (null-terminated)
-                pass
-            f.read(4)                                    # alpha
+            ident  = struct.unpack('<I', f.read(4))[0]
+            name   = _read_string(f)
+            n_alpha = struct.unpack('<i', f.read(4))[0]
+            v92 = n_num_tex = shader_id = n_use_colormap = v74 = 0
+            v108 = v109 = (0, 0, 0)
             if version >= 0x10004:
-                f.read(20); f.read(12); f.read(12)
-            f.read(64)                                   # v98-v101
-            f.read(4)                                    # v102
-            for _ in range(3):
-                while f.read(1) not in (b'\x00', b''):   # tex names
-                    pass
-            end = f.tell()
-            f.seek(start)
-            materials_raw.append(f.read(end - start))
+                v92            = struct.unpack('<i', f.read(4))[0]
+                n_num_tex      = struct.unpack('<i', f.read(4))[0]
+                shader_id      = struct.unpack('<i', f.read(4))[0]
+                n_use_colormap = struct.unpack('<i', f.read(4))[0]
+                v74            = struct.unpack('<i', f.read(4))[0]
+                v108           = struct.unpack('<3i', f.read(12))
+                v109           = struct.unpack('<3i', f.read(12))
+            v98  = struct.unpack('<4i', f.read(16))
+            v99  = struct.unpack('<4i', f.read(16))
+            v100 = struct.unpack('<4i', f.read(16))
+            v101 = struct.unpack('<4i', f.read(16))
+            v102 = struct.unpack('<i', f.read(4))[0]
+            tex_names = [_read_string(f) for _ in range(3)]
+            materials_raw.append({
+                'ident': ident, 'name': name, 'n_alpha': n_alpha,
+                'v92': v92, 'n_num_tex': n_num_tex, 'shader_id': shader_id,
+                'n_use_colormap': n_use_colormap, 'v74': v74,
+                'v108': v108, 'v109': v109,
+                'v98': v98, 'v99': v99, 'v100': v100, 'v101': v101,
+                'v102': v102, 'tex_names': tex_names,
+            })
 
         # streams
         ns = struct.unpack('<I', f.read(4))[0]
@@ -232,8 +246,25 @@ def write_bgm(path, version, materials_raw, streams, surfaces, models, meshes, o
         f.write(struct.pack('<I', version))
 
         f.write(struct.pack('<I', len(materials_raw)))
-        for blob in materials_raw:
-            f.write(blob)
+        for m in materials_raw:
+            f.write(struct.pack('<I', m['ident']))
+            f.write(m['name'].encode('ascii') + b'\x00')
+            f.write(struct.pack('<i', m['n_alpha']))
+            if version >= 0x10004:
+                f.write(struct.pack('<i', m['v92']))
+                f.write(struct.pack('<i', m['n_num_tex']))
+                f.write(struct.pack('<i', m['shader_id']))
+                f.write(struct.pack('<i', m['n_use_colormap']))
+                f.write(struct.pack('<i', m['v74']))
+                f.write(struct.pack('<3i', *m['v108']))
+                f.write(struct.pack('<3i', *m['v109']))
+            f.write(struct.pack('<4i', *m['v98']))
+            f.write(struct.pack('<4i', *m['v99']))
+            f.write(struct.pack('<4i', *m['v100']))
+            f.write(struct.pack('<4i', *m['v101']))
+            f.write(struct.pack('<i', m['v102']))
+            for t in m['tex_names']:
+                f.write(t.encode('ascii') + b'\x00')
 
         f.write(struct.pack('<I', len(streams)))
         for s in streams:
@@ -773,13 +804,7 @@ def op_menucar(surfaces, models, materials_raw, version):
     """
     import struct
 
-    # parse material names from raw blobs (name = null-terminated string after 4-byte identifier)
-    def mat_name(blob):
-        off = 4  # skip identifier
-        end = blob.index(0, off)
-        return blob[off:end].decode('ascii', errors='replace')
-
-    mat_names = [mat_name(b) for b in materials_raw]
+    mat_names = [m['name'] for m in materials_raw]
 
     print(f"\n── Menucar surface ordering ──")
 
@@ -1307,21 +1332,109 @@ def _convert_crash_dat_file(crash_path, output_path,
     _write_crash_dat(output_path, new_nodes, is_fouc=dst_is_fouc)
 
 
-def op_convert(streams, surfaces, objects, version, is_fouc, is_fo1, target):
-    """Convert BGM streams, surfaces and OBJC objects to the target game format.
+
+# SHADER ID mapping tables
+# 
+# FO1/FO2 share the same shader IDs (0-41)
+# FOUC extends the table (adds 42-54) and shifts some IDs
+# shaders 0-37 are identical
+
+# FO2/FO1 to FOUC  (only entries that differ)
+FO2_TO_FOUC_SHADER = {
+    38: 39,   # Ghost Body     → Ghost Body
+    39: 40,   # Static Nonlit  → Static Nonlit
+    40: 41,   # Dynamic Nonlit → Dynamic Nonlit
+    41: 50,   # Racemap        → Racemap
+}
+
+# FOUC to FO2/FO1  (FOUC-only shaders fallback to FO2 equivalent)
+FOUC_TO_FO2_SHADER = {
+    38: 15,   # Horizon              → Default
+    39: 38,   # Ghost Body           → Ghost Body
+    40: 39,   # Static Nonlit        → Static Nonlit
+    41: 40,   # Dynamic Nonlit       → Dynamic Nonlit
+    42: 15,   # Skid Marks           → Default
+    43:  7,   # Car Interior         → Car Diffuse
+    44:  9,   # Car Tire             → Car Tire
+    45: 15,   # Puddle               → Default
+    46: 15,   # Ambient Shadow       → Default
+    47: 25,   # Local Water          → Water
+    48: 15,   # Static Specular      → Default
+    49: 15,   # Lightmapped Refl.    → Default
+    50: 41,   # Racemap              → Racemap
+    51: 15,   # HDR Default          → Default
+    52: 15,   # Ambient Particle     → Default
+    53: 22,   # Videoscreen Dynamic  → Particle
+    54: 22,   # Videoscreen Static   → Particle
+}
+
+# car lights (10) and car lights unlit (14) need v92 adjusted per game
+LIGHT_SHADER_IDS = {10, 14}
+V92_FO1   = 0   # FO1: v92 = 0 for lights
+V92_FO2UC = 2   # FO2 / FOUC: v92 = 2 for lights
+
+
+def _remap_shaders(materials_raw, src_is_fouc, src_is_fo1,
+                   dst_is_fouc, dst_is_fo1, version):
+    """Remap nShaderId and v92 in all materials for a format conversion.
+
+    Returns a new shallow-copied list; originals are not modified.
+    No-op for pre-0x10004 files (they have no shader_id / v92 fields).
+    """
+    import copy as _c
+    materials_raw = [_c.copy(m) for m in materials_raw]
+
+    if version < 0x10004:
+        return materials_raw
+
+    if src_is_fouc and not dst_is_fouc:
+        shader_map = FOUC_TO_FO2_SHADER
+    elif not src_is_fouc and dst_is_fouc:
+        shader_map = FO2_TO_FOUC_SHADER
+    else:
+        shader_map = {}   # FO1<->FO2: same IDs, only v92 may change
+
+    remapped = 0
+    v92_fixed = 0
+    for m in materials_raw:
+        old_sid = m['shader_id']
+        new_sid = shader_map.get(old_sid, old_sid)
+        if new_sid != old_sid:
+            m['shader_id'] = new_sid
+            remapped += 1
+
+        if m['shader_id'] in LIGHT_SHADER_IDS:
+            target_v92 = V92_FO1 if dst_is_fo1 else V92_FO2UC
+            if m['v92'] != target_v92:
+                m['v92'] = target_v92
+                v92_fixed += 1
+
+    if remapped:
+        print(f"  Shader IDs remapped: {remapped} material(s)")
+    if v92_fixed:
+        print(f"  Light v92 updated:   {v92_fixed} material(s) "
+              f"({'→ 0 (FO1)' if dst_is_fo1 else '→ 2 (FO2/FOUC)'})")
+
+    return materials_raw
+
+def op_convert(streams, surfaces, objects, materials_raw,
+               version, is_fouc, is_fo1, target):
+    """Convert streams, surfaces, objects and materials to the target game format.
 
     target: 'FO1' | 'FO2' | 'FOUC'
 
-    Returns (new_streams, new_surfaces, new_objects, new_version, new_is_fouc, new_is_fo1).
+    Returns (new_streams, new_surfaces, new_objects, new_materials,
+             new_version, new_is_fouc, new_is_fo1).
     crash.dat conversion is handled separately by _convert_crash_dat_file().
 
     What changes per transition:
-      FO1 → FO2/FOUC : version; strip surface center/radius; OBJC flags 0x00000000→0x0000E0F9
-      FO1 → FOUC      : also VB float→int16; add multiplier extra; fc→22
-      FO2 → FO1       : version; compute & add surface center/radius; OBJC flags 0x0000E0F9→0x00000000
-      FO2 → FOUC      : VB float→int16; add multiplier extra; fc→22
-      FOUC → FO2      : VB int16→float; remove multiplier extra; fc→0
-      FOUC → FO1      : version; VB int16→float; remove multiplier; add center/radius; OBJC flags→0x00000000
+      All paths    : nShaderId remapped (38-41+ range diverges FO2↔FOUC);
+                     light shader v92 updated (0 for FO1, 2 for FO2/FOUC)
+      FO1→FO2/FOUC : version; strip surface center/radius; OBJC flags 0x00→0xE0F9
+      FO1/FO2→FOUC : VB float→int16; add multiplier extra (16 B); fc→22
+      FO2→FO1      : version; compute & add surface center/radius; OBJC flags 0xE0F9→0x00
+      FOUC→FO2/FO1 : VB int16→float; strip multiplier extra; fc→0
+      FOUC→FO1     : all of the above
     """
     import copy as _copy
 
@@ -1335,7 +1448,7 @@ def op_convert(streams, surfaces, objects, version, is_fouc, is_fo1, target):
 
     if src_label == target:
         print("  Source and target formats are identical — nothing to do.")
-        return streams, surfaces, version, is_fouc, is_fo1
+        return streams, surfaces, objects, materials_raw, version, is_fouc, is_fo1
 
     streams  = _copy.deepcopy(streams)
     surfaces = _copy.deepcopy(surfaces)
@@ -1452,6 +1565,10 @@ def op_convert(streams, surfaces, objects, version, is_fouc, is_fo1, target):
     print(f"  Updated extra bytes on {len(surfaces)} surfaces  "
           f"({'24 B center/radius' if new_is_fo1 else '16 B multiplier' if new_is_fouc else 'none'})")
 
+    # shader ID + v92 remapping
+    materials_raw = _remap_shaders(materials_raw, is_fouc, is_fo1,
+                                   new_is_fouc, new_is_fo1, version)
+
     # OBJC flags
     # FO1 uses 0x00000000 for all object/dummy flags.
     # FO2 and FOUC use 0x0000E0F9.
@@ -1472,7 +1589,7 @@ def op_convert(streams, surfaces, objects, version, is_fouc, is_fo1, target):
     # version
     print(f"  Version: 0x{version:X} → 0x{new_version:X}")
 
-    return streams, surfaces, objects, new_version, new_is_fouc, new_is_fo1
+    return streams, surfaces, objects, materials_raw, new_version, new_is_fouc, new_is_fo1
 
 
 def _parse_bgm_streams_only(path):
@@ -1591,8 +1708,8 @@ def main():
     surfaces_pre_convert = surfaces
 
     if convert_target:
-        streams, surfaces, objects, version, is_fouc, is_fo1 = op_convert(
-            streams, surfaces, objects, version, is_fouc, is_fo1, convert_target)
+        streams, surfaces, objects, materials_raw, version, is_fouc, is_fo1 = op_convert(
+            streams, surfaces, objects, materials_raw, version, is_fouc, is_fo1, convert_target)
 
     if do_windflip:
         streams, surfaces = op_windflip(streams, surfaces, is_fouc, models=models)
