@@ -1,7 +1,7 @@
 bl_info = {
     "name": "FlatOut 2 BGM Import (Car)",
     "author": "ravenDS",
-    "version": (1, 5, 1),
+    "version": (1, 5, 2),
     "blender": (3, 6, 0),
     "location": "File > Import > FlatOut 2 Car BGM (.bgm)",
     "description": "Import FlatOut 2 BGM car model files",
@@ -196,8 +196,11 @@ def parse_crash_dat(filepath: str, is_fouc: bool = False) -> list:
                     w = CrashWeight(
                         base_pos=(bp[0]*SCALE, bp[1]*SCALE, bp[2]*SCALE),
                         crash_pos=(cp[0]*SCALE, cp[1]*SCALE, cp[2]*SCALE),
-                        base_normal=((bn[0]-128)/128.0, (bn[1]-128)/128.0, (bn[2]-128)/128.0),
-                        crash_normal=((cn[0]-128)/128.0, (cn[1]-128)/128.0, (cn[2]-128)/128.0),
+                        # tCrashDataWeightsFOUC normal encoding matches tVertexDataFOUC:
+                        # buffer[0]=FO2.z, buffer[1]=FO2.y, buffer[2]=FO2.x
+                        # formula: (uint8 / 127.0) - 1.0
+                        base_normal=((bn[2]/127.0)-1.0, (bn[1]/127.0)-1.0, (bn[0]/127.0)-1.0),
+                        crash_normal=((cn[2]/127.0)-1.0, (cn[1]/127.0)-1.0, (cn[0]/127.0)-1.0),
                     )
                     surf.weights.append(w)
             else:
@@ -464,16 +467,34 @@ def extract_vertices(parser: BGMParser, surface: Surface) -> list:
         offset = base_offset + i * stride
 
         if is_fouc:
-            # tVertexDataFOUC: int16[3] pos, uint16 pad, uint8[4] tangents,
-            #                  uint8[4] bitangents, uint8[4] normals, uint8[4] colors,
-            #                  int16[2] UV1, int16[2] UV2  — all 32 bytes
-            scale = surface.fouc_vertex_multiplier[3] if surface.fouc_vertex_multiplier[3] != 0 else FOUC_VERTEX_SCALE
+            # tVertexDataFOUC layout (32 bytes):
+            #   offset  0: int16[3]  vPos
+            #   offset  6: uint16    pad
+            #   offset  8: uint8[4]  vTangents
+            #   offset 12: uint8[4]  vBitangents
+            #   offset 16: uint8[4]  vNormals   ← [0]=FO2.z, [1]=FO2.y, [2]=FO2.x
+            #   offset 20: uint8[4]  vVertexColors
+            #   offset 24: uint16[2] vUV1
+            #   offset 28: uint16[2] vUV2
+            # Position decode per C++ reference (w32fbxexport.h):
+            #   raw = int16 value
+            #   FO2.x = (raw_x + mult[0]) * mult[3]
+            #   FO2.y = (raw_y + mult[1]) * mult[3]
+            #   FO2.z = (raw_z + mult[2]) * mult[3]
+            # mult[0,1,2] are per-surface int16-space offsets (non-zero on shadow/special surfaces)
+            # mult[3] is the scale (default 0.000977 = 1/1024, but can differ per surface)
+            scale  = surface.fouc_vertex_multiplier[3] if surface.fouc_vertex_multiplier[3] != 0 else FOUC_VERTEX_SCALE
+            off_x  = surface.fouc_vertex_multiplier[0]
+            off_y  = surface.fouc_vertex_multiplier[1]
+            off_z  = surface.fouc_vertex_multiplier[2]
             px, py, pz = struct.unpack_from('<3h', vb.data, offset)
-            v.x, v.y, v.z = px * scale, py * scale, pz * scale
+            v.x = (px + off_x) * scale
+            v.y = (py + off_y) * scale
+            v.z = (pz + off_z) * scale
             nrm = struct.unpack_from('<4B', vb.data, offset + 16)
-            v.nx = (nrm[0] - 128) / 128.0
-            v.ny = (nrm[1] - 128) / 128.0
-            v.nz = (nrm[2] - 128) / 128.0
+            v.nx = (nrm[2] / 127.0) - 1.0  # FO2 X  (buffer byte 18)
+            v.ny = (nrm[1] / 127.0) - 1.0  # FO2 Y  (buffer byte 17)
+            v.nz = (nrm[0] / 127.0) - 1.0  # FO2 Z  (buffer byte 16)
             v.has_normal = True
             col = struct.unpack_from('<4B', vb.data, offset + 20)
             v.r, v.g, v.b, v.a = col[0]/255.0, col[1]/255.0, col[2]/255.0, col[3]/255.0

@@ -1,7 +1,7 @@
 bl_info = {
     "name":        "FlatOut 2 BGM Export (Car)",
     "author":      "ravenDS",
-    "version":     (1, 5, 1),
+    "version":     (1, 5, 2),
     "blender":     (3, 6, 0),
     "location":    "File > Export > FlatOut 2 BGM Car (.bgm)",
     "description": "Export FlatOut 2 car model (BGM) files. Based on reverse-egineering work by Chloe (FlatOutW32BGMTool)",
@@ -189,17 +189,27 @@ FOUC_VERTEX_SCALE_INV = 1.0 / FOUC_VERTEX_SCALE  # 1024.0
 def pack_fouc_vertex(fo2_pos, fo2_nrm, fo2_uv) -> bytes:
     """Pack a single FOUC vertex (32 bytes).
     fo2_pos: (x,y,z) in FO2 world units
-    fo2_nrm: (nx,ny,nz) normalized
+    fo2_nrm: (fo2.x, fo2.y, fo2.z) normalized — FO2 native space
     fo2_uv:  (u,v) 0..1 range
+
+    Buffer normal layout (per tVertexDataFOUC / w32fbxexport.h reference):
+      buffer[16] = enc(FO2.z) = enc(fo2_nrm[2])
+      buffer[17] = enc(FO2.y) = enc(fo2_nrm[1])
+      buffer[18] = enc(FO2.x) = enc(fo2_nrm[0])
+    Decode formula: float = (uint8 / 127.0) - 1.0
+    Encode formula: uint8 = round((float + 1.0) * 127.0), clamped [0, 255]
     """
     # position: float -> int16 via scale
     px = max(-32767, min(32767, int(round(fo2_pos[0] * FOUC_VERTEX_SCALE_INV))))
     py = max(-32767, min(32767, int(round(fo2_pos[1] * FOUC_VERTEX_SCALE_INV))))
     pz = max(-32767, min(32767, int(round(fo2_pos[2] * FOUC_VERTEX_SCALE_INV))))
-    # normals: float -1..1 -> uint8 0..255, 4th byte = 255
-    def enc_nrm(v): return max(0, min(255, int(round(v * 128.0 + 128.0))))
-    nx, ny, nz = enc_nrm(fo2_nrm[0]), enc_nrm(fo2_nrm[1]), enc_nrm(fo2_nrm[2])
-    # UV: float → int16 (scale 1024)
+    # normals: encode with (v + 1.0) * 127.0, 4th byte = 255
+    # component order in buffer: [0]=FO2.z, [1]=FO2.y, [2]=FO2.x
+    def enc_nrm(v): return max(0, min(255, int(round((v + 1.0) * 127.0))))
+    b_nrm0 = enc_nrm(fo2_nrm[2])  # buffer[16] = FO2.z
+    b_nrm1 = enc_nrm(fo2_nrm[1])  # buffer[17] = FO2.y
+    b_nrm2 = enc_nrm(fo2_nrm[0])  # buffer[18] = FO2.x
+    # UV: float → int16 (scale 2048)
     UV_SCALE = 2048.0
     u = max(-32767, min(32767, int(round(fo2_uv[0] * UV_SCALE))))
     v = max(-32767, min(32767, int(round(fo2_uv[1] * UV_SCALE))))
@@ -207,12 +217,12 @@ def pack_fouc_vertex(fo2_pos, fo2_nrm, fo2_uv) -> bytes:
     #       uint8[4] norm + uint8[4] color + int16[2] UV1 + int16[2] UV2
     return struct.pack('<3hH4B4B4B4B2h2h',
         px, py, pz, 0,
-        128, 128, 128, 255,   # tangents (neutral)
-        128, 128, 128, 255,   # bitangents (neutral)
-        nx, ny, nz, 255,      # normals
-        255, 255, 255, 255,   # vertex color (white)
-        u, v,                 # UV1
-        0, 0,                 # UV2
+        128, 128, 128, 255,           # tangents (neutral)
+        128, 128, 128, 255,           # bitangents (neutral)
+        b_nrm0, b_nrm1, b_nrm2, 255, # normals: [z, y, x, pad]
+        255, 255, 255, 255,           # vertex color (white)
+        u, v,                         # UV1
+        0, 0,                         # UV2
     )
 
 
