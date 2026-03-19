@@ -1,7 +1,7 @@
 bl_info = {
     "name": "FlatOut 2 BGM Import (Car)",
     "author": "ravenDS",
-    "version": (1, 5, 2),
+    "version": (1, 5, 3),
     "blender": (3, 6, 0),
     "location": "File > Import > FlatOut 2 Car BGM (.bgm)",
     "description": "Import FlatOut 2 BGM car model files",
@@ -1093,7 +1093,20 @@ def build_blender_meshes(context, parser: BGMParser, options: dict):
         all_face_mat_indices = []
         mat_index_map = {}  # bgm mat id -> local mesh mat index
         mesh_materials = []  # ordered list of blender materials for this mesh
-        vert_offset = 0
+
+        # two level vertex deduplication to eliminate seam creases when merging surfaces:
+        #
+        # 1 — by (stream_id, absolute_vb_index): surfaces that share the same
+        #   physical VB data (same stream, same index) always get the same Blender vertex.
+        #
+        # 2 — by (decoded_position, decoded_normal): surfaces that DON'T share VB
+        #   indices but have vertices at the same 3D position with the same normal (i.e.
+        #   seam boundary vertices duplicated into separate VB regions) are also merged.
+        #   Vertices at the same position with DIFFERENT normals are kept separate — those
+        #   represent intentional hard edges.
+
+        abs_stream_idx_to_vert = {}   # (stream_id, abs_vb_idx) -> bl_vi
+        pos_nrm_to_vert       = {}    # (pos_key, nrm_key)       -> bl_vi
 
         for surf in surfaces:
             vb = parser.vertex_buffers[surf.stream_id[0]]
@@ -1120,13 +1133,35 @@ def build_blender_meshes(context, parser: BGMParser, options: dict):
             has_uvs = any(v.has_uv for v in verts)
             has_colors = any(v.has_color for v in verts)
 
-            # transform and add vertices
-            for v in verts:
+            local_to_blender = {}  # local surface vert index -> index in all_verts
+            for vi, v in enumerate(verts):
+                # level 1: exact VB index match
+                abs_key = (surf.stream_id[0], base_vertex_offset + vi)
+                if abs_key in abs_stream_idx_to_vert:
+                    local_to_blender[vi] = abs_stream_idx_to_vert[abs_key]
+                    continue
+
+                # level 2: same decoded position + same decoded normal
+                # use raw float values rounded to avoid fp noise; 
+                # normal as 3-tuple of rounded floats so quantization doesn't prevent matching.
+                nrm_key = (round(v.nx, 4), round(v.ny, 4), round(v.nz, 4))                           if has_normals else None
+                pos_key = (round(v.x, 6), round(v.y, 6), round(v.z, 6))
+                pn_key  = (pos_key, nrm_key)
+                if pn_key in pos_nrm_to_vert:
+                    bl_vi = pos_nrm_to_vert[pn_key]
+                    abs_stream_idx_to_vert[abs_key] = bl_vi
+                    local_to_blender[vi] = bl_vi
+                    continue
+
+                # New vertex
+                bl_vi = len(all_verts)
+                abs_stream_idx_to_vert[abs_key] = bl_vi
+                pos_nrm_to_vert[pn_key]         = bl_vi
+                local_to_blender[vi]            = bl_vi
+
                 pos = Vector((v.x, v.y, v.z))
                 if not use_origins:
-                    # bake mesh matrix into vertices
                     pos = mesh_matrix @ pos
-                # apply axis conversion: FO2(x,y,z) → Blender(x,z,y)
                 pos = axis_matrix @ pos
                 pos *= global_scale
                 all_verts.append(pos)
@@ -1150,24 +1185,20 @@ def build_blender_meshes(context, parser: BGMParser, options: dict):
                 if has_colors:
                     all_colors.append((v.r, v.g, v.b, v.a))
 
-            # add faces (reversed winding)
+            # add faces (reversed winding), using deduplicated vertex indices
             for i0, i1, i2 in faces:
                 fi0 = i0 - base_vertex_offset
                 fi1 = i1 - base_vertex_offset
                 fi2 = i2 - base_vertex_offset
                 if not (0 <= fi0 < len(verts) and 0 <= fi1 < len(verts) and 0 <= fi2 < len(verts)):
                     continue
-                if fi0 == fi1 or fi1 == fi2 or fi0 == fi2:
+                bl0 = local_to_blender[fi0]
+                bl1 = local_to_blender[fi1]
+                bl2 = local_to_blender[fi2]
+                if bl0 == bl1 or bl1 == bl2 or bl0 == bl2:
                     continue
-                # original winding (X+Z negate preserves handedness)
-                all_faces.append((
-                    vert_offset + fi0,
-                    vert_offset + fi1,
-                    vert_offset + fi2,
-                ))
+                all_faces.append((bl0, bl1, bl2))
                 all_face_mat_indices.append(local_mat_idx)
-
-            vert_offset += len(verts)
 
         if not all_faces:
             continue
@@ -1208,6 +1239,11 @@ def build_blender_meshes(context, parser: BGMParser, options: dict):
         if all_face_mat_indices:
             bl_mesh.polygons.foreach_set("material_index", all_face_mat_indices)
 
+        # smooth shading must be enabled on every polygon or Blender ignores
+        # custom split normals entirely (the pre-4.1 use_auto_smooth mechanism
+        # is gone in 4.2+; per-polygon use_smooth is the replacement)
+        bl_mesh.polygons.foreach_set("use_smooth", [True] * len(all_faces))
+
         # UV layer must be set BEFORE update/validate which may remove degenerate faces
         if all_uvs:
             uv_layer = bl_mesh.uv_layers.new(name="UVMap")
@@ -1245,30 +1281,28 @@ def build_blender_meshes(context, parser: BGMParser, options: dict):
                 except Exception:
                     pass
 
-        # custom normals, requires update/validate first
+        # update + validate geometry before setting custom normals
+        bl_mesh.update()
+        bl_mesh.validate()
+
+        # custom split normals — must be set LAST, no update() after or Blender
+        # recalculates and overwrites them
         if all_normals:
-            # we need per-loop normals
             loop_normals = []
             for f in all_faces:
                 for vi in f:
-                    n = all_normals[vi]
-                    loop_normals.append(n)
+                    loop_normals.append(all_normals[vi])
 
-            bl_mesh.update()
-            bl_mesh.validate()
-
-            # set custom split normals
             try:
                 bl_mesh.normals_split_custom_set(loop_normals)
             except Exception:
-                # fallback for older Blender
                 try:
+                    # older Blender (pre-4.1) needed use_auto_smooth=True first
                     bl_mesh.use_auto_smooth = True
                     bl_mesh.normals_split_custom_set(loop_normals)
                 except Exception:
                     pass
-
-        bl_mesh.update()
+        # intentionally no bl_mesh.update() here — it would overwrite custom normals
 
         if validate_meshes:
             bl_mesh.validate(verbose=True)
@@ -1420,6 +1454,8 @@ def build_blender_meshes(context, parser: BGMParser, options: dict):
                 if crash_all_face_mat_indices:
                     bl_crash_mesh.polygons.foreach_set("material_index", crash_all_face_mat_indices)
 
+                bl_crash_mesh.polygons.foreach_set("use_smooth", [True] * len(crash_all_faces))
+
                 # UV layer before update/validate
                 if crash_all_uvs:
                     uv_layer = bl_crash_mesh.uv_layers.new(name="UVMap")
@@ -1430,14 +1466,15 @@ def build_blender_meshes(context, parser: BGMParser, options: dict):
                     for i, uv in enumerate(uv_data):
                         uv_layer.data[i].uv = uv
 
-                # custom normals after update/validate
+                # update + validate geometry, then set custom normals last (no update after)
+                bl_crash_mesh.update()
+                bl_crash_mesh.validate()
+
                 if crash_all_normals:
                     loop_normals = []
                     for f in crash_all_faces:
                         for vi in f:
                             loop_normals.append(crash_all_normals[vi])
-                    bl_crash_mesh.update()
-                    bl_crash_mesh.validate()
                     try:
                         bl_crash_mesh.normals_split_custom_set(loop_normals)
                     except Exception:
@@ -1446,8 +1483,7 @@ def build_blender_meshes(context, parser: BGMParser, options: dict):
                             bl_crash_mesh.normals_split_custom_set(loop_normals)
                         except Exception:
                             pass
-
-                bl_crash_mesh.update()
+                # intentionally no bl_crash_mesh.update() here
 
                 crash_obj = bpy.data.objects.new(crash_mesh_name, bl_crash_mesh)
                 fo2_crash_coll.objects.link(crash_obj)
@@ -2100,10 +2136,6 @@ class ImportBGM(bpy.types.Operator, ImportHelper):
 
         return {'FINISHED'}
 
-
-# SHADER ID PANEL
-
-# SHADER ID PANEL
 
 # SHADER ID PANEL
 
