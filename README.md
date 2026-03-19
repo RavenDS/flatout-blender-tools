@@ -12,10 +12,10 @@ Currently a **WIP**, please report all bugs/discoveries in issues.
 * **fo2_collision_io:** **WIP!** Import/Export collision data _(.cdb2)_ & _shadowmap_w2.dat_
 
 ## Standalone Scripts
+* **bgm_tool:** Convert + optimize BGM Files for FlatOut 1/2/UC _(experimental)_
+* **pctops2_bgm:** Convert PC .bgm to PS2 .bgm _(experimental)_
 * **dds2tga:** Convert .dds to .tga 32-bit, preserve alpha channel
 * **tga2dds:** Convert .tga to .dds (DXT1, DXT3, DXT5)
-* **pctops2_bgm:** Convert PC .bgm to PS2 .bgm _(experimental)_
-* **bgm_optimize:** Optimize BGM Files for FlatOut 2 PC _(experimental)_
 
 ## Credits &amp; Notes
 - [Chloe](https://github.com/gaycoderprincess) for her work on the model format ([FlatOutW32BGMTool](https://github.com/gaycoderprincess/FlatOutW32BGMTool))
