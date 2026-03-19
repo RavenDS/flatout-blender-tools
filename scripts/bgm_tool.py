@@ -1348,14 +1348,29 @@ def op_convert(streams, surfaces, objects, version, is_fouc, is_fo1, target):
         # only VB streams (dt 1 or 3) have a 'vs' key, IB streams (dt 2) do not
         old_vs_map = {si: sv['vs'] for si, sv in enumerate(streams) if sv['dt'] in (1, 3)}
 
-        # build per-stream multiplier for FOUC->FO2 (read from surface extras before we mutate them)
-        fouc_mult_per_stream = {}
+        # FOUC->FO2: build a per-vertex multiplier table before converting.
+        # Multiple surfaces can share the same VB stream but carry DIFFERENT foucVertexMultiplier values in their surface extras
+        # shadow surface for example (mult=[0,154,-12,0.003906] vs default [0,0,0,0.000977])
+        # using a single per-stream multiplier silently corrupts every surface that isn't the first one registered 
+        # tamp each surface's multiplier onto its exact vertex slice before touching the stream
         if is_fouc:
+            # build per-stream per-vertex multiplier arrays (one tuple per vert)
+            stream_vert_mults = {}   # stream_id -> list of mult tuples, len == sv['vc']
+            for si, sv in enumerate(streams):
+                if sv['dt'] in (1, 3):
+                    stream_vert_mults[si] = [(0.0, 0.0, 0.0, FOUC_SCALE)] * sv['vc']
+
             for s in surfaces:
-                if s['sids'] and len(s['extra']) >= 16:
-                    vid = s['sids'][0]
-                    if vid not in fouc_mult_per_stream:
-                        fouc_mult_per_stream[vid] = struct.unpack_from('<4f', s['extra'], 0)
+                if not s['sids'] or len(s['extra']) < 16:
+                    continue
+                vid   = s['sids'][0]
+                if vid not in stream_vert_mults:
+                    continue
+                vbase = s['soffs'][0] // 32   # FOUC stride is always 32
+                mult  = struct.unpack_from('<4f', s['extra'], 0)
+                for vi in range(s['vc']):
+                    if vbase + vi < len(stream_vert_mults[vid]):
+                        stream_vert_mults[vid][vbase + vi] = mult
 
         new_stream_list = []
         sid_map = {}
@@ -1363,10 +1378,31 @@ def op_convert(streams, surfaces, objects, version, is_fouc, is_fo1, target):
             if sv['dt'] in (1, 3):
                 if is_fouc:
                     # FOUC int16 → FO2 float (36 B, flags 0x0152)
-                    mult = fouc_mult_per_stream.get(si, (0.0, 0.0, 0.0, FOUC_SCALE))
-                    new_data, new_flags, new_vs = _fouc_vert_to_fo2(sv['data'], sv['vc'], mult)
+                    # Apply each vertex's own multiplier from the table above.
+                    vert_mults = stream_vert_mults.get(si, [])
+                    out = bytearray(sv['vc'] * 36)
+                    for vi in range(sv['vc']):
+                        m = vert_mults[vi] if vi < len(vert_mults) else (0.0, 0.0, 0.0, FOUC_SCALE)
+                        ox, oy, oz = m[0], m[1], m[2]
+                        sc = m[3] if m[3] != 0.0 else FOUC_SCALE
+                        base = vi * 32
+                        px, py, pz = struct.unpack_from('<3h', sv['data'], base)
+                        nb  = struct.unpack_from('<4B', sv['data'], base + 16)
+                        col = struct.unpack_from('<4B', sv['data'], base + 20)
+                        uv  = struct.unpack_from('<2h', sv['data'], base + 24)
+                        dst = vi * 36
+                        struct.pack_into('<3f', out, dst,
+                                         (px + ox) * sc, (py + oy) * sc, (pz + oz) * sc)
+                        struct.pack_into('<3f', out, dst + 12,
+                                         (nb[2] / 127.0) - 1.0,
+                                         (nb[1] / 127.0) - 1.0,
+                                         (nb[0] / 127.0) - 1.0)
+                        struct.pack_into('<4B', out, dst + 24, col[0], col[1], col[2], col[3])
+                        struct.pack_into('<2f', out, dst + 28,
+                                         uv[0] / 2048.0, uv[1] / 2048.0)
                     new_stream_list.append({'dt': sv['dt'], 'fc': 0,
-                        'vc': sv['vc'], 'vs': new_vs, 'flags': new_flags, 'data': new_data})
+                        'vc': sv['vc'], 'vs': 36, 'flags': FO2_VERTEX_FLAGS_FULL,
+                        'data': bytes(out)})
                 else:
                     # FO2 float → FOUC int16 (32 B, flags 0x2242)
                     new_data, _ = _fo2_vert_to_fouc(sv['data'], sv['vc'], sv['vs'], sv['flags'])
