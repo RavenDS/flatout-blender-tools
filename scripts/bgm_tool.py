@@ -1212,7 +1212,7 @@ def _compute_surface_aabb(streams, surface):
 def _convert_crash_dat_file(crash_path, output_path,
                              src_is_fouc, dst_is_fouc,
                              surfaces, streams_src, streams_dst,
-                             models=None):
+                             models=None, surfaces_dst=None):
     """Convert a crash.dat file between FO2/FO1 and FOUC formats.
 
     FO2/FO1 crash surface:
@@ -1268,20 +1268,27 @@ def _convert_crash_dat_file(crash_path, output_path,
 
                 vtx = b''
                 dst_vs = 36   # FO2 default; updated below if stream found
-                if bgm_surf is not None and bgm_surf['sids']:
-                    vid = bgm_surf['sids'][0]
+                # Use surfaces_dst (post-convert) to find the correct per-surface stream.
+                # Pre-convert surfaces all have sids[0]=0 (shared FOUC stream), which is
+                # wrong after per-surface VB conversion where each surface owns its stream.
+                bgm_surf_dst = None
+                if surfaces_dst is not None:
+                    if model_surf_ids is not None and j < len(model_surf_ids):
+                        sid_dst = model_surf_ids[j]
+                        if sid_dst < len(surfaces_dst):
+                            bgm_surf_dst = surfaces_dst[sid_dst]
+                    elif surf_idx < len(surfaces_dst):
+                        bgm_surf_dst = surfaces_dst[surf_idx]
+                if bgm_surf_dst is not None and bgm_surf_dst['sids']:
+                    vid = bgm_surf_dst['sids'][0]
                     if vid < len(streams_dst):
                         sv_dst = streams_dst[vid]
                         dst_vs = sv_dst['vs']
-                        # soffs[0] is a FOUC byte offset (stride 32).
-                        # recalculate as vertex-index * new stride.
-                        src_vs = 32   # FOUC VB stride is 32
-                        vertex_index = bgm_surf['soffs'][0] // src_vs
-                        new_voff = vertex_index * dst_vs
-                        vtx = sv_dst['data'][new_voff : new_voff + bgm_surf['vc'] * dst_vs]
+                        voff   = bgm_surf_dst['soffs'][0]  # already 0-based after conversion
+                        vtx    = sv_dst['data'][voff : voff + bgm_surf_dst['vc'] * dst_vs]
 
-                # per-surface foucVertexMultiplier for correct position decoding.
-                # default: no offset, scale = 1/1024.
+                # Per-surface foucVertexMultiplier for correct position decoding.
+                # Read from pre-convert bgm_surf — extra is stripped during conversion.
                 mult = (0.0, 0.0, 0.0, FOUC_SCALE)
                 if bgm_surf is not None and len(bgm_surf.get('extra', b'')) >= 16:
                     mult = struct.unpack_from('<4f', bgm_surf['extra'], 0)
@@ -1481,91 +1488,142 @@ def op_convert(streams, surfaces, objects, materials_raw,
 
     # vertex buffer conversion
     if need_vb_convert:
-        # save original vertex stride per stream BEFORE converting (needed for soff rescaling)
-        # only VB streams (dt 1 or 3) have a 'vs' key, IB streams (dt 2) do not
-        old_vs_map = {si: sv['vs'] for si, sv in enumerate(streams) if sv['dt'] in (1, 3)}
-
-        # FOUC->FO2: build a per-vertex multiplier table before converting.
-        # Multiple surfaces can share the same VB stream but carry DIFFERENT foucVertexMultiplier values in their surface extras
-        # shadow surface for example (mult=[0,154,-12,0.003906] vs default [0,0,0,0.000977])
-        # using a single per-stream multiplier silently corrupts every surface that isn't the first one registered 
-        # tamp each surface's multiplier onto its exact vertex slice before touching the stream
         if is_fouc:
-            # build per-stream per-vertex multiplier arrays (one tuple per vert)
-            stream_vert_mults = {}   # stream_id -> list of mult tuples, len == sv['vc']
+            # FOUC -> FO2/FO1: per-surface conversion with per-shader vertex format.
+            #
+            # FOUC uses one shared VB stream for all surfaces. FO2 requires
+            # different vertex formats per shader:
+            #   shadow  (13):     pos only          12 B  flags 0x0002
+            #   body/skin (5/26): pos+nrm+col+uv    36 B  flags 0x0152
+            #   everything else:  pos+nrm+uv         32 B  flags 0x0112  (no color)
+            #
+            # One independent VB+IB pair is created per surface, matching the
+            # Blender plugin output. IB indices are rebased to 0 within each VB.
+
+            FO2_FLAGS_NO_COLOR = VERTEX_POSITION | VERTEX_NORMAL | VERTEX_UV  # 0x0112
+
+            def _fo2_fmt_for_surface(surface):
+                mid      = surface['mid']
+                fouc_sid = materials_raw[mid]['shader_id'] if mid < len(materials_raw) else 8
+                fo2_sid  = FOUC_TO_FO2_SHADER.get(fouc_sid, fouc_sid)
+                if fo2_sid == 13:        return VERTEX_POSITION, 12
+                if fo2_sid in (5, 26):   return FO2_VERTEX_FLAGS_FULL, 36
+                return FO2_FLAGS_NO_COLOR, 32
+
+            # Build per-vertex multiplier table.
+            stream_vert_mults = {}
             for si, sv in enumerate(streams):
                 if sv['dt'] in (1, 3):
                     stream_vert_mults[si] = [(0.0, 0.0, 0.0, FOUC_SCALE)] * sv['vc']
-
             for s in surfaces:
                 if not s['sids'] or len(s['extra']) < 16:
                     continue
                 vid   = s['sids'][0]
                 if vid not in stream_vert_mults:
                     continue
-                vbase = s['soffs'][0] // 32   # FOUC stride is always 32
+                vbase = s['soffs'][0] // 32
                 mult  = struct.unpack_from('<4f', s['extra'], 0)
                 for vi in range(s['vc']):
                     if vbase + vi < len(stream_vert_mults[vid]):
                         stream_vert_mults[vid][vbase + vi] = mult
 
-        new_stream_list = []
-        sid_map = {}
-        for si, sv in enumerate(streams):
-            if sv['dt'] in (1, 3):
-                if is_fouc:
-                    # FOUC int16 → FO2 float (36 B, flags 0x0152)
-                    # Apply each vertex's own multiplier from the table above.
-                    vert_mults = stream_vert_mults.get(si, [])
-                    out = bytearray(sv['vc'] * 36)
-                    for vi in range(sv['vc']):
-                        m = vert_mults[vi] if vi < len(vert_mults) else (0.0, 0.0, 0.0, FOUC_SCALE)
-                        ox, oy, oz = m[0], m[1], m[2]
-                        sc = m[3] if m[3] != 0.0 else FOUC_SCALE
-                        base = vi * 32
-                        px, py, pz = struct.unpack_from('<3h', sv['data'], base)
-                        nb  = struct.unpack_from('<4B', sv['data'], base + 16)
-                        col = struct.unpack_from('<4B', sv['data'], base + 20)
-                        uv  = struct.unpack_from('<2h', sv['data'], base + 24)
-                        dst = vi * 36
-                        struct.pack_into('<3f', out, dst,
-                                         (px + ox) * sc, (py + oy) * sc, (pz + oz) * sc)
-                        struct.pack_into('<3f', out, dst + 12,
+            new_stream_list = []
+            for s in surfaces:
+                if not s['sids']:
+                    continue
+                vid        = s['sids'][0]
+                sv         = streams[vid]
+                tgt_flags, tgt_vs = _fo2_fmt_for_surface(s)
+                vbase      = s['soffs'][0] // 32
+                vc         = s['vc']
+                vmults     = stream_vert_mults.get(vid, [])
+
+                out_vb = bytearray(vc * tgt_vs)
+                for vi in range(vc):
+                    abs_vi  = vbase + vi
+                    m       = vmults[abs_vi] if abs_vi < len(vmults) else (0.0, 0.0, 0.0, FOUC_SCALE)
+                    ox, oy, oz = m[0], m[1], m[2]
+                    sc      = m[3] if m[3] != 0.0 else FOUC_SCALE
+                    src_off = abs_vi * 32
+                    dst     = vi * tgt_vs
+                    px, py, pz = struct.unpack_from('<3h', sv['data'], src_off)
+                    struct.pack_into('<3f', out_vb, dst,
+                                     (px + ox) * sc, (py + oy) * sc, (pz + oz) * sc)
+                    if tgt_vs >= 32:
+                        nb = struct.unpack_from('<4B', sv['data'], src_off + 16)
+                        struct.pack_into('<3f', out_vb, dst + 12,
                                          (nb[2] / 127.0) - 1.0,
                                          (nb[1] / 127.0) - 1.0,
                                          (nb[0] / 127.0) - 1.0)
-                        struct.pack_into('<4B', out, dst + 24, col[0], col[1], col[2], col[3])
-                        struct.pack_into('<2f', out, dst + 28,
-                                         uv[0] / 2048.0, uv[1] / 2048.0)
-                    new_stream_list.append({'dt': sv['dt'], 'fc': 0,
-                        'vc': sv['vc'], 'vs': 36, 'flags': FO2_VERTEX_FLAGS_FULL,
-                        'data': bytes(out)})
+                        uv = struct.unpack_from('<2h', sv['data'], src_off + 24)
+                        if tgt_vs == 36:
+                            col = struct.unpack_from('<4B', sv['data'], src_off + 20)
+                            struct.pack_into('<4B', out_vb, dst + 24,
+                                             col[0], col[1], col[2], col[3])
+                            struct.pack_into('<2f', out_vb, dst + 28,
+                                             uv[0] / 2048.0, uv[1] / 2048.0)
+                        else:
+                            struct.pack_into('<2f', out_vb, dst + 24,
+                                             uv[0] / 2048.0, uv[1] / 2048.0)
+
+                new_vb_sid = len(new_stream_list)
+                new_stream_list.append({'dt': sv['dt'], 'fc': 0,
+                                        'vc': vc, 'vs': tgt_vs, 'flags': tgt_flags,
+                                        'data': bytes(out_vb)})
+
+                if len(s['sids']) >= 2:
+                    iid  = s['sids'][1]
+                    isv  = streams[iid]
+                    ioff = s['soffs'][1]
+                    niu  = s['niu']
+                    new_idata = bytearray(niu * 2)
+                    for ii in range(niu):
+                        raw_idx = struct.unpack_from('<H', isv['data'], ioff + ii * 2)[0]
+                        struct.pack_into('<H', new_idata, ii * 2, raw_idx - vbase)
+                    new_ib_sid = len(new_stream_list)
+                    new_stream_list.append({'dt': 2, 'fc': 0, 'ic': niu,
+                                            'data': bytes(new_idata)})
+                    s['sids']  = [new_vb_sid, new_ib_sid]
+                    s['soffs'] = [0, 0]
                 else:
-                    # FO2 float → FOUC int16 (32 B, flags 0x2242)
+                    s['sids']  = [new_vb_sid]
+                    s['soffs'] = [0]
+
+                s['flags'] = tgt_flags
+
+            streams = new_stream_list
+            n_vb = sum(1 for sv in streams if sv['dt'] in (1, 3))
+            print(f"  Converted {n_vb} vertex buffer(s): int16→float, per-shader formats")
+
+        else:
+            # FO2/FO1 -> FOUC: uniform 32 B format, one new stream per original stream.
+            old_vs_map = {si: sv['vs'] for si, sv in enumerate(streams) if sv['dt'] in (1, 3)}
+            new_stream_list = []
+            sid_map = {}
+            for si, sv in enumerate(streams):
+                if sv['dt'] in (1, 3):
                     new_data, _ = _fo2_vert_to_fouc(sv['data'], sv['vc'], sv['vs'], sv['flags'])
                     new_stream_list.append({'dt': sv['dt'], 'fc': 22,
                         'vc': sv['vc'], 'vs': 32, 'flags': FOUC_VERTEX_FLAGS, 'data': new_data})
-                sid_map[si] = len(new_stream_list) - 1
-            else:
-                new_stream_list.append(dict(sv))
-                sid_map[si] = len(new_stream_list) - 1
+                    sid_map[si] = len(new_stream_list) - 1
+                else:
+                    new_stream_list.append(dict(sv))
+                    sid_map[si] = len(new_stream_list) - 1
 
-        # remap surface stream IDs and rescale VB byte offsets
-        for s in surfaces:
-            if s['sids']:
-                old_vb_sid = s['sids'][0]
-                old_vs     = old_vs_map.get(old_vb_sid, 1)
-                new_vb_sid = sid_map.get(old_vb_sid, old_vb_sid)
-                new_vs     = new_stream_list[new_vb_sid]['vs']
-                vbase      = s['soffs'][0] // old_vs if old_vs else 0
-                s['soffs'][0] = vbase * new_vs
-            s['sids'] = [sid_map.get(sid, sid) for sid in s['sids']]
+            for s in surfaces:
+                if s['sids']:
+                    old_vb_sid = s['sids'][0]
+                    old_vs     = old_vs_map.get(old_vb_sid, 1)
+                    new_vb_sid = sid_map.get(old_vb_sid, old_vb_sid)
+                    new_vs     = new_stream_list[new_vb_sid]['vs']
+                    vbase      = s['soffs'][0] // old_vs if old_vs else 0
+                    s['soffs'][0] = vbase * new_vs
+                    s['flags'] = new_stream_list[new_vb_sid]['flags']
+                s['sids'] = [sid_map.get(sid, sid) for sid in s['sids']]
 
-        streams = new_stream_list
-        n_vb = sum(1 for sv in streams if sv['dt'] in (1, 3))
-        print(f"  Converted {n_vb} vertex buffer(s): "
-              f"{'int16→float (36 B, flags 0x0152)' if is_fouc else 'float→int16 (32 B, flags 0x2242)'}")
-
+            streams = new_stream_list
+            n_vb = sum(1 for sv in streams if sv['dt'] in (1, 3))
+            print(f"  Converted {n_vb} vertex buffer(s): float→int16 (32 B, flags 0x2242)")
     # surface extra bytes
     for s in surfaces:
         # remove source-specific extra first
@@ -1770,7 +1828,7 @@ def main():
             _convert_crash_dat_file(tmp_crash, dst_crash,
                                     src_is_fouc, dst_is_fouc,
                                     surfaces_pre_convert, streams_pre_convert, streams,
-                                    models=models)
+                                    models=models, surfaces_dst=surfaces)
             if os.path.exists(tmp_crash): os.remove(tmp_crash)
             if os.path.exists(tmp_bgm):   os.remove(tmp_bgm)
             print(f"  crash.dat: done → {os.path.getsize(dst_crash):,} B"
@@ -1788,7 +1846,7 @@ def main():
         _convert_crash_dat_file(crash_src, dst_crash,
                                 src_is_fouc, dst_is_fouc,
                                 surfaces_pre_convert, streams_pre_convert, streams,
-                                models=models)
+                                models=models, surfaces_dst=surfaces)
         print(f"  crash.dat: {os.path.getsize(crash_src):,} B"
               f" → {os.path.getsize(dst_crash):,} B  ({os.path.basename(dst_crash)})")
 
