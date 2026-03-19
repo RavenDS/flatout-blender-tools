@@ -1211,15 +1211,16 @@ def _compute_surface_aabb(streams, surface):
 
 def _convert_crash_dat_file(crash_path, output_path,
                              src_is_fouc, dst_is_fouc,
-                             surfaces, streams_src, streams_dst):
+                             surfaces, streams_src, streams_dst,
+                             models=None):
     """Convert a crash.dat file between FO2/FO1 and FOUC formats.
 
     FO2/FO1 crash surface:
-      uint32 nv + uint32 nvb + vbuf[nvb] + weights[nv × 48]
+      uint32 nv + uint32 nvb + vbuf[nvb] + weights[nv x 48]
       weights: base_pos[3f] crash_pos[3f] base_nrm[3f] crash_nrm[3f]
 
     FOUC crash surface:
-      uint32 nv + weights[nv × 40]
+      uint32 nv + weights[nv x 40]
       weights: base_pos[3h] crash_pos[3h]
                baseUnkBump1[4B] crashUnkBump1[4B]
                baseUnkBump2[4B] crashUnkBump2[4B]
@@ -1227,41 +1228,65 @@ def _convert_crash_dat_file(crash_path, output_path,
                baseUV[2H]
     """
     if src_is_fouc == dst_is_fouc:
-        # same format — just copy
+        # same format -- just copy
         shutil.copy2(crash_path, output_path)
         return
 
     nodes = _parse_crash_dat(crash_path, is_fouc=src_is_fouc)
 
-    # build surface index lookup by position in the flat surfaces list
-    # crash nodes are matched to models, but here we process per-surface by order
-    # build a flat ordered list of (surface_dict, vb_stream) for crash matching
-    surf_list = []
-    for s in surfaces:
-        vid = s['sids'][0] if s['sids'] else None
-        sv  = streams_src[vid] if (vid is not None and vid < len(streams_src)) else None
-        surf_list.append((s, sv))
+    # build model-name -> surface_ids lookup so each crash node maps to the correct BGM surfaces 
+    # (NOT a sequential flat-list index)
+    model_surf_map = {}
+    if models:
+        for m in models:
+            model_surf_map[m['name']] = m['surfaces']
 
     def _enc_nrm(v):
         return max(0, min(255, int(round((v + 1.0) * 127.0))))
 
     new_nodes = []
-    surf_idx = 0   # global surface counter matched against crash surfaces
+    surf_idx = 0   # fallback sequential counter (used when model map unavailable)
 
     for node_name, surfs in nodes:
         new_surfs = []
-        for crash_surf in surfs:
+        base_name = node_name.replace('_crash', '')
+        model_surf_ids = model_surf_map.get(base_name)
+
+        for j, crash_surf in enumerate(surfs):
             if src_is_fouc and not dst_is_fouc:
-                # FOUC -> FO2: reconstruct vtx from dst streams, convert 40B->48B weights
-                # vtx: the destination (float) VB slice for this surface
-                # find the matching dst surface VB slice
+                # FOUC -> FO2: reconstruct vtx from dst streams, convert 40B->48B weights.
+                #
+                # surface lookup: prefer model-name-based lookup so each crash surface maps 
+                # to the correct BGM surface (fixes wrong vtx slice / wrong vs).
+                bgm_surf = None
+                if model_surf_ids is not None and j < len(model_surf_ids):
+                    surf_id = model_surf_ids[j]
+                    if surf_id < len(surfaces):
+                        bgm_surf = surfaces[surf_id]
+                elif surf_idx < len(surfaces):
+                    bgm_surf = surfaces[surf_idx]
+
                 vtx = b''
-                if surf_idx < len(surf_list):
-                    s, _ = surf_list[surf_idx]
-                    if s['sids'] and s['sids'][0] < len(streams_dst):
-                        sv_dst = streams_dst[s['sids'][0]]
-                        voff = s['soffs'][0]
-                        vtx  = sv_dst['data'][voff : voff + s['vc'] * sv_dst['vs']]
+                dst_vs = 36   # FO2 default; updated below if stream found
+                if bgm_surf is not None and bgm_surf['sids']:
+                    vid = bgm_surf['sids'][0]
+                    if vid < len(streams_dst):
+                        sv_dst = streams_dst[vid]
+                        dst_vs = sv_dst['vs']
+                        # soffs[0] is a FOUC byte offset (stride 32).
+                        # recalculate as vertex-index * new stride.
+                        src_vs = 32   # FOUC VB stride is 32
+                        vertex_index = bgm_surf['soffs'][0] // src_vs
+                        new_voff = vertex_index * dst_vs
+                        vtx = sv_dst['data'][new_voff : new_voff + bgm_surf['vc'] * dst_vs]
+
+                # per-surface foucVertexMultiplier for correct position decoding.
+                # default: no offset, scale = 1/1024.
+                mult = (0.0, 0.0, 0.0, FOUC_SCALE)
+                if bgm_surf is not None and len(bgm_surf.get('extra', b'')) >= 16:
+                    mult = struct.unpack_from('<4f', bgm_surf['extra'], 0)
+                ox, oy, oz = mult[0], mult[1], mult[2]
+                sc = mult[3] if mult[3] != 0.0 else FOUC_SCALE
 
                 nv  = len(crash_surf['wgt']) // 40
                 new_wgt = bytearray()
@@ -1271,19 +1296,18 @@ def _convert_crash_dat_file(crash_path, output_path,
                     cp = struct.unpack_from('<3h', crash_surf['wgt'], base + 6)
                     bn = struct.unpack_from('<4B', crash_surf['wgt'], base + 28)
                     cn = struct.unpack_from('<4B', crash_surf['wgt'], base + 32)
-                    # int16 pos → float
-                    bpf = tuple(v * FOUC_SCALE for v in bp)
-                    cpf = tuple(v * FOUC_SCALE for v in cp)
-                    # uint8 nrm [0]=z [1]=y [2]=x → float
+                    # int16 pos -> float, applying per-surface offset and scale
+                    bpf = ((bp[0] + ox) * sc, (bp[1] + oy) * sc, (bp[2] + oz) * sc)
+                    cpf = ((cp[0] + ox) * sc, (cp[1] + oy) * sc, (cp[2] + oz) * sc)
+                    # uint8 nrm [0]=z [1]=y [2]=x -> float
                     bnf = ((bn[2]/127.0)-1.0, (bn[1]/127.0)-1.0, (bn[0]/127.0)-1.0)
                     cnf = ((cn[2]/127.0)-1.0, (cn[1]/127.0)-1.0, (cn[0]/127.0)-1.0)
                     new_wgt += struct.pack('<12f', *bpf, *cpf, *bnf, *cnf)
 
-                new_surfs.append({'vtx': vtx, 'wgt': bytes(new_wgt),
-                                  'vs': len(vtx) // nv if nv and vtx else 0})
+                new_surfs.append({'vtx': vtx, 'wgt': bytes(new_wgt), 'vs': dst_vs})
 
             else:
-                # FO2 -> FOUC: drop vtx, convert 48B→40B weights, extract UVs from vtx
+                # FO2 -> FOUC: drop vtx, convert 48B->40B weights, extract UVs from vtx
                 vs    = crash_surf['vs']
                 nv    = len(crash_surf['wgt']) // 48
                 vtx   = crash_surf['vtx']
@@ -1745,7 +1769,8 @@ def main():
                   f"({'FOUC→FO2/FO1' if src_is_fouc else 'FO2/FO1→FOUC'}) ...")
             _convert_crash_dat_file(tmp_crash, dst_crash,
                                     src_is_fouc, dst_is_fouc,
-                                    surfaces_pre_convert, streams_pre_convert, streams)
+                                    surfaces_pre_convert, streams_pre_convert, streams,
+                                    models=models)
             if os.path.exists(tmp_crash): os.remove(tmp_crash)
             if os.path.exists(tmp_bgm):   os.remove(tmp_bgm)
             print(f"  crash.dat: done → {os.path.getsize(dst_crash):,} B"
@@ -1762,7 +1787,8 @@ def main():
               f"({'FOUC→FO2/FO1' if src_is_fouc else 'FO2/FO1→FOUC'}) ...")
         _convert_crash_dat_file(crash_src, dst_crash,
                                 src_is_fouc, dst_is_fouc,
-                                surfaces_pre_convert, streams_pre_convert, streams)
+                                surfaces_pre_convert, streams_pre_convert, streams,
+                                models=models)
         print(f"  crash.dat: {os.path.getsize(crash_src):,} B"
               f" → {os.path.getsize(dst_crash):,} B  ({os.path.basename(dst_crash)})")
 
