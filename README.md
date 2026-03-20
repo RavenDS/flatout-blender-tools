@@ -1,7 +1,5 @@
 # FlatOut Blender Tools
-A collection of Blender Add-Ons &amp; Python scripts for various formats from the FlatOut game series.  
-
-Currently a **WIP**, please report all bugs/discoveries in issues. 
+A collection of Blender Add-Ons &amp; Python scripts for various formats from **FlatOut 1/2/Ultimate Carnage**.  
 
 ## Blender Plugins/Addons
 * **fo2_bgm_import:** Import car _body.bgm_ & additional files (_crash.dat_, _body.ini_, _camera.ini_)
