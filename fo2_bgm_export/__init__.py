@@ -1,10 +1,10 @@
 bl_info = {
-    "name":        "FlatOut 2 BGM Export (Car)",
+    "name":        "FlatOut BGM Export (Car)",
     "author":      "ravenDS",
-    "version":     (1, 5, 3),
+    "version":     (1, 5, 4),
     "blender":     (3, 6, 0),
-    "location":    "File > Export > FlatOut 2 BGM Car (.bgm)",
-    "description": "Export FlatOut 2 car model (BGM) files. Based on reverse-egineering work by Chloe (FlatOutW32BGMTool)",
+    "location":    "File > Export > FlatOut Car BGM (.bgm)",
+    "description": "Export FlatOut 1/2/UC car model (BGM) files. Based on reverse-egineering work by Chloe (FlatOutW32BGMTool)",
     "category":    "Import-Export",
     "doc_url":     "https://github.com/RavenDS",
     "tracker_url": "https://github.com/RavenDS/flatout-blender-tools/issues",
@@ -1909,7 +1909,7 @@ class ExportBGM(bpy.types.Operator, ExportHelper):
 # REGISTRATION
 
 def menu_func_export(self, context):
-    self.layout.operator(ExportBGM.bl_idname, text="FlatOut 2 Car BGM (.bgm)")
+    self.layout.operator(ExportBGM.bl_idname, text="FlatOut Car BGM (.bgm)")
 
 
 def register():

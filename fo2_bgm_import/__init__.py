@@ -1,10 +1,10 @@
 bl_info = {
-    "name": "FlatOut 2 BGM Import (Car)",
+    "name": "FlatOut BGM Import (Car)",
     "author": "ravenDS",
-    "version": (1, 5, 3),
+    "version": (1, 5, 4),
     "blender": (3, 6, 0),
-    "location": "File > Import > FlatOut 2 Car BGM (.bgm)",
-    "description": "Import FlatOut 2 BGM car model files",
+    "location": "File > Import > FlatOut Car BGM (.bgm)",
+    "description": "Import FlatOut 1/2/UC BGM car model files",
     "category": "Import-Export",
     "doc_url":     "https://github.com/RavenDS",
     "tracker_url": "https://github.com/RavenDS/flatout-blender-tools/issues",
@@ -949,8 +949,12 @@ def build_blender_meshes(context, parser: BGMParser, options: dict):
             crash_dat_path = candidate3
         else:
             crash_dat_path = ''
+    import_crash   = options.get('import_crash',   True)
+    import_body    = options.get('import_body',    True)
+    import_dummies = options.get('import_dummies', True)
+
     crash_nodes = []
-    if crash_dat_path and os.path.isfile(crash_dat_path):
+    if import_crash and crash_dat_path and os.path.isfile(crash_dat_path):
         crash_nodes = parse_crash_dat(crash_dat_path, is_fouc=parser.is_fouc)
         print(f"[BGM Import] Loaded crash data from: {crash_dat_path}")
     # build lookup: model_name -> CrashNode (crash node name = model_name + "_crash")
@@ -1054,6 +1058,8 @@ def build_blender_meshes(context, parser: BGMParser, options: dict):
 
     # build group empties for objects (dummies)
     object_empties = {}
+    if not import_dummies:
+        parser.objects = []
     for bgm_obj in parser.objects:
         obj_empty = bpy.data.objects.new(bgm_obj.name1, None)
         obj_empty.empty_display_type = 'PLAIN_AXES'
@@ -1081,6 +1087,9 @@ def build_blender_meshes(context, parser: BGMParser, options: dict):
 
     created_objects = []
 
+    if not import_body:
+        mesh_exports = []
+        crash_exports = []
     for (bgm_mesh, surfaces), (_, crash_surface_pairs) in zip(mesh_exports, crash_exports):
         mesh_matrix = fo2_matrix_to_blender(bgm_mesh.matrix)
 
@@ -2010,6 +2019,21 @@ class ImportBGM(bpy.types.Operator, ImportHelper):
 
     # collision
 
+    import_body: BoolProperty(
+        name="Import Body",
+        default=True,
+        description="Import the car body meshes (FO2 Body collection)",
+    )
+    import_crash: BoolProperty(
+        name="Import Crash",
+        default=True,
+        description="Import crash deform meshes from crash.dat (FO2 Body Crash collection)",
+    )
+    import_dummies: BoolProperty(
+        name="Import Dummies",
+        default=True,
+        description="Import dummy/object empties (FO2 Body Dummies collection)",
+    )
     import_body_ini: BoolProperty(
         name="Import Collision Boxes (body.ini)",
         default=True,
@@ -2055,14 +2079,13 @@ class ImportBGM(bpy.types.Operator, ImportHelper):
         row.enabled = (self.use_alpha and self.alpha_mode == 'BLEND')
         row.prop(self, "transparency_overlap")
 
-        # collision
+        # bgm data
         box = layout.box()
-        box.label(text="Collision", icon='MOD_WIREFRAME')
+        box.label(text="BGM Data", icon='MESH_DATA')
+        box.prop(self, "import_body")
+        box.prop(self, "import_crash")
+        box.prop(self, "import_dummies")
         box.prop(self, "import_body_ini")
-
-        # cameras
-        box = layout.box()
-        box.label(text="Cameras", icon='CAMERA_DATA')
         box.prop(self, "import_camera_ini")
 
         # FOUC debug
@@ -2094,6 +2117,9 @@ class ImportBGM(bpy.types.Operator, ImportHelper):
             'use_backface_culling': self.use_backface_culling,
             'import_normal_maps': self.import_normal_maps,
             'import_specular_maps': self.import_specular_maps,
+            'import_body': self.import_body,
+            'import_crash': self.import_crash,
+            'import_dummies': self.import_dummies,
         }
 
         objects = build_blender_meshes(context, parser, options)
@@ -2399,7 +2425,7 @@ class FO2_PT_ShaderPanel(bpy.types.Panel):
 # REGISTRATION
 
 def menu_func_import(self, context):
-    self.layout.operator(ImportBGM.bl_idname, text="FlatOut 2 Car BGM (.bgm)")
+    self.layout.operator(ImportBGM.bl_idname, text="FlatOut Car BGM (.bgm)")
 
 
 def register():

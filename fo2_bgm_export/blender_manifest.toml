@@ -1,9 +1,9 @@
 schema_version = "1.0.0"
 
 id = "fo2_bgm_export"
-version = "1.5.3"
-name = "FlatOut 2 Car BGM (Export)"
-tagline = "Export FlatOut 2 Car Model (body.bgm + crash.dat + body.ini + camera.ini)"
+version = "1.5.4"
+name = "FlatOut Car BGM (Export)"
+tagline = "Export FlatOut 1/2/UC Car Model (body.bgm + crash.dat + body.ini + camera.ini)"
 maintainer = "ravenDS <https://github.com/RavenDS>"
 type = "add-on"
 
