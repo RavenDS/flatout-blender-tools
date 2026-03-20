@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FlatOut BGM Tool 2.1.0 — FlatOut BGM converter & optimizer.
+FlatOut BGM Tool 2.1.2 — FlatOut BGM converter & optimizer.
 https://github.com/RavenDS/flatout-blender-tools
 
 by ravenDS (github.com/ravenDS)
@@ -35,6 +35,11 @@ Operations (can be combined,:
       Operates directly on the index buffer streams; vertex data is unchanged.
       crash.dat is copied alongside unchanged (vertex ordering is not affected).
 
+  -lighthacks
+      Fix for additional light surfaces when converting from FOUC to FO2/FO1.
+      Default: duplicate all _b light variants, assign common material
+      Override: <target1>,<target2>,<target3>,..
+
   -convert <fmt>
       Convert the BGM (and its crash.dat) to a different game format.
       <fmt> is one of: FO1, FO2, FOUC.
@@ -61,11 +66,11 @@ Operations (can be combined,:
       The vbuf in the output crash.dat is taken from the converted BGM vertex buffer
       (FOUC->FO2), or dropped entirely (FO2/FO1->FOUC).
 
-      Can be combined with -clean, -optimize, -windflip etc.
+      Can be combined with -clean, -optimize, -windflip, -lighthacks etc.
 
-
-
-      Order: -clean -> (-menucar) -> -optimize -> -convert -> -windflip
+      Execution order depends on source format:
+        FOUC -> FO2/FO1: -windflip -> -convert -> -lighthacks -> -clean -> -menucar -> -optimize
+        FO2/FO1 -> FOUC: -clean -> -menucar -> -optimize -> -windflip -> -convert -> -lighthacks
 
 Usage:
   bgm_tool.py <input.bgm> [output.bgm] -clean [-optimize]
@@ -1905,8 +1910,8 @@ def main():
         print("  -lighthacks [mat1,mat2,...]  Duplicate light _b surfaces (or named materials) remapped to common, mirror in crash.dat")
         print("  -convert <fmt>    Convert to target format: FO1, FO2, or FOUC")
         print()
-        print("Execution order: -clean → -menucar → -optimize → -convert → -windflip")
-        print("                 -lighthacks runs after convert")
+        print("Execution order (FOUC→FO2/FO1): -windflip → -convert → -lighthacks → -clean → -menucar → -optimize")
+        print("Execution order (FO2/FO1→FOUC):  -clean → -menucar → -optimize → -windflip → -convert → -lighthacks")
         sys.exit(1)
 
     inp = pos_args[0]
@@ -1944,38 +1949,74 @@ def main():
     crash_src, crash_standalone = _find_crash_dat(inp)
     opt_crash_info              = None
     src_is_fouc                 = is_fouc   # preserve original for crash.dat
-    b_dupe_map                  = []        # filled by op_lightshack if -lightshack
+    b_dupe_map                  = []        # filled by op_lighthacks if -lighthacks
 
-    # execution order: clean -> menucar -> optimize -> convert -> windflip
+    # Execution order depends on source format:
+    #   FOUC -> FO2/FO1: windflip -> convert -> clean -> menucar -> optimize
+    #   FO2/FO1 -> FOUC: clean -> menucar -> optimize -> windflip -> convert
 
-    if do_clean:
-        streams, surfaces = op_strip(streams, surfaces)
+    converting_from_fouc = is_fouc and convert_target in ('FO1', 'FO2')
+    converting_to_fouc   = not is_fouc and convert_target == 'FOUC'
 
-    if do_menucar:
-        surfaces, models = op_menucar(surfaces, models, materials_raw, version)
+    if converting_from_fouc:
+        # FOUC -> FO2/FO1: windflip -> convert -> lighthacks -> clean -> menucar -> optimize
+        if do_windflip:
+            streams, surfaces = op_windflip(streams, surfaces, is_fouc, models=models)
 
-    if do_optimize:
-        (streams, surfaces,
-         surf_seen, surf_vs, surf_original_vc,
-         streams_orig, surfaces_orig) = op_optimize(streams, surfaces)
-        opt_crash_info = (surf_seen, surf_vs, surf_original_vc,
-                          streams_orig, surfaces_orig)
+        # Snapshot before convert — needed for crash.dat format conversion
+        streams_pre_convert  = streams
+        surfaces_pre_convert = surfaces
 
-    # Snapshot before convert — needed for crash.dat format conversion
-    streams_pre_convert  = streams
-    surfaces_pre_convert = surfaces
+        if convert_target:
+            streams, surfaces, objects, materials_raw, version, is_fouc, is_fo1 = op_convert(
+                streams, surfaces, objects, materials_raw, version, is_fouc, is_fo1, convert_target)
 
-    if convert_target:
-        streams, surfaces, objects, materials_raw, version, is_fouc, is_fo1 = op_convert(
-            streams, surfaces, objects, materials_raw, version, is_fouc, is_fo1, convert_target,
-)
-
-    if do_lighthacks:
-        streams, surfaces, b_dupe_map = op_lighthacks(streams, surfaces, models, materials_raw, objects,
+        if do_lighthacks:
+            streams, surfaces, b_dupe_map = op_lighthacks(streams, surfaces, models, materials_raw, objects,
                                                            targets=lighthacks_targets)
 
-    if do_windflip:
-        streams, surfaces = op_windflip(streams, surfaces, is_fouc, models=models)
+        if do_clean:
+            streams, surfaces = op_strip(streams, surfaces)
+
+        if do_menucar:
+            surfaces, models = op_menucar(surfaces, models, materials_raw, version)
+
+        if do_optimize:
+            (streams, surfaces,
+             surf_seen, surf_vs, surf_original_vc,
+             streams_orig, surfaces_orig) = op_optimize(streams, surfaces)
+            opt_crash_info = (surf_seen, surf_vs, surf_original_vc,
+                              streams_orig, surfaces_orig)
+
+    else:
+        # FO2/FO1 -> FOUC (and non-convert ops): clean -> menucar -> optimize -> windflip -> convert -> lighthacks
+        if do_clean:
+            streams, surfaces = op_strip(streams, surfaces)
+
+        if do_menucar:
+            surfaces, models = op_menucar(surfaces, models, materials_raw, version)
+
+        if do_optimize:
+            (streams, surfaces,
+             surf_seen, surf_vs, surf_original_vc,
+             streams_orig, surfaces_orig) = op_optimize(streams, surfaces)
+            opt_crash_info = (surf_seen, surf_vs, surf_original_vc,
+                              streams_orig, surfaces_orig)
+
+        if do_windflip:
+            streams, surfaces = op_windflip(streams, surfaces, is_fouc, models=models)
+
+        # Snapshot before convert — needed for crash.dat format conversion
+        streams_pre_convert  = streams
+        surfaces_pre_convert = surfaces
+
+        if convert_target:
+            streams, surfaces, objects, materials_raw, version, is_fouc, is_fo1 = op_convert(
+                streams, surfaces, objects, materials_raw, version, is_fouc, is_fo1, convert_target)
+
+        if do_lighthacks:
+            streams, surfaces, b_dupe_map = op_lighthacks(streams, surfaces, models, materials_raw, objects,
+                                                           targets=lighthacks_targets)
 
     # write BGM 
     print(f"\nWriting  {os.path.basename(out)} ...")
