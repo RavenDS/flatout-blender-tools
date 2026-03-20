@@ -1,7 +1,7 @@
 bl_info = {
     "name":        "FlatOut 2 BGM Export (Car)",
     "author":      "ravenDS",
-    "version":     (1, 5, 2),
+    "version":     (1, 5, 3),
     "blender":     (3, 6, 0),
     "location":    "File > Export > FlatOut 2 BGM Car (.bgm)",
     "description": "Export FlatOut 2 car model (BGM) files. Based on reverse-egineering work by Chloe (FlatOutW32BGMTool)",
@@ -684,7 +684,7 @@ def build_buffers_for_material(obj, mat_index, flags, vertex_size,
 
 # BUILD FO2 MATERIAL FROM BLENDER MATERIAL
 
-def build_fo2_material(bl_mat, is_fo1: bool = False) -> FO2Material:
+def build_fo2_material(bl_mat, is_fo1: bool = False, override_light_shader: bool = True) -> FO2Material:
     """Convert a Blender material to an FO2 material struct."""
     mat = FO2Material()
     mat.name = bl_mat.name
@@ -727,11 +727,15 @@ def build_fo2_material(bl_mat, is_fo1: bool = False) -> FO2Material:
         if mat.shader_id == SHADER_CAR_BODY:
             tex_name = "skin1.tga"
         elif mat.shader_id == SHADER_CAR_LIGHTS and not is_fo1:
-            mat.v92 = 2
+            if override_light_shader:
+                mat.v92 = 2
     else:
         # infer everything from name
         shader_id, alpha, v92, tex_override = get_shader_for_material(
             mat.name, tex_name)
+        if not override_light_shader and shader_id == SHADER_CAR_LIGHTS:
+            v92 = 0
+            alpha = 0
         mat.shader_id = shader_id
         mat.alpha = alpha
         mat.v92 = v92
@@ -908,6 +912,7 @@ def write_bgm(filepath: str, context, options: dict):
     auto_triangulate = options.get('auto_triangulate', True)
     is_fouc = options.get('game_mode', 'FO2') == 'FOUC'
     is_fo1  = options.get('game_mode', 'FO2') == 'FO1'
+    override_light_shader = options.get('override_light_shader', True)
 
     root = find_root_empty(context)
     mesh_objects, empty_objects = collect_objects_under(root, context)
@@ -1042,7 +1047,7 @@ def write_bgm(filepath: str, context, options: dict):
         all_mat_slots.sort(key=lambda m: get_material_priority(m.name))
 
     for i, bl_mat in enumerate(all_mat_slots):
-        fo2_mat = build_fo2_material(bl_mat, is_fo1=is_fo1)
+        fo2_mat = build_fo2_material(bl_mat, is_fo1=is_fo1, override_light_shader=override_light_shader)
         bl_mat_to_fo2_id[bl_mat] = i
         fo2_materials.append(fo2_mat)
 
@@ -1765,6 +1770,12 @@ class ExportBGM(bpy.types.Operator, ExportHelper):
                     "(lights drawn after body, etc.)",
         default=True,
     )
+    override_light_shader: BoolProperty(
+        name="Light Shader Override (v92=2, alpha=1)",
+        description="Force v92=2 and alpha=1 on light materials/shaders. "
+                    "Disable to preserve stored or default values",
+        default=True,
+    )
     auto_triangulate: BoolProperty(
         name="Auto-Triangulate Meshes",
         description="Automatically triangulate any mesh with quads or n-gons before "
@@ -1847,6 +1858,7 @@ class ExportBGM(bpy.types.Operator, ExportHelper):
         box = layout.box()
         box.label(text="Options", icon='PREFERENCES')
         box.prop(self, "use_priorities")
+        box.prop(self, "override_light_shader")
         box.prop(self, "auto_triangulate")
         box.prop(self, "overwrite_crash_dat")
 
@@ -1876,6 +1888,7 @@ class ExportBGM(bpy.types.Operator, ExportHelper):
             'game_mode': self.game_mode,
             'global_scale': self.global_scale,
             'use_priorities': self.use_priorities,
+            'override_light_shader': self.override_light_shader,
             'auto_triangulate': self.auto_triangulate,
             'convert_tga_to_dds': self.convert_tga_to_dds,
             'dds_format': self.dds_format,
