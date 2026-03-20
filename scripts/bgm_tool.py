@@ -865,6 +865,157 @@ def op_menucar(surfaces, models, materials_raw, version):
 
 
 
+# light material _b surface checker
+
+def _is_lighthacks_target(mat_name, targets):
+    """Return True if mat_name should be processed by -lighthacks.
+
+    targets=None  : any material starting with "light" and ending with "_b".
+    targets=set() : exact match against the set (case-insensitive).
+    """
+    n = mat_name.lower()
+    if targets is None:
+        return n.startswith('light') and n.endswith('_b')
+    return n in {t.lower() for t in targets}
+
+
+def op_lighthacks(streams, surfaces, models, materials_raw, objects, targets=None):
+    """List light materials and objects, display _b surfaces, then duplicate
+    and remap to common.
+
+    targets=None  : duplicate all surfaces whose material starts with "light"
+                    and ends with "_b".
+    targets=set() : duplicate surfaces whose material name is in the set
+                    (exact match, case-insensitive).
+
+    Returns (streams, surfaces, b_dupe_map) where b_dupe_map is used by
+    main() to mirror the duplicates in crash.dat:
+      b_dupe_map: list of (model_name, orig_pos_in_model) for each duplicate.
+    """
+    import copy as _copy
+    from collections import defaultdict
+
+    mat_names = [m['name'] for m in materials_raw]
+
+    # light materials
+    print(f"\n── Light hacks: light materials ──")
+    light_mats = [m['name'] for m in materials_raw if m['name'].lower().startswith('light')]
+    if light_mats:
+        for name in light_mats:
+            print(f"  {name}")
+        print(f"\n  {len(light_mats)} material(s)")
+    else:
+        print("  None found.")
+
+    # light objects (dummies)
+    print(f"\n── Light hacks: light objects ──")
+    light_objs = [o['name1'] for o in objects if o['name1'].lower().startswith('light')]
+    if light_objs:
+        for name in light_objs:
+            print(f"  {name}")
+        print(f"\n  {len(light_objs)} object(s)")
+    else:
+        print("  None found.")
+
+    # _b surface check
+    print(f"\n── Light hacks: _b surface check ──")
+
+    # build model name -> surface-index list map and reverse lookup
+    model_surfs   = defaultdict(list)
+    surf_to_model = {}
+    for m in models:
+        for sid in m['surfaces']:
+            model_surfs[m['name']].append(sid)
+            surf_to_model[sid] = m['name']
+
+    b_hits = []   # (model_name, mat_name, surf_index)
+    for si, s in enumerate(surfaces):
+        name = mat_names[s['mid']] if s['mid'] < len(mat_names) else ''
+        if _is_lighthacks_target(name, targets):
+            b_hits.append((surf_to_model.get(si, '(unowned)'), name, si))
+
+    if not b_hits:
+        print("  No light _b surfaces found.")
+        return streams, surfaces, []
+
+    by_model = defaultdict(list)
+    for model_name, mat_name, si in b_hits:
+        by_model[model_name].append(mat_name)
+    for model_name, mats in sorted(by_model.items()):
+        print(f"  {model_name}")
+        for mat in mats:
+            print(f"    {mat}")
+    print(f"\n  {len(b_hits)} surface(s) across {len(by_model)} model(s)")
+
+    # find "common" material index
+    common_mid = next(
+        (i for i, m in enumerate(materials_raw) if m['name'].lower() == 'common'),
+        None
+    )
+    if common_mid is None:
+        print("\n── Light hacks: duplication ──")
+        print("  No 'common' material found — skipping.")
+        return streams, surfaces, []
+
+    # duplicate each _b surface, remapped to common
+    #
+    # for each light_*_b surface:
+    # - copy VB stream verbatim -> new stream entry
+    # - copy IB stream verbatim -> new stream entry
+    # - build duplicate surface dict with mid = common_mid
+    # - append to surfaces list and owning model's surface list
+    #
+    # b_dupe_map records (model_name, orig_pos_in_model) for each duplicate
+    # so main() can mirror the operation in crash.dat
+
+    print(f"\n── Light hacks: duplication ──")
+
+    b_dupe_map = []   # [(model_name, orig_pos_in_model), ...]
+
+    for model_name, mat_name, si in b_hits:
+        s = surfaces[si]
+
+        # copy VB stream
+        src_vb     = streams[s['sids'][0]]
+        new_vb_sid = len(streams)
+        streams.append(dict(src_vb, data=bytes(src_vb['data'])))
+
+        # copy IB stream (if present)
+        new_sids  = [new_vb_sid]
+        new_soffs = [0]
+        if len(s['sids']) >= 2:
+            src_ib     = streams[s['sids'][1]]
+            new_ib_sid = len(streams)
+            streams.append(dict(src_ib, data=bytes(src_ib['data'])))
+            new_sids.append(new_ib_sid)
+            new_soffs.append(0)
+
+        # build duplicate surface remapped to common
+        new_surf          = _copy.copy(s)
+        new_surf['mid']   = common_mid
+        new_surf['sids']  = new_sids
+        new_surf['soffs'] = new_soffs
+        new_surf['nst']   = len(new_sids)
+
+        new_si = len(surfaces)
+        surfaces.append(new_surf)
+
+        # append to owning model and record position for crash.dat mirroring
+        for m in models:
+            if si in m['surfaces']:
+                orig_pos = m['surfaces'].index(si)
+                m['surfaces'].append(new_si)
+                b_dupe_map.append((m['name'], orig_pos))
+                break
+
+        print(f"  {model_name}: {mat_name} → common")
+
+    print(f"\n  {len(b_hits)} surface(s) duplicated")
+
+    return streams, surfaces, b_dupe_map
+
+
+
 
 # winding flip
 
@@ -1527,17 +1678,9 @@ def op_convert(streams, surfaces, objects, materials_raw,
                     if vbase + vi < len(stream_vert_mults[vid]):
                         stream_vert_mults[vid][vbase + vi] = mult
 
-            new_stream_list = []
-            for s in surfaces:
-                if not s['sids']:
-                    continue
-                vid        = s['sids'][0]
-                sv         = streams[vid]
-                tgt_flags, tgt_vs = _fo2_fmt_for_surface(s)
-                vbase      = s['soffs'][0] // 32
-                vc         = s['vc']
-                vmults     = stream_vert_mults.get(vid, [])
-
+            # helper: convert a slice of vc vertices starting at abs vertex
+            # index vbase from FOUC stream sv into a float VB of tgt_vs bytes/vert
+            def _conv_verts(sv, vmults, vbase, vc, tgt_vs):
                 out_vb = bytearray(vc * tgt_vs)
                 for vi in range(vc):
                     abs_vi  = vbase + vi
@@ -1565,16 +1708,36 @@ def op_convert(streams, surfaces, objects, materials_raw,
                         else:
                             struct.pack_into('<2f', out_vb, dst + 24,
                                              uv[0] / 2048.0, uv[1] / 2048.0)
+                return bytes(out_vb)
 
+            # Snapshot original sids/soffs before any surface is mutated.
+            orig_sids  = [list(s['sids'])  for s in surfaces]
+            orig_soffs = [list(s['soffs']) for s in surfaces]
+
+            new_stream_list = []
+
+            # per-surface pass: each surface gets its own independent VB + IB
+            for si, s in enumerate(surfaces):
+                if not s['sids']:
+                    continue
+                vid        = orig_sids[si][0]
+                sv         = streams[vid]
+                tgt_flags, tgt_vs = _fo2_fmt_for_surface(s)
+                vbase      = orig_soffs[si][0] // 32
+                vc         = s['vc']
+                vmults     = stream_vert_mults.get(vid, [])
+
+                # per-surface VB
+                out_vb     = _conv_verts(sv, vmults, vbase, vc, tgt_vs)
                 new_vb_sid = len(new_stream_list)
                 new_stream_list.append({'dt': sv['dt'], 'fc': 0,
                                         'vc': vc, 'vs': tgt_vs, 'flags': tgt_flags,
-                                        'data': bytes(out_vb)})
+                                        'data': out_vb})
 
-                if len(s['sids']) >= 2:
-                    iid  = s['sids'][1]
+                if len(orig_sids[si]) >= 2:
+                    iid  = orig_sids[si][1]
                     isv  = streams[iid]
-                    ioff = s['soffs'][1]
+                    ioff = orig_soffs[si][1]
                     niu  = s['niu']
                     new_idata = bytearray(niu * 2)
                     for ii in range(niu):
@@ -1710,7 +1873,13 @@ def main():
     do_clean       = '-clean'     in args or do_full
     do_optimize    = '-optimize'  in args or do_full
     do_menucar     = '-menucar'   in args
-    do_windflip    = '-windflip'  in args
+    do_windflip    = '-windflip'    in args
+    do_lighthacks  = '-lighthacks' in args
+    lighthacks_targets = None   # None = target all _b; set = target named materials
+    if do_lighthacks:
+        lh_idx = args.index('-lighthacks')
+        if lh_idx + 1 < len(args) and not args[lh_idx + 1].startswith('-'):
+            lighthacks_targets = set(args[lh_idx + 1].split(','))
     convert_target = None
     for i, a in enumerate(args):
         if a == '-convert' and i + 1 < len(args) and args[i+1].upper() in ('FO1', 'FO2', 'FOUC'):
@@ -1718,10 +1887,14 @@ def main():
             break
 
     flags    = {'-clean', '-optimize', '-full', '-menucar', '-windflip',
-                '-convert', 'FO1', 'FO2', 'FOUC'}
+                '-lighthacks', '-convert', 'FO1', 'FO2', 'FOUC'}
+    # exclude the lighthacks target list token from positional args
+    if lighthacks_targets is not None:
+        lh_idx = args.index('-lighthacks')
+        flags.add(args[lh_idx + 1])
     pos_args = [a for a in args if a not in flags]
 
-    if not (do_clean or do_optimize or do_menucar or do_windflip or convert_target) or not pos_args:
+    if not (do_clean or do_optimize or do_menucar or do_windflip or do_lighthacks or convert_target) or not pos_args:
         print("Usage: bgm_tool.py <input.bgm> [output.bgm] <flags>")
         print()
         print("  -clean            Remove unreferenced (orphan) streams")
@@ -1729,9 +1902,11 @@ def main():
         print("  -full             Shortcut for -clean -optimize")
         print("  -menucar          Reorder surfaces to FO2 menucar draw order")
         print("  -windflip         Fix triangles with inverted winding")
+        print("  -lighthacks [mat1,mat2,...]  Duplicate light _b surfaces (or named materials) remapped to common, mirror in crash.dat")
         print("  -convert <fmt>    Convert to target format: FO1, FO2, or FOUC")
         print()
         print("Execution order: -clean → -menucar → -optimize → -convert → -windflip")
+        print("                 -lighthacks runs after convert")
         sys.exit(1)
 
     inp = pos_args[0]
@@ -1769,6 +1944,7 @@ def main():
     crash_src, crash_standalone = _find_crash_dat(inp)
     opt_crash_info              = None
     src_is_fouc                 = is_fouc   # preserve original for crash.dat
+    b_dupe_map                  = []        # filled by op_lightshack if -lightshack
 
     # execution order: clean -> menucar -> optimize -> convert -> windflip
 
@@ -1791,7 +1967,12 @@ def main():
 
     if convert_target:
         streams, surfaces, objects, materials_raw, version, is_fouc, is_fo1 = op_convert(
-            streams, surfaces, objects, materials_raw, version, is_fouc, is_fo1, convert_target)
+            streams, surfaces, objects, materials_raw, version, is_fouc, is_fo1, convert_target,
+)
+
+    if do_lighthacks:
+        streams, surfaces, b_dupe_map = op_lighthacks(streams, surfaces, models, materials_raw, objects,
+                                                           targets=lighthacks_targets)
 
     if do_windflip:
         streams, surfaces = op_windflip(streams, surfaces, is_fouc, models=models)
@@ -1853,6 +2034,33 @@ def main():
     else:
         # strip / windflip / same-format convert: vertex positions unchanged
         _copy_crash_dat(inp, out)
+
+    # -lighthacks: mirror _b surface duplicates in the crash.dat
+    if do_lighthacks and b_dupe_map and crash_src:
+        dst_crash = _crash_dst_path(out, crash_standalone)
+        if not os.path.exists(dst_crash):
+            # crash.dat wasn't produced yet (no conversion) — copy source first
+            shutil.copy2(crash_src, dst_crash)
+        crash_nodes = _parse_crash_dat(dst_crash, is_fouc=dst_is_fouc)
+        # build model_name -> crash node index
+        crash_node_idx = {}
+        for ni, (node_name, _) in enumerate(crash_nodes):
+            crash_node_idx[node_name.replace('_crash', '')] = ni
+        import copy as _copy2
+        patched = 0
+        for model_name, orig_pos in b_dupe_map:
+            ni = crash_node_idx.get(model_name)
+            if ni is None:
+                continue
+            node_name, crash_surfs = crash_nodes[ni]
+            if orig_pos < len(crash_surfs):
+                crash_surfs.append(_copy2.copy(crash_surfs[orig_pos]))
+                crash_nodes[ni] = (node_name, crash_surfs)
+                patched += 1
+        if patched:
+            _write_crash_dat(dst_crash, crash_nodes, is_fouc=dst_is_fouc)
+            print(f"  crash.dat: mirrored {patched} _b duplicate(s) "
+                  f"({os.path.basename(dst_crash)})")
 
     print("\nDone!")
 
