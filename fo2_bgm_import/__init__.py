@@ -1087,7 +1087,8 @@ def build_blender_meshes(context, parser: BGMParser, options: dict):
         # merge all surfaces of this mesh into one Blender mesh
         all_verts = []
         all_normals = []
-        all_uvs = []
+        all_uvs = []        # per-vertex UV (used only for newly created verts)
+        all_face_uvs = []   # per-loop UV (one entry per face-corner, always correct)
         all_colors = []
         all_faces = []
         all_face_mat_indices = []
@@ -1199,6 +1200,16 @@ def build_blender_meshes(context, parser: BGMParser, options: dict):
                     continue
                 all_faces.append((bl0, bl1, bl2))
                 all_face_mat_indices.append(local_mat_idx)
+                # store per-loop UVs from the actual source vertices so that
+                # merged verts (level-2 dedup) keep their correct per-corner UV
+                if has_uvs:
+                    all_face_uvs.append((
+                        (verts[fi0].u, 1.0 - verts[fi0].v),
+                        (verts[fi1].u, 1.0 - verts[fi1].v),
+                        (verts[fi2].u, 1.0 - verts[fi2].v),
+                    ))
+                else:
+                    all_face_uvs.append(((0.0, 0.0), (0.0, 0.0), (0.0, 0.0)))
 
         if not all_faces:
             continue
@@ -1245,12 +1256,11 @@ def build_blender_meshes(context, parser: BGMParser, options: dict):
         bl_mesh.polygons.foreach_set("use_smooth", [True] * len(all_faces))
 
         # UV layer must be set BEFORE update/validate which may remove degenerate faces
-        if all_uvs:
+        if all_face_uvs:
             uv_layer = bl_mesh.uv_layers.new(name="UVMap")
             uv_data = []
-            for f in all_faces:
-                for vi in f:
-                    uv_data.append(all_uvs[vi])
+            for face_uvs in all_face_uvs:
+                uv_data.extend(face_uvs)
             for i, uv in enumerate(uv_data):
                 uv_layer.data[i].uv = uv
 
