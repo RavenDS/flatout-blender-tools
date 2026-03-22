@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FlatOut BGM Tool 2.1.2 — FlatOut BGM converter & optimizer.
+FlatOut PC BGM Tool 2.1.3 — FlatOut BGM converter & optimizer.
 https://github.com/RavenDS/flatout-blender-tools
 
 by ravenDS (github.com/ravenDS)
@@ -371,7 +371,7 @@ def _find_crash_dat(bgm_path):
     if named:
         return named, False
     if standalone:
-        return standalone, True
+        return standalone, False  # treat as input-only; output goes to <stem>_crash.dat
     return None, None
 
 
