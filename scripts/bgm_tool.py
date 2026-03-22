@@ -40,6 +40,11 @@ Operations (can be combined,:
       Default: duplicate all _b light variants, assign common material
       Override: <target1>,<target2>,<target3>,..
 
+  -lightorder
+      Reorder materials and surfaces by draw priority (mirrors fo2_bgm_export).
+      Light _b surfaces are drawn before active lights; suspension drawn before body.
+      Edit the MATERIAL_PRIORITIES table below to customise.
+
   -convert <fmt>
       Convert the BGM (and its crash.dat) to a different game format.
       <fmt> is one of: FO1, FO2, FOUC.
@@ -69,8 +74,8 @@ Operations (can be combined,:
       Can be combined with -clean, -optimize, -windflip, -lighthacks etc.
 
       Execution order depends on source format:
-        FOUC -> FO2/FO1: -windflip -> -convert -> -lighthacks -> -clean -> -menucar -> -optimize
-        FO2/FO1 -> FOUC: -clean -> -menucar -> -optimize -> -windflip -> -convert -> -lighthacks
+        FOUC -> FO2/FO1: -windflip -> -lightorder -> -convert -> -lighthacks -> -clean -> -menucar -> -optimize
+        FO2/FO1 -> FOUC: -lightorder -> -clean -> -menucar -> -optimize -> -windflip -> -convert -> -lighthacks
 
 Usage:
   bgm_tool.py <input.bgm> [output.bgm] -clean [-optimize]
@@ -82,6 +87,41 @@ Default output suffix: _clean.bgm (-clean only), _opt.bgm (-optimize only or bot
 """
 
 import struct, sys, os, shutil, copy
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LIGHT ORDER — material draw priority table (used by -lightorder)
+# Mirrors fo2_bgm_export MATERIAL_PRIORITIES. Higher value = drawn later.
+# Materials not listed default to priority 0.
+# Edit this table to change the draw order applied by -lightorder.
+# ─────────────────────────────────────────────────────────────────────────────
+MATERIAL_PRIORITIES = {
+    # suspension
+    "shearshock": 1, "shearhock": 1, "shearspring": 2,
+    # lights — _b variants (inactive/base state) drawn first
+    "light_brake_b": 1, "light_brake_b_2": 1, "light_brake_2_b": 1,
+    "light_brake_l_b": 1, "light_brake_r_b": 1,
+    "light_brake_l_b_2": 1, "light_brake_r_b_2": 1,
+    "light_brake_l_2_b": 1, "light_brake_r_2_b": 1,
+    "light_reverse_b": 1, "light_reverse_b_2": 1, "light_reverse_2_b": 1,
+    "light_reverse_l_b": 1, "light_reverse_r_b": 1,
+    "light_reverse_l_b_2": 1, "light_reverse_r_b_2": 1,
+    "light_reverse_l_2_b": 1, "light_reverse_r_2_b": 1,
+    "light_front_b": 1, "light_front_b_2": 1, "light_front_2_b": 1,
+    "light_front_l_b": 1, "light_front_r_b": 1,
+    "light_front_l_b_2": 1, "light_front_r_b_2": 1,
+    "light_front_l_2_b": 1, "light_front_r_2_b": 1,
+    # lights — active/illuminated variants drawn last
+    "light_brake": 2, "light_brake_2": 2,
+    "light_brake_l": 2, "light_brake_r": 2,
+    "light_brake_l_2": 2, "light_brake_r_2": 2,
+    "light_reverse": 2, "light_reverse_2": 2,
+    "light_reverse_l": 2, "light_reverse_r": 2,
+    "light_reverse_l_2": 2, "light_reverse_r_2": 2,
+    "light_front": 2, "light_front_2": 2,
+    "light_front_l": 2, "light_front_r": 2,
+    "light_front_l_2": 2, "light_front_r_2": 2,
+}
+
 
 def _read_string(f):
     s = b""
@@ -871,6 +911,88 @@ def op_menucar(surfaces, models, materials_raw, version):
 
 
 # light material _b surface checker
+
+def op_lightorder(surfaces, models, materials_raw):
+    """Reorder materials and surfaces by draw priority (mirrors fo2_bgm_export).
+
+    Two-pass operation matching the export plugin behaviour:
+
+    Pass 1 — Material reordering:
+      Sort the materials_raw list by MATERIAL_PRIORITIES[name] (stable sort,
+      unlisted materials stay at priority 0).  Remap every surface's 'mid'
+      field to point at the new material indices.
+
+    Pass 2 — Surface reordering within each model:
+      For each model, stable-sort its surface list so surfaces with lower-
+      priority materials come first (mirrors mesh_sort_key in the exporter).
+    """
+    print(f"\n── Light order ──")
+
+    # Pass 1: sort materials and remap surface mid references
+    old_order = list(range(len(materials_raw)))
+    old_order.sort(key=lambda i: MATERIAL_PRIORITIES.get(
+        materials_raw[i]['name'].lower(), 0))
+
+    mat_moved = sum(1 for new, old in enumerate(old_order) if new != old)
+
+    # build old-index → new-index map and reorder
+    old_to_new_mid = {old: new for new, old in enumerate(old_order)}
+    materials_raw[:] = [materials_raw[i] for i in old_order]
+
+    # remap all surface mid references
+    for s in surfaces:
+        s['mid'] = old_to_new_mid.get(s['mid'], s['mid'])
+
+    if mat_moved:
+        print(f"  Materials reordered: {mat_moved}")
+        for new_i, old_i in enumerate(old_order):
+            if new_i != old_i:
+                print(f"    [{old_i}] → [{new_i}]  {materials_raw[new_i]['name']}")
+    else:
+        print("  Materials: already in correct order")
+
+    # Pass 2: sort surfaces within each model by material priority
+    mat_names = [m['name'] for m in materials_raw]
+    surf_moved = 0
+    for m in models:
+        orig = list(m['surfaces'])
+        sorted_surfs = sorted(
+            orig,
+            key=lambda si: MATERIAL_PRIORITIES.get(
+                mat_names[surfaces[si]['mid']].lower()
+                if surfaces[si]['mid'] < len(mat_names) else '', 0)
+        )
+        moved = sum(1 for a, b in zip(orig, sorted_surfs) if a != b)
+        surf_moved += moved
+        if moved:
+            print(f"  Model '{m['name']}': reordered {moved} surface(s)")
+        m['surfaces'] = sorted_surfs
+
+    # rebuild flat surfaces list in model-reference order (mirrors op_menucar)
+    new_order = []
+    seen = set()
+    for m in models:
+        for si in m['surfaces']:
+            if si not in seen:
+                new_order.append(si)
+                seen.add(si)
+    for si in range(len(surfaces)):
+        if si not in seen:
+            new_order.append(si)
+
+    old_to_new_si = {old: new for new, old in enumerate(new_order)}
+    new_surfaces = [surfaces[i] for i in new_order]
+    for m in models:
+        m['surfaces'] = [old_to_new_si[si] for si in m['surfaces']]
+
+    if surf_moved == 0:
+        print("  Surfaces: already in correct order")
+    else:
+        print(f"  Total surfaces reordered: {surf_moved}")
+
+    return new_surfaces, models, materials_raw
+
+
 
 def _is_lighthacks_target(mat_name, targets):
     """Return True if mat_name should be processed by -lighthacks.
@@ -1877,7 +1999,8 @@ def main():
     do_full        = '-full'      in args
     do_clean       = '-clean'     in args or do_full
     do_optimize    = '-optimize'  in args or do_full
-    do_menucar     = '-menucar'   in args
+    do_menucar      = '-menucar'    in args
+    do_lightorder   = '-lightorder'  in args
     do_windflip    = '-windflip'    in args
     do_lighthacks  = '-lighthacks' in args
     lighthacks_targets = None   # None = target all _b; set = target named materials
@@ -1892,26 +2015,27 @@ def main():
             break
 
     flags    = {'-clean', '-optimize', '-full', '-menucar', '-windflip',
-                '-lighthacks', '-convert', 'FO1', 'FO2', 'FOUC'}
+                '-lighthacks', '-lightorder', '-convert', 'FO1', 'FO2', 'FOUC'}
     # exclude the lighthacks target list token from positional args
     if lighthacks_targets is not None:
         lh_idx = args.index('-lighthacks')
         flags.add(args[lh_idx + 1])
     pos_args = [a for a in args if a not in flags]
 
-    if not (do_clean or do_optimize or do_menucar or do_windflip or do_lighthacks or convert_target) or not pos_args:
+    if not (do_clean or do_optimize or do_menucar or do_windflip or do_lighthacks or do_lightorder or convert_target) or not pos_args:
         print("Usage: bgm_tool.py <input.bgm> [output.bgm] <flags>")
         print()
         print("  -clean            Remove unreferenced (orphan) streams")
         print("  -optimize         Vertex deduplication + stream merging")
         print("  -full             Shortcut for -clean -optimize")
         print("  -menucar          Reorder surfaces to FO2 menucar draw order")
+        print("  -lightorder       Reorder materials+surfaces by draw priority (mirrors fo2_bgm_export)")
         print("  -windflip         Fix triangles with inverted winding")
         print("  -lighthacks [mat1,mat2,...]  Duplicate light _b surfaces (or named materials) remapped to common, mirror in crash.dat")
         print("  -convert <fmt>    Convert to target format: FO1, FO2, or FOUC")
         print()
-        print("Execution order (FOUC→FO2/FO1): -windflip → -convert → -lighthacks → -clean → -menucar → -optimize")
-        print("Execution order (FO2/FO1→FOUC):  -clean → -menucar → -optimize → -windflip → -convert → -lighthacks")
+        print("Execution order (FOUC→FO2/FO1): -windflip → -lightorder → -convert → -lighthacks → -clean → -menucar → -optimize")
+        print("Execution order (FO2/FO1→FOUC):  -lightorder → -clean → -menucar → -optimize → -windflip → -convert → -lighthacks")
         sys.exit(1)
 
     inp = pos_args[0]
@@ -1952,16 +2076,19 @@ def main():
     b_dupe_map                  = []        # filled by op_lighthacks if -lighthacks
 
     # Execution order depends on source format:
-    #   FOUC -> FO2/FO1: windflip -> convert -> clean -> menucar -> optimize
+    #   FOUC -> FO2/FO1: windflip -> lightorder -> convert -> lighthacks -> clean -> menucar -> optimize
     #   FO2/FO1 -> FOUC: clean -> menucar -> optimize -> windflip -> convert
 
     converting_from_fouc = is_fouc and convert_target in ('FO1', 'FO2')
     converting_to_fouc   = not is_fouc and convert_target == 'FOUC'
 
     if converting_from_fouc:
-        # FOUC -> FO2/FO1: windflip -> convert -> lighthacks -> clean -> menucar -> optimize
+        # FOUC -> FO2/FO1: windflip -> lightorder -> convert -> lighthacks -> clean -> menucar -> optimize
         if do_windflip:
             streams, surfaces = op_windflip(streams, surfaces, is_fouc, models=models)
+
+        if do_lightorder:
+            surfaces, models, materials_raw = op_lightorder(surfaces, models, materials_raw)
 
         # Snapshot before convert — needed for crash.dat format conversion
         streams_pre_convert  = streams
@@ -1989,7 +2116,10 @@ def main():
                               streams_orig, surfaces_orig)
 
     else:
-        # FO2/FO1 -> FOUC (and non-convert ops): clean -> menucar -> optimize -> windflip -> convert -> lighthacks
+        # FO2/FO1 -> FOUC (and non-convert ops): lightorder -> clean -> menucar -> optimize -> windflip -> convert -> lighthacks
+        if do_lightorder:
+            surfaces, models, materials_raw = op_lightorder(surfaces, models, materials_raw)
+
         if do_clean:
             streams, surfaces = op_strip(streams, surfaces)
 
