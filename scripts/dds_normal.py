@@ -10,13 +10,14 @@ Usage:
   python dds_normal.py -to_fouc   input.dds
   python dds_normal.py -from_fouc input.dds
   python dds_normal.py -to_fouc   *.dds
-  python dds_normal.py -from_fouc folder/
+  python dds_normal.py -to_fouc   folder/
   python dds_normal.py -to_fouc   input.dds output.dds
 """
 
 import sys
 import os
 import glob
+import math
 
 
 def _import_sibling(name):
@@ -50,6 +51,7 @@ DXT5                = dds2tga.DXT5
 
 compress_to_dxt = tga2dds.compress_to_dxt
 write_dds       = tga2dds.write_dds
+write_tga       = dds2tga.write_tga
 
 
 def decode_dds(dds):
@@ -86,7 +88,6 @@ def remap_from_fouc(pixels):
     B is reconstructed via sqrt(1 - X² - Y²) from the unit normal constraint.
     Note: DXT5 compression artifacts may push X²+Y² slightly above 1, clamped to 0.
     """
-    import math
     out = []
     for r, g, b, a in pixels:
         nx = (a / 127.5) - 1.0
@@ -96,7 +97,15 @@ def remap_from_fouc(pixels):
     return out
 
 
-def convert_normalmap(src_path, dst_path, to_fouc):
+def make_output_path(src_path, to_fouc, tga_out):
+    base = os.path.splitext(src_path)[0]
+    if tga_out:
+        return base + '.tga'
+    suffix = '_RXGB' if to_fouc else '_RGBA'
+    return base + suffix + '.dds'
+
+
+def convert_normalmap(src_path, dst_path, to_fouc, tga_out=False):
     print(f"  Reading:     {src_path}")
     dds = read_dds(src_path)
     width, height = dds['width'], dds['height']
@@ -115,13 +124,17 @@ def convert_normalmap(src_path, dst_path, to_fouc):
         remapped = remap_from_fouc(pixels)
         print(f"  Remapping:   (0,G,0,A) to (A,G,0,255)  [FOUC DXT5nm → standard]")
 
-    print(f"  Compressing: DXT5")
-    compressed = compress_to_dxt(width, height, remapped, 'DXT5')
-    write_dds(dst_path, width, height, compressed, 'DXT5')
+    if tga_out:
+        write_tga(dst_path, width, height, remapped)
+    else:
+        print(f"  Compressing: DXT5")
+        compressed = compress_to_dxt(width, height, remapped, 'DXT5')
+        write_dds(dst_path, width, height, compressed, 'DXT5')
 
 
 def main():
     to_fouc  = None
+    tga_out  = False
     raw_args = []
 
     for arg in sys.argv[1:]:
@@ -130,30 +143,31 @@ def main():
             to_fouc = True
         elif low == '-from_fouc':
             to_fouc = False
+        elif low == '-tga':
+            tga_out = True
         else:
             raw_args.append(arg)
 
     if to_fouc is None or not raw_args:
         print("Source: https://github.com/RavenDS/flatout-blender-tools")
         print()
-        print("Usage: dds_normal.py -to_fouc|-from_fouc <input.dds|*.dds|folder/> [output.dds]")
+        print("Usage: dds_normal.py -to_fouc|-from_fouc [-tga] <input.dds|*.dds|folder/>")
         print()
-        print("Always outputs DXT5.")
-        print()
-        print("  -to_fouc    Standard (X=R, Y=G) → FOUC DXT5nm (X=A, Y=G, R=0, B=0)")
-        print("  -from_fouc  FOUC DXT5nm (X=A, Y=G) → Standard (X=R, Y=G, B=reconstructed, A=255)")
+        print("  -to_fouc    Standard (X=R, Y=G) → FOUC DXT5nm (X=A, Y=G, R=0, B=0)   → _RXGB.dds")
+        print("  -from_fouc  FOUC DXT5nm (X=A, Y=G) → Standard (X=R, Y=G, B=reconstructed, A=255)  → _RGBA.dds")
+        print("  -tga        Output decoded TGA instead of DDS (same base name, no suffix)")
         print()
         print("Note: -from_fouc reconstructs B via sqrt(1 - X² - Y²). Not bit-perfect due to DXT5 artifacts.")
         print()
         print("Examples:")
-        print("  python dds_normal.py -to_fouc   normal.dds")
-        print("  python dds_normal.py -from_fouc normal.dds out.dds")
+        print("  python dds_normal.py -to_fouc   normal.dds       → normal_RXGB.dds")
+        print("  python dds_normal.py -from_fouc normal.dds       → normal_RGBA.dds")
+        print("  python dds_normal.py -to_fouc  -tga  normal.dds  → normal.tga")
         print("  python dds_normal.py -to_fouc   *.dds")
         print("  python dds_normal.py -from_fouc normalmaps/")
         sys.exit(1)
 
     inputs = []
-    output = None
 
     if len(raw_args) == 1 and os.path.isdir(raw_args[0]):
         inputs = glob.glob(os.path.join(raw_args[0], '*.dds'))
@@ -165,17 +179,13 @@ def main():
             expanded = glob.glob(arg)
             inputs.extend(expanded if expanded else [arg])
 
-        if len(raw_args) == 2 and raw_args[1].lower().endswith('.dds'):
-            inputs = [raw_args[0]]
-            output = raw_args[1]
-
     converted = 0
     for src in inputs:
         if not src.lower().endswith('.dds'):
             continue
-        dst = output or src  # overwrite in-place if no explicit output
+        dst = make_output_path(src, to_fouc, tga_out)
         try:
-            convert_normalmap(src, dst, to_fouc)
+            convert_normalmap(src, dst, to_fouc, tga_out)
             converted += 1
         except Exception as e:
             print(f"  ERROR: {src}: {e}")
