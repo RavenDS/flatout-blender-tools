@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FlatOut PC BGM Tool 2.1.3 — FlatOut BGM converter & optimizer.
+FlatOut PC BGM Tool 2.1.4 — FlatOut BGM converter & optimizer.
 https://github.com/RavenDS/flatout-blender-tools
 
 by ravenDS (github.com/ravenDS)
