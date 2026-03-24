@@ -528,6 +528,7 @@ def build_blender_meshes_ps2(context, parser: 'PS2BGMParser', options: dict):
             auto_shared_dir, convert_dds,
             use_backface_culling,
             is_fouc=False,
+            native_tex_ext='.tm2',
         )
         blender_materials[i] = bl_mat
 

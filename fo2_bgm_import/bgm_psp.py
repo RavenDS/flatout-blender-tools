@@ -337,6 +337,7 @@ def build_blender_meshes_psp(context, parser: 'PSPBGMParser', options: dict):
             auto_shared_dir, convert_dds,
             use_backface_culling,
             is_fouc=False,
+            native_tex_ext='.tex',
         )
         blender_materials[i] = bl_mat
 

@@ -5,7 +5,7 @@
 bl_info = {
     "name": "FlatOut BGM Import (Car)",
     "author": "ravenDS",
-    "version": (1, 6, 0),
+    "version": (1, 6, 1),
     "blender": (3, 6, 0),
     "location": "File > Import > FlatOut Car BGM (.bgm)",
     "description": "Import FlatOut 1/2/UC BGM car model files",
