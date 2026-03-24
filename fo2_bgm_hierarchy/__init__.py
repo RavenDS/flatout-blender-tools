@@ -24,7 +24,7 @@ Three reorganise operators are available in View3D > Object:
 bl_info = {
     "name":        "FlatOut BGM Hierarchy Reorganiser",
     "author":      "ravenDS",
-    "version":     (1, 3, 2),
+    "version":     (1, 3, 3),
     "blender":     (3, 6, 0),
     "location":    "View3D > Object > FO2: Reorganise",
     "description": "Flatten any scene hierarchy into the layout the BGM exporter expects",
@@ -657,6 +657,60 @@ Sets version 0x00020000 + FOUC vertex format, object flags 0xE0F9, v92=2 on ligh
         return {'FINISHED'}
 
 
+class FO2_OT_ViewDummiesAsCubes(bpy.types.Operator):
+    """Set all fo2_body_dummies empties to display as 0.03 m cubes with name and in-front enabled"""
+    bl_idname  = "object.fo2_view_dummies_as_cubes"
+    bl_label   = "FO2: View Dummies as Cubes"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        count = 0
+        parent_empty = bpy.data.objects.get('fo2_body_dummies')
+        if parent_empty and parent_empty.type == 'EMPTY':
+            parent_empty.empty_display_type = 'CUBE'
+            parent_empty.empty_display_size = 0.16
+            parent_empty.show_name          = True
+            parent_empty.show_in_front      = True
+        for obj in bpy.data.objects:
+            if (obj.type == 'EMPTY'
+                    and obj.parent
+                    and obj.parent.name == 'fo2_body_dummies'):
+                obj.empty_display_type = 'CUBE'
+                obj.empty_display_size = 0.03
+                obj.show_name          = True
+                obj.show_in_front      = True
+                count += 1
+        self.report({'INFO'}, f"Set {count} dummies to cube display")
+        return {'FINISHED'}
+
+
+class FO2_OT_ViewDummiesAsAxes(bpy.types.Operator):
+    """Set all fo2_body_dummies empties to display as 0.3 m axes with name and in-front disabled"""
+    bl_idname  = "object.fo2_view_dummies_as_axes"
+    bl_label   = "FO2: View Dummies as Axes"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        count = 0
+        parent_empty = bpy.data.objects.get('fo2_body_dummies')
+        if parent_empty and parent_empty.type == 'EMPTY':
+            parent_empty.empty_display_type = 'PLAIN_AXES'
+            parent_empty.empty_display_size = 0.3
+            parent_empty.show_name          = False
+            parent_empty.show_in_front      = False
+        for obj in bpy.data.objects:
+            if (obj.type == 'EMPTY'
+                    and obj.parent
+                    and obj.parent.name == 'fo2_body_dummies'):
+                obj.empty_display_type = 'PLAIN_AXES'
+                obj.empty_display_size = 0.3
+                obj.show_name          = False
+                obj.show_in_front      = False
+                count += 1
+        self.report({'INFO'}, f"Set {count} dummies to axes display")
+        return {'FINISHED'}
+
+
 # Registration
 
 def menu_func_object(self, context):
@@ -664,17 +718,24 @@ def menu_func_object(self, context):
     self.layout.operator(FO2_OT_ReorganiseForFO1.bl_idname)
     self.layout.operator(FO2_OT_ReorganiseForFO2.bl_idname)
     self.layout.operator(FO2_OT_ReorganiseForFOUC.bl_idname)
+    self.layout.separator()
+    self.layout.operator(FO2_OT_ViewDummiesAsCubes.bl_idname)
+    self.layout.operator(FO2_OT_ViewDummiesAsAxes.bl_idname)
 
 
 def register():
     bpy.utils.register_class(FO2_OT_ReorganiseForFO1)
     bpy.utils.register_class(FO2_OT_ReorganiseForFO2)
     bpy.utils.register_class(FO2_OT_ReorganiseForFOUC)
+    bpy.utils.register_class(FO2_OT_ViewDummiesAsCubes)
+    bpy.utils.register_class(FO2_OT_ViewDummiesAsAxes)
     bpy.types.VIEW3D_MT_object.append(menu_func_object)
 
 
 def unregister():
     bpy.types.VIEW3D_MT_object.remove(menu_func_object)
+    bpy.utils.unregister_class(FO2_OT_ViewDummiesAsAxes)
+    bpy.utils.unregister_class(FO2_OT_ViewDummiesAsCubes)
     bpy.utils.unregister_class(FO2_OT_ReorganiseForFOUC)
     bpy.utils.unregister_class(FO2_OT_ReorganiseForFO2)
     bpy.utils.unregister_class(FO2_OT_ReorganiseForFO1)
