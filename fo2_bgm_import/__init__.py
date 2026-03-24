@@ -1,7 +1,7 @@
 bl_info = {
     "name": "FlatOut BGM Import (Car)",
     "author": "ravenDS",
-    "version": (1, 5, 4),
+    "version": (1, 5, 5),
     "blender": (3, 6, 0),
     "location": "File > Import > FlatOut Car BGM (.bgm)",
     "description": "Import FlatOut 1/2/UC BGM car model files",
@@ -27,6 +27,7 @@ from mathutils import Matrix, Vector
 from dataclasses import dataclass, field
 from typing import Optional
 from . import dds2tga as _dds2tga
+from . import dds_normal as _dds_normal
 
 
 # BGM PARSER (standalone, no Blender dependency)
@@ -621,7 +622,8 @@ def tga_to_dds(name: str) -> str:
 
 
 def find_texture_file(tex_name: str, bgm_dir: str, shared_dir: str,
-                      auto_shared_dir: str = "", convert_dds: bool = False) -> str:
+                      auto_shared_dir: str = "", convert_dds: bool = False,
+                      use_normal_converter: bool = False) -> str:
     """Resolve a texture filename to a full path on disk.
 
     Search order per directory: TGA first, then DDS.
@@ -671,7 +673,10 @@ def find_texture_file(tex_name: str, bgm_dir: str, shared_dir: str,
         if convert_dds:
             out_tga = os.path.join(bgm_dir, tga_name)
             try:
-                _dds2tga.convert_dds_to_tga(found_dds, out_tga)
+                if use_normal_converter: # if texture is _normal
+                    _dds_normal.convert_normalmap(found_dds, out_tga, to_fouc=False, tga_out=True)
+                else:
+                    _dds2tga.convert_dds_to_tga(found_dds, out_tga)
                 print(f"[BGM Import] Converted: {os.path.basename(found_dds)} → {tga_name}")
                 return out_tga
             except Exception as exc:
@@ -694,7 +699,8 @@ def _find_sibling_texture(base_tex_name: str, suffix: str, bgm_dir: str,
     for ext in ('.dds', '.tga', '.png'):
         candidate = stem + suffix + ext
         path = find_texture_file(candidate, bgm_dir, shared_dir,
-                                  auto_shared_dir, convert_dds)
+                                  auto_shared_dir, convert_dds,
+                                  use_normal_converter=(suffix == '_normal'))
         if path:
             return path
     return ""
