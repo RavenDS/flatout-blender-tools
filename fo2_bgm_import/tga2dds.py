@@ -2,7 +2,7 @@
 """
 TGA to DDS Converter (DXT1, DXT3, DXT5)
 Converts 32-bit TGA with alpha to compressed DDS.
-Use -dxt1, -dxt3 or -dxt5 to select compression format.
+Use -dxt1, -dxt3, -dxt5, -bc5, -bc4 to select compression format.
 
 https://github.com/RavenDS/flatout-blender-tools
 """
@@ -179,31 +179,61 @@ def encode_dxt3_block(pixels):
     return struct.pack('<Q', alpha_bits) + color_block
 
 
+# DXT5 / ATI2 alpha-block encoder (shared)
+
+def _encode_alpha_block(values: list) -> bytes:
+    """
+    Encode 16 single-channel values (0-255) into an 8-byte DXT5-style alpha block.
+    Shared by encode_dxt5_block (alpha channel) and encode_ati2_block (R and G channels).
+    """
+    a0 = max(values)    # endpoint 0 – stored as byte 0
+    a1 = min(values)    # endpoint 1 – stored as byte 1
+
+    # Build 8-entry decoder LUT matching the endpoints we will write
+    if a0 > a1:         # 8-value interpolation mode
+        lut = [a0, a1] + [((7 - i) * a0 + i * a1) // 7 for i in range(1, 7)]
+    else:               # 6-value + 0 + 255 mode
+        lut = [a0, a1] + [((5 - i) * a0 + i * a1) // 5 for i in range(1, 5)] + [0, 255]
+
+    indices = 0
+    for i, v in enumerate(values):
+        idx      = min(range(8), key=lambda j: abs(v - lut[j]))
+        indices |= idx << (i * 3)
+
+    return bytes([a0, a1]) + bytes((indices >> (8 * k)) & 0xFF for k in range(6))
+
+
 # DXT5
 
 def encode_dxt5_block(pixels):
     """16 bytes. Interpolated 8-bit alpha with 2 endpoints + 3-bit indices."""
-    alphas = [a for _, _, _, a in pixels]
-    a0 = max(alphas)                                # stored as byte 0
-    a1 = min(alphas)                                # stored as byte 1
-
-    # build 8-entry decoder LUT that matches the a0/a1 values we will write
-    if a0 > a1:                                     # 8-alpha interpolation mode
-        lut = [a0, a1] + [((7 - i) * a0 + i * a1) // 7 for i in range(1, 7)]
-    else:                                           # 6-alpha + 0 + 255 mode
-        lut = [a0, a1] + [((5 - i) * a0 + i * a1) // 5 for i in range(1, 5)]
-        lut += [0, 255]
-
-    alpha_indices = 0
-    for i, a in enumerate(alphas):
-        idx = min(range(8), key=lambda j: abs(a - lut[j]))
-        alpha_indices |= idx << (i * 3)
-
-    alpha_block = bytes([a0, a1]) + bytes(
-        (alpha_indices >> (8 * k)) & 0xFF for k in range(6)
-    )
+    alpha_block = _encode_alpha_block([a for _, _, _, a in pixels])
     color_block = encode_color_block(pixels, four_color_mode=True)
     return alpha_block + color_block
+
+
+# ATI2 / BC5
+
+def encode_ati2_block(pixels):
+    """
+    16 bytes. ATI2/BC5 normal-map format.
+    [8 bytes: Red/X channel] [8 bytes: Green/Y channel]
+    Blue and Alpha from the input pixels are ignored; Z is reconstructed on decode.
+    """
+    r_block = _encode_alpha_block([r for r, g, b, a in pixels])
+    g_block = _encode_alpha_block([g for r, g, b, a in pixels])
+    return r_block + g_block
+
+
+# ATI1 / BC4
+
+def encode_ati1_block(pixels):
+    """
+    8 bytes. ATI1/BC4 single-channel format.
+    Only the Red channel of the input pixels is stored.
+    Green and Blue are ignored; they will be reconstructed as R=G=B on decode.
+    """
+    return _encode_alpha_block([r for r, g, b, a in pixels])
 
 
 # main compression
@@ -213,6 +243,8 @@ def compress_to_dxt(width, height, pixels, fmt):
         'DXT1': encode_dxt1_block,
         'DXT3': encode_dxt3_block,
         'DXT5': encode_dxt5_block,
+        'ATI1': encode_ati1_block,
+        'ATI2': encode_ati2_block,
     }[fmt]
 
     bw = (width  + 3) // 4
@@ -236,7 +268,7 @@ def compress_to_dxt(width, height, pixels, fmt):
 
 def write_dds(filepath, width, height, compressed_data, fmt):
     fourcc     = fmt.encode('ascii')
-    block_size = 8 if fmt == 'DXT1' else 16
+    block_size = 8 if fmt in ('DXT1', 'ATI1') else 16   # ATI1/DXT1=8, DXT3/DXT5/ATI2=16
     linear_size = (
         max(1, (width + 3) // 4) *
         max(1, (height + 3) // 4) *
@@ -307,20 +339,24 @@ def main():
 
     for arg in sys.argv[1:]:
         low = arg.lower()
-        if low in ('-dxt1', '-dxt3', '-dxt5'):
-            fmt = low[1:].upper()
+        if low in ('-dxt1', '-dxt3', '-dxt5', '-ati2', '-bc5', '-ati1', '-bc4'):
+            if   low in ('-ati2', '-bc5'): fmt = 'ATI2'
+            elif low in ('-ati1', '-bc4'): fmt = 'ATI1'
+            else:                          fmt = low[1:].upper()
         else:
             args.append(arg)
 
     if not args or fmt is None:
         print("Source: https://github.com/RavenDS/flatout-blender-tools")
         print()
-        print("Usage: tga2dds.py -dxt1|-dxt3|-dxt5 <input.tga or *.tga> [output.dds]")
+        print("Usage: tga2dds.py -dxt1|-dxt3|-dxt5|-ati1|-bc4|-ati2|-bc5 <input.tga or *.tga> [output.dds]")
         print()
         print("Format guide:")
-        print("  -dxt1   No alpha / 1-bit alpha  (smallest file)")
-        print("  -dxt3   Sharp / binary alpha     (explicit 4-bit alpha per pixel)")
-        print("  -dxt5   Smooth alpha gradients   (interpolated alpha, best quality)")
+        print("  -dxt1        No alpha / 1-bit alpha  (smallest file)")
+        print("  -dxt3        Sharp / binary alpha     (explicit 4-bit alpha per pixel)")
+        print("  -dxt5        Smooth alpha gradients   (interpolated alpha, best quality)")
+        print("  -ati1/-bc4   Single-channel grayscale (BC4: R only, R=G=B on decode)")
+        print("  -ati2/-bc5   Two-channel normal map   (BC5: R=X, G=Y, Z reconstructed on decode)")
         print()
         print("Examples:")
         print("  python tga2dds.py -dxt5 texture.tga")

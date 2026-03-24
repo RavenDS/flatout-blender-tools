@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 DDS to TGA Converter (32-bit with Alpha)
-Converts DDS files (DXT1, DXT3, DXT5, uncompressed RGBA) to 32-bit TGA with alpha preserved.
+Converts DDS files (DXT1, DXT3, DXT5, BC5, BC4, uncompressed RGBA) to 32-bit TGA with alpha preserved.
 
 https://github.com/RavenDS/flatout-blender-tools
 """
@@ -25,6 +25,8 @@ DDPF_RGB         = 0x40
 DXT1 = b'DXT1'
 DXT3 = b'DXT3'
 DXT5 = b'DXT5'
+ATI1 = b'ATI1'  # BC4: single-channel format (R only, stored as grayscale)
+ATI2 = b'ATI2'  # BC5U: two-channel normal map format (X=R, Y=G, Z reconstructed)
 
 
 # DDS parsing
@@ -152,6 +154,55 @@ def decode_dxt5_block(block):
     for i in range(16):
         r, g, b, _ = color_pixels[i]
         pixels.append((r, g, b, alphas[i]))
+    return pixels
+
+
+# ATI2 / BC5 decompression
+
+def _decode_alpha_block(block8: bytes) -> list:
+    """
+    Decode one 8-byte DXT5-style alpha block → 16 values (0-255).
+    Shared by decode_dxt5_block and decode_ati2_block.
+    """
+    a0, a1 = block8[0], block8[1]
+    bits = int.from_bytes(block8[2:8], 'little')
+    if a0 > a1:     # 8-value interpolation mode
+        lut = [a0, a1] + [((7 - i) * a0 + i * a1) // 7 for i in range(1, 7)]
+    else:           # 6-value + 0 + 255 mode
+        lut = [a0, a1] + [((5 - i) * a0 + i * a1) // 5 for i in range(1, 5)] + [0, 255]
+    return [lut[(bits >> (i * 3)) & 7] for i in range(16)]
+
+
+def decode_ati1_block(block: bytes) -> list:
+    """
+    Decode one 8-byte ATI1/BC4 block → 16 (R,G,B,A) tuples.
+
+    Layout: [8 bytes: single channel]
+    The channel is replicated to R, G and B to produce a grayscale image.
+    Alpha is always 255.
+    """
+    vals = _decode_alpha_block(block[0:8])
+    return [(v, v, v, 255) for v in vals]
+
+
+def decode_ati2_block(block: bytes) -> list:
+    """
+    Decode one 16-byte ATI2/BC5 block → 16 (R,G,B,A) tuples.
+
+    Layout: [8 bytes: X/Red channel] [8 bytes: Y/Green channel]
+    Z (Blue) is reconstructed from the unit-normal constraint: Z = sqrt(1 - X² - Y²).
+    Alpha is always 255.
+    """
+    import math
+    r_vals = _decode_alpha_block(block[0:8])
+    g_vals = _decode_alpha_block(block[8:16])
+    pixels = []
+    for r, g in zip(r_vals, g_vals):
+        nx = (r / 127.5) - 1.0
+        ny = (g / 127.5) - 1.0
+        nz = math.sqrt(max(0.0, 1.0 - nx * nx - ny * ny))
+        b  = min(255, int((nz + 1.0) * 127.5))
+        pixels.append((r, g, b, 255))
     return pixels
 
 
@@ -284,6 +335,10 @@ def convert_dds_to_tga(dds_path, tga_path=None):
             pixels = decompress_dxt(dds, decode_dxt3_block, 16)
         elif fourcc == DXT5:
             pixels = decompress_dxt(dds, decode_dxt5_block, 16)
+        elif fourcc == ATI1:
+            pixels = decompress_dxt(dds, decode_ati1_block, 8)
+        elif fourcc == ATI2:
+            pixels = decompress_dxt(dds, decode_ati2_block, 16)
         else:
             raise ValueError(f"Unsupported compressed format: {fmt_name}")
 
