@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 from . import dds2tga as _dds2tga
 from . import dds_normal as _dds_normal
+from . import tm2tga as _tm2tga
 
 # BGM PARSER (standalone, no Blender dependency)
 
@@ -620,21 +621,27 @@ def tga_to_dds(name: str) -> str:
 
 def find_texture_file(tex_name: str, bgm_dir: str, shared_dir: str,
                       auto_shared_dir: str = "", convert_dds: bool = False,
-                      use_normal_converter: bool = False) -> str:
+                      use_normal_converter: bool = False,
+                      native_ext: str = "") -> str:
     """Resolve a texture filename to a full path on disk.
 
-    Search order per directory: TGA first, then DDS.
+    Search order per directory: TGA first, then native (tm2/tex if given), then DDS.
     Directories searched: bgm_dir -> auto_shared_dir -> shared_dir.
 
-    If convert_dds=True and the texture is only found as a DDS, it is
+    native_ext: platform-specific fallback extension before DDS:
+      '.tm2' for PS2,  '.tex' for PSP.  When found, tm2tga.convert_to_tga()
+      produces a TGA beside the BGM file and that TGA path is returned.
+
+    If convert_dds=True and the texture is only found as DDS, it is
     converted to TGA (placed in bgm_dir) and the TGA path is returned.
     Does case-insensitive matching on all platforms."""
     if not tex_name:
         return ""
 
     base = os.path.splitext(tex_name)[0]
-    tga_name = base + '.tga'
-    dds_name = base + '.dds'
+    tga_name    = base + '.tga'
+    dds_name    = base + '.dds'
+    native_name = (base + native_ext) if native_ext else ""
 
     # build ordered search list, avoid duplicates
     search_dirs = [bgm_dir]
@@ -643,7 +650,8 @@ def find_texture_file(tex_name: str, bgm_dir: str, shared_dir: str,
     if shared_dir and shared_dir not in search_dirs:
         search_dirs.append(shared_dir)
 
-    found_dds = ""  # best DDS path found (first dir wins)
+    found_native = ""  # best native (.tm2/.tex) path found
+    found_dds    = ""  # best DDS path found
 
     for search_dir in search_dirs:
         if not search_dir or not os.path.isdir(search_dir):
@@ -659,13 +667,31 @@ def find_texture_file(tex_name: str, bgm_dir: str, shared_dir: str,
         if tga_match:
             return os.path.join(search_dir, tga_match)
 
+        # remember the first native (.tm2/.tex) found
+        if native_name and not found_native:
+            nat_match = entries_lower.get(native_name.lower())
+            if nat_match:
+                found_native = os.path.join(search_dir, nat_match)
+
         # remember the first DDS found for fallback
         if not found_dds:
             dds_match = entries_lower.get(dds_name.lower())
             if dds_match:
                 found_dds = os.path.join(search_dir, dds_match)
 
-    # no TGA found anywhere, deal with DDS
+    # no TGA found — try native format (.tm2 / .tex) before DDS
+    if found_native:
+        out_tga = os.path.join(bgm_dir, tga_name)
+        try:
+            _tm2tga.convert_to_tga(found_native, out_tga)
+            print(f"[BGM Import] Converted: {os.path.basename(found_native)} → {tga_name}")
+            return out_tga
+        except Exception as exc:
+            print(f"[BGM Import] {native_ext.upper()[1:]}→TGA conversion failed for "
+                  f"{os.path.basename(found_native)}: {exc}")
+        # fall through to DDS if conversion failed
+
+    # no TGA or native found, deal with DDS
     if found_dds:
         if convert_dds:
             out_tga = os.path.join(bgm_dir, tga_name)
@@ -724,7 +750,8 @@ def create_blender_material(bgm_mat: BGMMaterial, bgm_dir: str, shared_dir: str,
                             use_backface_culling: bool = True,
                             is_fouc: bool = False,
                             import_normal_maps: bool = True,
-                            import_specular_maps: bool = False) -> bpy.types.Material:
+                            import_specular_maps: bool = False,
+                            native_tex_ext: str = "") -> bpy.types.Material:
     """Create a Blender material with Principled BSDF from a BGM material."""
     mat_name = bgm_mat.name if bgm_mat.name else "bgm_unnamed"
     bl_mat = bpy.data.materials.new(name=mat_name)
@@ -757,7 +784,8 @@ def create_blender_material(bgm_mat: BGMMaterial, bgm_dir: str, shared_dir: str,
         # FO1 stores "body.tga" in the BGM but the actual file on disk is skin1.tga
         tex_lookup_name = "skin1.tga" if tex_name.lower() == "body.tga" else tex_name
         tex_path = find_texture_file(tex_lookup_name, bgm_dir, shared_dir,
-                                      auto_shared_dir, convert_dds)
+                                      auto_shared_dir, convert_dds,
+                                      native_ext=native_tex_ext)
 
         if tex_path:
             img = _load_or_find_image(tex_path)
