@@ -3,7 +3,6 @@
 FlatOut BGM Tool 2.3.0 — multi-platform BGM converter & optimizer
 https://github.com/RavenDS/flatout-blender-tools
 
-
 Supported input formats  (auto-detected):
   PC FO1 / FO2 / FOUC   — float vertex / index streams (types 1 + 2)
   PS2                    — VIF packet blob (stream type 3, 40-byte surface records)
@@ -4243,7 +4242,7 @@ def write_xbox_bgm(output_path, version, materials_raw, streams, surfaces, model
     else:   print(f"\n  {osz:,}B")
     crash_src,_=_find_crash_dat(input_path) if input_path else (None,None)
     if crash_src and os.path.exists(crash_src):
-        crash_out=os.path.splitext(output_path)[0]+'-crash.dat'
+        crash_out=os.path.splitext(output_path)[0]+'_crash.dat'
         _xb_convert_crash_dat_file(crash_src,crash_out)
     else:
         print("  No crash.dat found, skipping Xbox crash.dat generation")
