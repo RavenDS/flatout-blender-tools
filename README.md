@@ -10,17 +10,14 @@ A collection of Blender Add-Ons &amp; Python scripts for **FlatOut 1/2/Ultimate 
 * **fo2_collision_io:** **WIP!** Import/Export collision data _(.cdb2)_ & _shadowmap_w2.dat_
 
 ## Standalone Scripts
-* **bgm_tool:** Convert + Optimize **FO1/FO2/UC** .bgm files
-* **bgm_tool_ps2:**  Convert **FO2 PC** .bgm to **FO2 PS2** .bgm _(experimental)_
-* **bgm_tool_xbox:** Convert **FO2 PC** .bgm to **FO2 XBOX** .bgm _(experimental)_
-* **bgm_tool_psp:**  Convert **FO2 PC** .bgm to **FOHO PSP** .bgm _(experimental)_
+* **bgm_tool:** Convert + Optimize **FO1/FO2/UC** .bgm files for **PC/PS2/XBOX/PSP**
 * **dds2tga:** Convert .dds to .tga 32-bit, preserve alpha channel
 * **dds_normal**: Convert **FOUC RXGB** (DXT5nm) to RGBA
 * **dds_resize**: Quick resize .dds files for console ports
 * **tga2dds:** Convert .tga to .dds (DXT1, DXT3, DXT5)
 
 ## Standalone Tools
-* **PS2texTool:** VB.Net GUI to easily import .dds into PS2 .tm2 and PSP .tex files
+* **PS2TexTool:** VB.Net GUI to easily import **.dds** into PS2 **.tm2** and PSP **.tex** skin files
 
 ## Credits &amp; Notes
 - [Chloe](https://github.com/gaycoderprincess) for her work on the model (bgm) format ([FlatOutW32BGMTool](https://github.com/gaycoderprincess/FlatOutW32BGMTool))
