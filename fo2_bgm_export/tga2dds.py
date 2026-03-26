@@ -95,6 +95,40 @@ def sq_dist(a, b):
     return (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2
 
 
+# mipmap generation
+
+def _downsample_box(pixels, src_w, src_h):
+    """Halve dimensions using a 2×2 box filter (average of 4 pixels → 1)."""
+    dst_w = max(1, src_w // 2)
+    dst_h = max(1, src_h // 2)
+    out = []
+    for dy in range(dst_h):
+        for dx in range(dst_w):
+            r_acc = g_acc = b_acc = a_acc = 0
+            for ky in range(2):
+                for kx in range(2):
+                    sx = min(dx * 2 + kx, src_w - 1)
+                    sy = min(dy * 2 + ky, src_h - 1)
+                    r, g, b, a = pixels[sy * src_w + sx]
+                    r_acc += r; g_acc += g; b_acc += b; a_acc += a
+            out.append((r_acc // 4, g_acc // 4, b_acc // 4, a_acc // 4))
+    return dst_w, dst_h, out
+
+
+def generate_mipmaps(width, height, pixels):
+    """
+    Generate all mip levels below the base image using a 2×2 box filter.
+    Returns a list of (w, h, pixels) tuples for levels 1, 2, 3, … down to 1×1.
+    The base level (level 0) is NOT included.
+    """
+    levels = []
+    w, h, px = width, height, pixels
+    while w > 1 or h > 1:
+        w, h, px = _downsample_box(px, w, h)
+        levels.append((w, h, px))
+    return levels
+
+
 # DXT color block encoder (shared by all three formats)
 
 def encode_color_block(pixels, four_color_mode=True):
@@ -266,24 +300,39 @@ def compress_to_dxt(width, height, pixels, fmt):
 
 # DDS writing
 
-def write_dds(filepath, width, height, compressed_data, fmt):
+def write_dds(filepath, width, height, compressed_data, fmt, mip_data=None):
+    """
+    Write a DDS file.
+    mip_data: optional list of (w, h, compressed_bytes) for mip levels 1, 2, …
+              If None or empty, a single-level DDS is written (legacy behaviour).
+    """
     fourcc     = fmt.encode('ascii')
-    block_size = 8 if fmt in ('DXT1', 'ATI1') else 16   # ATI1/DXT1=8, DXT3/DXT5/ATI2=16
-    linear_size = (
-        max(1, (width + 3) // 4) *
-        max(1, (height + 3) // 4) *
-        block_size
-    )
+    block_size = 8 if fmt in ('DXT1', 'ATI1') else 16
+
+    def _linear_size(w, h):
+        return max(1, (w + 3) // 4) * max(1, (h + 3) // 4) * block_size
+
+    linear_size = _linear_size(width, height)
 
     DDSD_CAPS        = 0x000001
     DDSD_HEIGHT      = 0x000002
     DDSD_WIDTH       = 0x000004
     DDSD_PIXELFORMAT = 0x001000
     DDSD_LINEARSIZE  = 0x080000
+    DDSD_MIPMAPCOUNT = 0x020000
     DDSCAPS_TEXTURE  = 0x001000
+    DDSCAPS_COMPLEX  = 0x000008
+    DDSCAPS_MIPMAP   = 0x400000
     DDPF_FOURCC      = 0x000004
 
+    has_mips  = bool(mip_data)
+    mip_count = 1 + len(mip_data) if has_mips else 1
+
     flags = DDSD_CAPS | DDSD_HEIGHT | DDSD_WIDTH | DDSD_PIXELFORMAT | DDSD_LINEARSIZE
+    caps  = DDSCAPS_TEXTURE
+    if has_mips:
+        flags |= DDSD_MIPMAPCOUNT
+        caps  |= DDSCAPS_COMPLEX | DDSCAPS_MIPMAP
 
     with open(filepath, 'wb') as f:
         f.write(b'DDS ')
@@ -295,7 +344,8 @@ def write_dds(filepath, width, height, compressed_data, fmt):
         f.write(struct.pack('<I', width))         # dwWidth
         f.write(struct.pack('<I', linear_size))   # dwPitchOrLinearSize
         f.write(struct.pack('<I', 0))             # dwDepth
-        f.write(struct.pack('<I', 1))             # dwMipMapCount
+        f.write(struct.pack('<I', mip_count))     # dwMipMapCount
+
         f.write(b'\x00' * 44)                     # dwReserved1[11]
 
         # DDS_PIXELFORMAT (32 bytes)
@@ -309,33 +359,49 @@ def write_dds(filepath, width, height, compressed_data, fmt):
         f.write(struct.pack('<I', 0))             # dwABitMask
 
         # caps (5 × 4 bytes)
-        f.write(struct.pack('<I', DDSCAPS_TEXTURE))
+        f.write(struct.pack('<I', caps))
         f.write(struct.pack('<I', 0))             # dwCaps2
         f.write(struct.pack('<I', 0))             # dwCaps3
         f.write(struct.pack('<I', 0))             # dwCaps4
         f.write(struct.pack('<I', 0))             # dwReserved2
 
+        # pixel data: base level then each mip in order
         f.write(compressed_data)
+        if has_mips:
+            for _w, _h, mip_bytes in mip_data:
+                f.write(mip_bytes)
 
-    print(f"  Saved: {filepath} ({width}x{height}, {fmt})")
+    mip_str = f", {mip_count} mip level{'s' if mip_count > 1 else ''}" if has_mips else ""
+    print(f"  Saved: {filepath} ({width}x{height}, {fmt}{mip_str})")
 
 
 # top-level conversion
 
-def convert_tga_to_dds(tga_path, dds_path, fmt):
+def convert_tga_to_dds(tga_path, dds_path, fmt, mipmaps=False):
     print(f"  Reading: {tga_path}")
     width, height, pixels = read_tga(tga_path)
     print(f"  Compressing: {width}x{height} → {fmt}")
     data = compress_to_dxt(width, height, pixels, fmt)
-    write_dds(dds_path, width, height, data, fmt)
+
+    mip_data = None
+    if mipmaps:
+        levels = generate_mipmaps(width, height, pixels)
+        mip_data = []
+        for mw, mh, mpx in levels:
+            mip_data.append((mw, mh, compress_to_dxt(mw, mh, mpx, fmt)))
+        print(f"  Mipmaps:     {1 + len(mip_data)} levels "
+              f"({width}x{height} → {mip_data[-1][0]}x{mip_data[-1][1]})")
+
+    write_dds(dds_path, width, height, data, fmt, mip_data)
     return dds_path
 
 
 # CLI
 
 def main():
-    fmt  = None
-    args = []
+    fmt     = None
+    mipmaps = False
+    args    = []
 
     for arg in sys.argv[1:]:
         low = arg.lower()
@@ -343,13 +409,15 @@ def main():
             if   low in ('-ati2', '-bc5'): fmt = 'ATI2'
             elif low in ('-ati1', '-bc4'): fmt = 'ATI1'
             else:                          fmt = low[1:].upper()
+        elif low == '-mip':
+            mipmaps = True
         else:
             args.append(arg)
 
     if not args or fmt is None:
         print("Source: https://github.com/RavenDS/flatout-blender-tools")
         print()
-        print("Usage: tga2dds.py -dxt1|-dxt3|-dxt5|-ati1|-bc4|-ati2|-bc5 <input.tga or *.tga> [output.dds]")
+        print("Usage: tga2dds.py -dxt1|-dxt3|-dxt5|-ati1|-bc4|-ati2|-bc5 [-mip] <input.tga or *.tga> [output.dds]")
         print()
         print("Format guide:")
         print("  -dxt1        No alpha / 1-bit alpha  (smallest file)")
@@ -358,8 +426,12 @@ def main():
         print("  -ati1/-bc4   Single-channel grayscale (BC4: R only, R=G=B on decode)")
         print("  -ati2/-bc5   Two-channel normal map   (BC5: R=X, G=Y, Z reconstructed on decode)")
         print()
+        print("Options:")
+        print("  -mip         Generate full mipmap chain (box filter, down to 1×1)")
+        print()
         print("Examples:")
         print("  python tga2dds.py -dxt5 texture.tga")
+        print("  python tga2dds.py -dxt5 -mip texture.tga")
         print("  python tga2dds.py -dxt1 texture.tga output.dds")
         print("  python tga2dds.py -dxt3 *.tga")
         print("  python tga2dds.py -dxt5 folder/")
@@ -388,7 +460,7 @@ def main():
             continue
         dds_path = output or (os.path.splitext(tga_path)[0] + '.dds')
         try:
-            convert_tga_to_dds(tga_path, dds_path, fmt)
+            convert_tga_to_dds(tga_path, dds_path, fmt, mipmaps)
             converted += 1
         except Exception as e:
             print(f"  ERROR converting {tga_path}: {e}")
