@@ -445,16 +445,30 @@ def find_pngs_naming(folder):
       <n>_a.png    -> alpha for <n>.png     (also accepts <n>_alpha.png)
       <n>_d_a.png  -> alpha for <n>_d.png   (also accepts <n>_d_alpha.png)
 
-    If at least one alpha file exists in folder and a color file has no paired alpha,
-    the last alpha seen in sorted order is reused (fallback_alpha=True).
+    Alpha files are strictly scoped:
+      - _a / _alpha        only pair with regular (non-_d) color files
+      - _d_a / _d_alpha    only pair with _d color files
+
+    Fallback (folder mode): if at least one alpha of the matching type exists in the
+    folder and a color file has no paired alpha, the last known alpha of that same
+    type (regular or damaged, in sorted order) is inherited automatically.
     """
     all_pngs  = glob.glob(os.path.join(folder, '*.png'))
     # stem (no extension, no folder) -> basename (with extension)
     basenames = {os.path.splitext(os.path.basename(p))[0]: os.path.basename(p)
                  for p in all_pngs}
 
-    alpha_stems   = {s for s in basenames if _is_alpha_stem(s)}
-    has_any_alpha = bool(alpha_stems)
+    alpha_stems = {s for s in basenames if _is_alpha_stem(s)}
+
+    # Separate "has any alpha" flags per variant type
+    has_any_regular_alpha = any(
+        s.endswith('_a') or s.endswith('_alpha')
+        for s in alpha_stems
+    )
+    has_any_damaged_alpha = any(
+        s.endswith('_d_a') or s.endswith('_d_alpha')
+        for s in alpha_stems
+    )
 
     # Build sorted color entries
     color_entries = []
@@ -467,23 +481,32 @@ def find_pngs_naming(folder):
         if stem.endswith('_d'):
             base        = stem[:-2]            # e.g. "4" from "4_d"
             output_stem = f'skin{base}_damaged'
-            alpha_png   = _find_alpha_for_stem(stem, basenames, folder)
+            is_damaged  = True
         else:
             output_stem = f'skin{stem}'
-            alpha_png   = _find_alpha_for_stem(stem, basenames, folder)
+            is_damaged  = False
 
-        color_entries.append((stem, path, alpha_png, output_stem))
+        alpha_png = _find_alpha_for_stem(stem, basenames, folder)
+        color_entries.append((stem, path, alpha_png, output_stem, is_damaged))
 
-    # Apply last-known-alpha fallback in sorted order
-    last_known_alpha = None
+    # Apply last-known-alpha fallback in sorted order, tracked separately per type
+    last_known_regular_alpha = None
+    last_known_damaged_alpha = None
     result = []
-    for stem, color_png, alpha_png, output_stem in color_entries:
+    for stem, color_png, alpha_png, output_stem, is_damaged in color_entries:
         fallback_used = False
-        if alpha_png is not None:
-            last_known_alpha = alpha_png   # update whenever we have a real pair
-        elif has_any_alpha and last_known_alpha is not None:
-            alpha_png     = last_known_alpha
-            fallback_used = True
+        if is_damaged:
+            if alpha_png is not None:
+                last_known_damaged_alpha = alpha_png
+            elif has_any_damaged_alpha and last_known_damaged_alpha is not None:
+                alpha_png     = last_known_damaged_alpha
+                fallback_used = True
+        else:
+            if alpha_png is not None:
+                last_known_regular_alpha = alpha_png
+            elif has_any_regular_alpha and last_known_regular_alpha is not None:
+                alpha_png     = last_known_regular_alpha
+                fallback_used = True
         result.append((color_png, alpha_png, output_stem, fallback_used))
 
     return result
@@ -548,7 +571,7 @@ def _usage():
     print("  -nmips <n>            Number of MIP maps to generate")
     print()
     print("-naming convention:")
-    print("  Input  : <n>.png / <n>_d.png  +  <n>_a.png / <n>_d_a.png  (alpha)")
+    print("  Input  : <n>.png / <n>_a.png  +  <n>_d.png / <n>_d_a.png")
     print("           (_alpha.png suffix is accepted as fallback for _a.png)")
     print("  Output : <n>.png     -> skin<n>.dds")
     print("           <n>_d.png   -> skin<n>_damaged.dds")
