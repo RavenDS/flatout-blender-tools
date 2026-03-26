@@ -15,14 +15,15 @@ PNG reading uses only Python stdlib (zlib + struct) - no external libraries.
 TGA writing uses write_tga() from dds2tga.py.
 
 Usage:
-  python png_merge_to_dds.py [options] <folder>
-  python png_merge_to_dds.py [options] <n>.png
+  python png2dds.py [options] <folder>
+  python png2dds.py [options] <n>.png
 
 General options:
   -rd                   Recurse into sub-folders (folder mode only)
   -skiptga              Delete intermediate TGA files after conversion
   -dxt1 | -dxt3 | -dxt5 | -bc4 | -bc5
                         DDS compression format (default: -dxt5)
+  -naming               Use structured naming convention (see below)
 
 nvdxt-only options (ignored when falling back to tga2dds):
   -quick                Fast compression method (replaces -quality_highest)
@@ -30,6 +31,19 @@ nvdxt-only options (ignored when falling back to tga2dds):
   -quality_production   Production quality compression (replaces -quality_highest)
   -sharpenMethod <m>    Sharpen method for MIP maps
   -nmips <n>            Number of MIP maps to generate
+
+-naming convention:
+  Input files:
+    <n>.png       color skin
+    <n>_d.png     damaged skin
+    <n>_a.png     alpha for <n>.png
+    <n>_d_a.png   alpha for <n>_d.png
+  Output files:
+    <n>.png       -> skin<n>.dds / skin<n>.tga
+    <n>_d.png     -> skin<n>_damaged.dds / skin<n>_damaged.tga
+  Alpha fallback (folder mode only):
+    If at least one _a/_alpha file exists in the folder and a color file
+    has no paired alpha, the last known alpha (in sorted order) is reused.
 
 """
 
@@ -242,7 +256,7 @@ def _alpha_from_pixel(r, g, b, a):
 def build_tga(color_png, alpha_png, tga_path):
     """
     Read color_png (and optionally alpha_png) and write a 32-bit TGA at tga_path.
-    If alpha_png is None every pixel gets alpha=255.
+    If alpha_png is None the PNG's own alpha is preserved (RGB -> fully opaque).
     Returns (width, height).
     """
     cw, ch, color_px = read_png(color_png)
@@ -302,20 +316,33 @@ def convert_tga(tga_path, fmt, nvdxt_extra):
         convert_tga_to_dds(tga_path, dds_path, fmt, mipmaps=True)
 
 
-def process_png(color_png, alpha_png, fmt, nvdxt_extra, skip_tga):
+def process_png(color_png, alpha_png, fmt, nvdxt_extra, skip_tga,
+                output_stem=None, fallback_alpha=False):
     """
     Full pipeline for one PNG:  build TGA -> convert to DDS -> optionally remove TGA.
-    alpha_png may be None (standalone PNG, alpha=255).
+
+    output_stem   : if set, the TGA/DDS are written as <folder>/<output_stem>.tga/.dds
+                    instead of the default <color_png_base>.tga/.dds  (-naming mode)
+    fallback_alpha: True when alpha_png was inherited from the previous file, not paired
     """
-    base     = os.path.splitext(color_png)[0]
-    tga_path = base + '.tga'
+    if output_stem is not None:
+        folder   = os.path.dirname(os.path.abspath(color_png))
+        tga_path = os.path.join(folder, output_stem + '.tga')
+    else:
+        base     = os.path.splitext(color_png)[0]
+        tga_path = base + '.tga'
 
     print(f"\n[{os.path.basename(color_png)}]")
-    print(f"  Color : {color_png}")
+    print(f"  Color  : {os.path.basename(color_png)}")
     if alpha_png:
-        print(f"  Alpha : {alpha_png}")
+        alpha_label = os.path.basename(alpha_png)
+        if fallback_alpha:
+            alpha_label += "  (inherited - no paired alpha found)"
+        print(f"  Alpha  : {alpha_label}")
     else:
-        print(f"  Alpha : (none - using PNG's own alpha channel)")
+        print(f"  Alpha  : (none - using PNG's own alpha channel)")
+    if output_stem is not None:
+        print(f"  Output : {output_stem}")
 
     try:
         build_tga(color_png, alpha_png, tga_path)
@@ -335,7 +362,7 @@ def process_png(color_png, alpha_png, fmt, nvdxt_extra, skip_tga):
 
 
 # ---------------------------------------------------------------------------
-# Folder scanning
+# Standard folder scanning (no -naming)
 # ---------------------------------------------------------------------------
 
 def find_pngs(folder):
@@ -386,6 +413,116 @@ def process_folder(folder, fmt, nvdxt_extra, skip_tga, recursive=False):
 
 
 # ---------------------------------------------------------------------------
+# -naming folder scanning
+# ---------------------------------------------------------------------------
+
+def _is_alpha_stem(stem):
+    """True if this stem represents an alpha file under the -naming convention."""
+    return (stem.endswith('_a') or stem.endswith('_alpha') or
+            stem.endswith('_d_a') or stem.endswith('_d_alpha'))
+
+
+def _find_alpha_for_stem(stem, basenames, folder):
+    """
+    Look for an alpha PNG for a given color stem.
+    Tries <stem>_a.png first, then <stem>_alpha.png.
+    Returns the full path if found, else None.
+    """
+    for suffix in ('_a', '_alpha'):
+        candidate = stem + suffix
+        if candidate in basenames:
+            return os.path.join(folder, basenames[candidate])
+    return None
+
+
+def find_pngs_naming(folder):
+    """
+    Yield (color_png, alpha_png_or_None, output_stem, fallback_alpha) in -naming mode.
+
+    Naming convention:
+      <n>.png      -> color,         output: skin<n>
+      <n>_d.png    -> damaged color, output: skin<n>_damaged
+      <n>_a.png    -> alpha for <n>.png     (also accepts <n>_alpha.png)
+      <n>_d_a.png  -> alpha for <n>_d.png   (also accepts <n>_d_alpha.png)
+
+    If at least one alpha file exists in folder and a color file has no paired alpha,
+    the last alpha seen in sorted order is reused (fallback_alpha=True).
+    """
+    all_pngs  = glob.glob(os.path.join(folder, '*.png'))
+    # stem (no extension, no folder) -> basename (with extension)
+    basenames = {os.path.splitext(os.path.basename(p))[0]: os.path.basename(p)
+                 for p in all_pngs}
+
+    alpha_stems   = {s for s in basenames if _is_alpha_stem(s)}
+    has_any_alpha = bool(alpha_stems)
+
+    # Build sorted color entries
+    color_entries = []
+    for stem in sorted(basenames):
+        if stem in alpha_stems:
+            continue  # alpha files are never converted directly
+
+        path = os.path.join(folder, basenames[stem])
+
+        if stem.endswith('_d'):
+            base        = stem[:-2]            # e.g. "4" from "4_d"
+            output_stem = f'skin{base}_damaged'
+            alpha_png   = _find_alpha_for_stem(stem, basenames, folder)
+        else:
+            output_stem = f'skin{stem}'
+            alpha_png   = _find_alpha_for_stem(stem, basenames, folder)
+
+        color_entries.append((stem, path, alpha_png, output_stem))
+
+    # Apply last-known-alpha fallback in sorted order
+    last_known_alpha = None
+    result = []
+    for stem, color_png, alpha_png, output_stem in color_entries:
+        fallback_used = False
+        if alpha_png is not None:
+            last_known_alpha = alpha_png   # update whenever we have a real pair
+        elif has_any_alpha and last_known_alpha is not None:
+            alpha_png     = last_known_alpha
+            fallback_used = True
+        result.append((color_png, alpha_png, output_stem, fallback_used))
+
+    return result
+
+
+def process_folder_naming(folder, fmt, nvdxt_extra, skip_tga, recursive=False):
+    """Process all PNGs in folder using -naming convention."""
+    folders = []
+    if recursive:
+        for dirpath, dirnames, _ in os.walk(folder):
+            dirnames.sort()
+            folders.append(dirpath)
+    else:
+        folders = [folder]
+
+    total_ok  = 0
+    total_err = 0
+
+    for f in folders:
+        entries = find_pngs_naming(f)
+        if not entries:
+            if not recursive:
+                print(f"No PNG files found in: {f}")
+            continue
+
+        if recursive and f != folder:
+            print(f"\n=== {f} ===")
+
+        for color_png, alpha_png, output_stem, fallback_used in entries:
+            if process_png(color_png, alpha_png, fmt, nvdxt_extra, skip_tga,
+                           output_stem=output_stem, fallback_alpha=fallback_used):
+                total_ok  += 1
+            else:
+                total_err += 1
+
+    return total_ok, total_err
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -401,13 +538,22 @@ def _usage():
     print("  -skiptga              Delete intermediate TGA after conversion")
     print("  -dxt1 | -dxt3 | -dxt5 | -bc4 | -bc5")
     print("                        Output format (default: -dxt5)")
+    print("  -naming               Use structured naming convention (see below)")
     print()
-    print("nvdxt-only options (ignored when falling back to tga2dds):")
+    print("nvdxt-only options:")
     print("  -quick                Fast compression (replaces -quality_highest)")
     print("  -quality_normal       Normal quality   (replaces -quality_highest)")
     print("  -quality_production   Production quality (replaces -quality_highest)")
     print("  -sharpenMethod <m>    Sharpen method for MIP maps")
     print("  -nmips <n>            Number of MIP maps to generate")
+    print()
+    print("-naming convention:")
+    print("  Input  : <n>.png / <n>_d.png  +  <n>_a.png / <n>_d_a.png  (alpha)")
+    print("           (_alpha.png suffix is accepted as fallback for _a.png)")
+    print("  Output : <n>.png     -> skin<n>.dds")
+    print("           <n>_d.png   -> skin<n>_damaged.dds")
+    print("  If at least one alpha exists in a folder and a file has no paired alpha,")
+    print("  the last known alpha (sorted order) is inherited automatically.")
     print()
     print("Notes:")
     print("  If <n>_alpha.png is present it is used as the alpha channel.")
@@ -426,6 +572,7 @@ def main():
     # ---- parse flags ----
     recursive   = False
     skip_tga    = False
+    naming      = False
     fmt         = 'DXT5'    # default format
     nvdxt_extra = []        # forwarded to nvdxt only
     positional  = []
@@ -439,6 +586,8 @@ def main():
             recursive = True
         elif low == '-skiptga':
             skip_tga = True
+        elif low == '-naming':
+            naming = True
         elif low in _FORMAT_MAP:
             fmt = _FORMAT_MAP[low]
         elif low in _NVDXT_QUALITY_FLAGS:
@@ -469,20 +618,57 @@ def main():
             print(f"ERROR: File not found: {target}")
             sys.exit(1)
 
-        base = os.path.splitext(os.path.abspath(target))[0]
-        # Correct silently if user passed the alpha PNG by mistake
-        if base.endswith('_alpha'):
-            base = base[: -len('_alpha')]
+        base   = os.path.splitext(os.path.abspath(target))[0]
+        folder = os.path.dirname(base)
+        stem   = os.path.basename(base)
 
-        color_png = base + '.png'
-        alpha_png = base + '_alpha.png'
+        if naming:
+            # Strip alpha suffixes if user accidentally passed an alpha file
+            for a_sfx in ('_d_alpha', '_d_a', '_alpha', '_a'):
+                if stem.endswith(a_sfx):
+                    stem = stem[: -len(a_sfx)]
+                    base = os.path.join(folder, stem)
+                    break
 
-        if not os.path.isfile(color_png):
-            print(f"ERROR: Color PNG not found: {color_png}")
-            sys.exit(1)
+            color_png = base + '.png'
+            if not os.path.isfile(color_png):
+                print(f"ERROR: Color PNG not found: {color_png}")
+                sys.exit(1)
 
-        alpha_arg = alpha_png if os.path.isfile(alpha_png) else None
-        ok = process_png(color_png, alpha_arg, fmt, nvdxt_extra, skip_tga)
+            if stem.endswith('_d'):
+                real_base   = stem[:-2]
+                output_stem = f'skin{real_base}_damaged'
+            else:
+                output_stem = f'skin{stem}'
+
+            # Look for alpha: _a first, then _alpha
+            alpha_arg = None
+            for suffix in ('_a', '_alpha'):
+                candidate = os.path.join(folder, stem + suffix + '.png')
+                if os.path.isfile(candidate):
+                    alpha_arg = candidate
+                    break
+
+            ok = process_png(color_png, alpha_arg, fmt, nvdxt_extra, skip_tga,
+                             output_stem=output_stem)
+
+        else:
+            # Standard mode
+            # Correct silently if user passed the alpha PNG by mistake
+            if stem.endswith('_alpha'):
+                stem = stem[: -len('_alpha')]
+                base = os.path.join(folder, stem)
+
+            color_png = base + '.png'
+            alpha_png = base + '_alpha.png'
+
+            if not os.path.isfile(color_png):
+                print(f"ERROR: Color PNG not found: {color_png}")
+                sys.exit(1)
+
+            alpha_arg = alpha_png if os.path.isfile(alpha_png) else None
+            ok = process_png(color_png, alpha_arg, fmt, nvdxt_extra, skip_tga)
+
         print(f"\nDone. {'1 converted.' if ok else '0 converted (error).'}")
         sys.exit(0 if ok else 1)
 
@@ -493,7 +679,11 @@ def main():
         label = f"'{target}'" + (" recursively" if recursive else "")
         print(f"Scanning {label} ...")
 
-        ok, err = process_folder(target, fmt, nvdxt_extra, skip_tga, recursive)
+        if naming:
+            ok, err = process_folder_naming(target, fmt, nvdxt_extra, skip_tga, recursive)
+        else:
+            ok, err = process_folder(target, fmt, nvdxt_extra, skip_tga, recursive)
+
         print(f"\nDone. {ok} converted, {err} error(s).")
         sys.exit(0 if err == 0 else 1)
 
