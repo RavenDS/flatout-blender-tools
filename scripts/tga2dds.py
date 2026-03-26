@@ -95,6 +95,140 @@ def sq_dist(a, b):
     return (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2
 
 
+# colour-block helpers ─────────────────────────────────────────────────────────
+
+def _pca_axis(rgb_list):
+    """
+    Return the dominant direction of the colour cloud using power iteration on
+    the 3×3 covariance matrix.  Falls back to (1,1,1) for uniform blocks.
+    """
+    n = len(rgb_list)
+    mr = sum(c[0] for c in rgb_list) / n
+    mg = sum(c[1] for c in rgb_list) / n
+    mb = sum(c[2] for c in rgb_list) / n
+
+    rr = rg = rb = gg = gb = bb = 0.0
+    for r, g, b in rgb_list:
+        dr = r - mr; dg = g - mg; db = b - mb
+        rr += dr*dr; rg += dr*dg; rb += dr*db
+        gg += dg*dg; gb += dg*db; bb += db*db
+
+    # Row-sum heuristic as the starting vector for power iteration
+    vr = rr + rg + rb
+    vg = rg + gg + gb
+    vb = rb + gb + bb
+    length = (vr*vr + vg*vg + vb*vb) ** 0.5
+    if length < 1e-10:
+        return 1.0, 1.0, 1.0   # uniform block
+    vr /= length; vg /= length; vb /= length
+
+    for _ in range(8):
+        nr = rr*vr + rg*vg + rb*vb
+        ng = rg*vr + gg*vg + gb*vb
+        nb = rb*vr + gb*vg + bb*vb
+        length = (nr*nr + ng*ng + nb*nb) ** 0.5
+        if length < 1e-10:
+            break
+        vr, vg, vb = nr/length, ng/length, nb/length
+
+    return vr, vg, vb
+
+
+def _enforce_order(c0, c1, four_color_mode):
+    """Guarantee c0 > c1 (4-color) or c0 < c1 (3-color+transparent) in 565 space."""
+    if four_color_mode:
+        if c0 < c1:
+            c0, c1 = c1, c0
+        if c0 == c1:
+            if c0 > 0:    c1 -= 1
+            else:         c0 += 1
+    else:
+        if c0 > c1:
+            c0, c1 = c1, c0
+        if c0 == c1:
+            if c1 < 0xFFFF: c1 += 1
+            else:           c0 -= 1
+    return c0, c1
+
+
+def _build_palette4(c0_565, c1_565):
+    """Build the 4-colour DXT palette from two 565 endpoints (c0 > c1 assumed)."""
+    c0r, c0g, c0b = from_rgb565(c0_565)
+    c1r, c1g, c1b = from_rgb565(c1_565)
+    return [
+        (c0r, c0g, c0b),
+        (c1r, c1g, c1b),
+        ((2*c0r + c1r) // 3, (2*c0g + c1g) // 3, (2*c0b + c1b) // 3),
+        ((c0r + 2*c1r) // 3, (c0g + 2*c1g) // 3, (c0b + 2*c1b) // 3),
+    ]
+
+
+def _assign_indices4(rgb_list, palette):
+    """Return the nearest-palette index for each colour (squared RGB distance)."""
+    out = []
+    for r, g, b in rgb_list:
+        best_i = 0; best_d = 10**9
+        for i, (pr, pg, pb) in enumerate(palette):
+            d = (r-pr)**2 + (g-pg)**2 + (b-pb)**2
+            if d < best_d:
+                best_d = d; best_i = i
+        out.append(best_i)
+    return out
+
+
+def _lsq_refine(rgb_list, indices):
+    """
+    Least-squares solve for new float endpoints given current index assignments.
+
+    In 4-colour mode the DXT interpolation is:
+        colour[0] = c0
+        colour[1] = c1
+        colour[2] = (2*c0 + c1) / 3
+        colour[3] = (c0 + 2*c1) / 3
+
+    Each pixel satisfies  pixel ≈ alpha_i * c0 + beta_i * c1, where:
+        idx 0  →  alpha = 1,    beta = 0
+        idx 1  →  alpha = 0,    beta = 1
+        idx 2  →  alpha = 2/3,  beta = 1/3
+        idx 3  →  alpha = 1/3,  beta = 2/3
+
+    The 2×2 normal equations are solved independently per channel.
+    Returns two integer RGB tuples clamped to the block's actual colour range
+    (prevents overshoot on sharp edges, which causes wobbly-line artifacts).
+    """
+    ALPHA = (1.0, 0.0, 2/3, 1/3)
+    BETA  = (0.0, 1.0, 1/3, 2/3)
+
+    c0 = [0.0, 0.0, 0.0]
+    c1 = [0.0, 0.0, 0.0]
+
+    for ch in range(3):
+        ch_vals = [p[ch] for p in rgb_list]
+        lo = float(min(ch_vals))
+        hi = float(max(ch_vals))
+
+        saa = sab = sbb = sra = srb = 0.0
+        for (r, g, b), idx in zip(rgb_list, indices):
+            v  = (r, g, b)[ch]
+            a  = ALPHA[idx]; be = BETA[idx]
+            saa += a*a;  sab += a*be;  sbb += be*be
+            sra += v*a;  srb += v*be
+        det = saa*sbb - sab*sab
+        if abs(det) < 1e-6:
+            # Degenerate (all pixels assigned to same index): use channel mean
+            mean = sum(ch_vals) / len(ch_vals)
+            c0[ch] = c1[ch] = mean
+        else:
+            # Clamp to the block's actual colour range, not just [0, 255].
+            # This prevents the solver from extrapolating beyond real colours,
+            # which causes wobbly edges at 4×4 block boundaries.
+            c0[ch] = max(lo, min(hi, (sra*sbb - srb*sab) / det))
+            c1[ch] = max(lo, min(hi, (srb*saa - sra*sab) / det))
+
+    return (round(c0[0]), round(c0[1]), round(c0[2])), \
+           (round(c1[0]), round(c1[1]), round(c1[2]))
+
+
 # mipmap generation
 
 def _downsample_box(pixels, src_w, src_h):
@@ -129,42 +263,87 @@ def generate_mipmaps(width, height, pixels):
     return levels
 
 
-# DXT color block encoder (shared by all three formats)
+def _block_error(rgb_list, c0_565, c1_565):
+    """Total squared RGB error for the best 4-colour palette assignment."""
+    palette = _build_palette4(c0_565, c1_565)
+    return sum(min(sq_dist(p, pal) for pal in palette) for p in rgb_list)
+
+
+# DXT color block encoder (shared by DXT1, DXT3, DXT5)
 
 def encode_color_block(pixels, four_color_mode=True):
     """
-    Encode 16 RGBA pixels into an 8-byte DXT color block.
+    Encode 16 RGBA pixels into an 8-byte DXT colour block.
 
-    four_color_mode = True  = c0 > c1  (4 opaque colours, used by DXT3/DXT5 and opaque DXT1 blocks)
-    four_color_mode = False = c0 <= c1 (3 colours + 1-bit transparent, used by DXT1 blocks with alpha)
+    four_color_mode = True   →  c0 > c1  (4 opaque colours; used by DXT3/DXT5
+                                           and opaque DXT1 blocks)
+    four_color_mode = False  →  c0 ≤ c1  (3 colours + 1-bit transparent;
+                                           used by DXT1 blocks that contain
+                                           transparent pixels)
+
+    Uses two endpoint strategies and picks whichever gives lower block error:
+
+    A) AABB – min/max per channel (fast; exact for axis-aligned gradients)
+    B) PCA  – principal axis via power iteration + iterative least-squares
+              refinement (better for diagonal colour distributions)
+
+    The best-of-two approach guarantees we never regress vs. AABB alone while
+    gaining meaningful quality on varied / noisy blocks.
     """
-    rgb = [(r, g, b) for r, g, b, a in pixels]
-
-    # axis-aligned bounding box for a quick but reasonable endpoint pair
-    min_r = min(p[0] for p in rgb);  max_r = max(p[0] for p in rgb)
-    min_g = min(p[1] for p in rgb);  max_g = max(p[1] for p in rgb)
-    min_b = min(p[2] for p in rgb);  max_b = max(p[2] for p in rgb)
-
-    c0_565 = to_rgb565(max_r, max_g, max_b)
-    c1_565 = to_rgb565(min_r, min_g, min_b)
-
-    # enforce the ordering required by the chosen mode
+    # In 3-colour mode ignore fully-transparent pixels for endpoint fitting
     if four_color_mode:
-        if c0_565 < c1_565:
-            c0_565, c1_565 = c1_565, c0_565
-        elif c0_565 == c1_565 and c0_565 > 0:
-            c1_565 -= 1                             # guarantee c0 > c1
+        rgb_fit = [(r, g, b) for r, g, b, a in pixels]
     else:
-        if c0_565 > c1_565:
-            c0_565, c1_565 = c1_565, c0_565
-        elif c0_565 == c1_565 and c1_565 < 0xFFFF:
-            c1_565 += 1                             # guarantee c0 < c1
+        rgb_fit = [(r, g, b) for r, g, b, a in pixels if a >= 128] or \
+                  [(r, g, b) for r, g, b, a in pixels]
 
-    # reconstruct palette from the quantised (rounded) endpoints
+    # strategy A: AABB 
+    min_r = min(p[0] for p in rgb_fit); max_r = max(p[0] for p in rgb_fit)
+    min_g = min(p[1] for p in rgb_fit); max_g = max(p[1] for p in rgb_fit)
+    min_b = min(p[2] for p in rgb_fit); max_b = max(p[2] for p in rgb_fit)
+    aabb0 = to_rgb565(max_r, max_g, max_b)
+    aabb1 = to_rgb565(min_r, min_g, min_b)
+    aabb0, aabb1 = _enforce_order(aabb0, aabb1, four_color_mode)
+
+    best0, best1 = aabb0, aabb1
+    if four_color_mode:
+        best_err = _block_error(rgb_fit, aabb0, aabb1)
+
+    # strategy B: PCA + least-squares refinement
+    ax, ay, az = _pca_axis(rgb_fit)
+    dots  = [r*ax + g*ay + b*az for r, g, b in rgb_fit]
+    ep_hi = rgb_fit[dots.index(max(dots))]
+    ep_lo = rgb_fit[dots.index(min(dots))]
+
+    c0_565 = to_rgb565(*ep_hi)
+    c1_565 = to_rgb565(*ep_lo)
+    c0_565, c1_565 = _enforce_order(c0_565, c1_565, four_color_mode)
+
+    if four_color_mode:
+        rgb_all = [(r, g, b) for r, g, b, a in pixels]
+        for _ in range(4):
+            palette = _build_palette4(c0_565, c1_565)
+            indices = _assign_indices4(rgb_all, palette)
+            ep0, ep1 = _lsq_refine(rgb_all, indices)
+            new0 = to_rgb565(*ep0)
+            new1 = to_rgb565(*ep1)
+            new0, new1 = _enforce_order(new0, new1, four_color_mode)
+            if new0 == c0_565 and new1 == c1_565:
+                break   # converged
+            c0_565, c1_565 = new0, new1
+
+        # Keep whichever gave lower block error
+        err = _block_error(rgb_fit, c0_565, c1_565)
+        if err < best_err:
+            best0, best1 = c0_565, c1_565
+
+    c0_565, c1_565 = best0, best1
+
+    # build final palette and assign indices
     c0r, c0g, c0b = from_rgb565(c0_565)
     c1r, c1g, c1b = from_rgb565(c1_565)
 
-    if c0_565 > c1_565:                             # 4-colour mode
+    if c0_565 > c1_565:     # 4-colour mode
         palette = [
             (c0r, c0g, c0b),
             (c1r, c1g, c1b),
@@ -172,7 +351,55 @@ def encode_color_block(pixels, four_color_mode=True):
             ((c0r + 2*c1r) // 3, (c0g + 2*c1g) // 3, (c0b + 2*c1b) // 3),
         ]
         transparent_idx = None
-    else:                                           # 3-colour + transparent
+    else:                   # 3-colour + transparent
+        palette = [
+            (c0r, c0g, c0b),
+            (c1r, c1g, c1b),
+            ((c0r + c1r) // 2, (c0g + c1g) // 2, (c0b + c1b) // 2),
+            None,
+        ]
+        transparent_idx = 3
+
+    bits = 0
+    for i, (r, g, b, a) in enumerate(pixels):
+        if transparent_idx is not None and a < 128:
+            idx = transparent_idx
+        else:
+            idx = min(
+                (j for j in range(4) if palette[j] is not None),
+                key=lambda j: sq_dist((r, g, b), palette[j])
+            )
+        bits |= idx << (i * 2)
+
+    return struct.pack('<HHI', c0_565, c1_565, bits)
+
+
+def encode_color_block_legacy(pixels, four_color_mode=True):
+    """
+    Legacy AABB colour-block encoder (min/max per channel).
+    Used by -legacy mode to reproduce the pre-PCA output exactly.
+    """
+    rgb = [(r, g, b) for r, g, b, a in pixels]
+    min_r = min(p[0] for p in rgb); max_r = max(p[0] for p in rgb)
+    min_g = min(p[1] for p in rgb); max_g = max(p[1] for p in rgb)
+    min_b = min(p[2] for p in rgb); max_b = max(p[2] for p in rgb)
+
+    c0_565 = to_rgb565(max_r, max_g, max_b)
+    c1_565 = to_rgb565(min_r, min_g, min_b)
+    c0_565, c1_565 = _enforce_order(c0_565, c1_565, four_color_mode)
+
+    c0r, c0g, c0b = from_rgb565(c0_565)
+    c1r, c1g, c1b = from_rgb565(c1_565)
+
+    if c0_565 > c1_565:
+        palette = [
+            (c0r, c0g, c0b),
+            (c1r, c1g, c1b),
+            ((2*c0r + c1r) // 3, (2*c0g + c1g) // 3, (2*c0b + c1b) // 3),
+            ((c0r + 2*c1r) // 3, (c0g + 2*c1g) // 3, (c0b + 2*c1b) // 3),
+        ]
+        transparent_idx = None
+    else:
         palette = [
             (c0r, c0g, c0b),
             (c1r, c1g, c1b),
@@ -197,19 +424,21 @@ def encode_color_block(pixels, four_color_mode=True):
 
 # block encoders
 
-def encode_dxt1_block(pixels):
+def encode_dxt1_block(pixels, legacy=False):
     """8 bytes. Uses 1-bit alpha (transparent) if any pixel has a (alpha) < 128."""
     has_transparent = any(a < 128 for _, _, _, a in pixels)
-    return encode_color_block(pixels, four_color_mode=not has_transparent)
+    enc = encode_color_block_legacy if legacy else encode_color_block
+    return enc(pixels, four_color_mode=not has_transparent)
 
 
-def encode_dxt3_block(pixels):
+def encode_dxt3_block(pixels, legacy=False):
     """16 bytes. Explicit 4-bit alpha per pixel."""
     alpha_bits = 0
     for i, (_, _, _, a) in enumerate(pixels):
         a4 = min(15, (a * 15 + 127) // 255)
         alpha_bits |= a4 << (i * 4)
-    color_block = encode_color_block(pixels, four_color_mode=True)
+    enc = encode_color_block_legacy if legacy else encode_color_block
+    color_block = enc(pixels, four_color_mode=True)
     return struct.pack('<Q', alpha_bits) + color_block
 
 
@@ -219,15 +448,22 @@ def _encode_alpha_block(values: list) -> bytes:
     """
     Encode 16 single-channel values (0-255) into an 8-byte DXT5-style alpha block.
     Shared by encode_dxt5_block (alpha channel) and encode_ati2_block (R and G channels).
+
+    Uses 8-value interpolation mode (a0 > a1) which gives the finest granularity
+    for smooth gradients.  A fast path handles the common fully-opaque case where
+    all 16 values are identical.
     """
-    a0 = max(values)    # endpoint 0 – stored as byte 0
-    a1 = min(values)    # endpoint 1 – stored as byte 1
+    # Fast path: uniform block — all indices stay at 0
+    first = values[0]
+    if all(v == first for v in values):
+        return bytes([first, first, 0, 0, 0, 0, 0, 0])
+
+    a0 = max(values)    # endpoint 0 (stored as byte 0)
+    a1 = min(values)    # endpoint 1 (stored as byte 1)
+    # a0 > a1  →  8-value interpolation mode
 
     # Build 8-entry decoder LUT matching the endpoints we will write
-    if a0 > a1:         # 8-value interpolation mode
-        lut = [a0, a1] + [((7 - i) * a0 + i * a1) // 7 for i in range(1, 7)]
-    else:               # 6-value + 0 + 255 mode
-        lut = [a0, a1] + [((5 - i) * a0 + i * a1) // 5 for i in range(1, 5)] + [0, 255]
+    lut = [a0, a1] + [((7 - i) * a0 + i * a1) // 7 for i in range(1, 7)]
 
     indices = 0
     for i, v in enumerate(values):
@@ -239,10 +475,11 @@ def _encode_alpha_block(values: list) -> bytes:
 
 # DXT5
 
-def encode_dxt5_block(pixels):
+def encode_dxt5_block(pixels, legacy=False):
     """16 bytes. Interpolated 8-bit alpha with 2 endpoints + 3-bit indices."""
     alpha_block = _encode_alpha_block([a for _, _, _, a in pixels])
-    color_block = encode_color_block(pixels, four_color_mode=True)
+    enc = encode_color_block_legacy if legacy else encode_color_block
+    color_block = enc(pixels, four_color_mode=True)
     return alpha_block + color_block
 
 
@@ -272,14 +509,18 @@ def encode_ati1_block(pixels):
 
 # main compression
 
-def compress_to_dxt(width, height, pixels, fmt):
-    encoder = {
+def compress_to_dxt(width, height, pixels, fmt, legacy=False):
+    _enc = {
         'DXT1': encode_dxt1_block,
         'DXT3': encode_dxt3_block,
         'DXT5': encode_dxt5_block,
         'ATI1': encode_ati1_block,
         'ATI2': encode_ati2_block,
     }[fmt]
+    # ATI1/ATI2 have no colour block so legacy has no effect on them,
+    # but we pass it anyway for consistency (the kwarg is simply ignored).
+    encoder = (lambda blk: _enc(blk, legacy=legacy)) if fmt in ('DXT1', 'DXT3', 'DXT5') \
+              else _enc
 
     bw = (width  + 3) // 4
     bh = (height + 3) // 4
@@ -377,18 +618,19 @@ def write_dds(filepath, width, height, compressed_data, fmt, mip_data=None):
 
 # top-level conversion
 
-def convert_tga_to_dds(tga_path, dds_path, fmt, mipmaps=False):
+def convert_tga_to_dds(tga_path, dds_path, fmt, mipmaps=False, legacy=False):
     print(f"  Reading: {tga_path}")
     width, height, pixels = read_tga(tga_path)
-    print(f"  Compressing: {width}x{height} → {fmt}")
-    data = compress_to_dxt(width, height, pixels, fmt)
+    print(f"  Compressing: {width}x{height} → {fmt}"
+          + (" [legacy]" if legacy else ""))
+    data = compress_to_dxt(width, height, pixels, fmt, legacy)
 
     mip_data = None
     if mipmaps:
         levels = generate_mipmaps(width, height, pixels)
         mip_data = []
         for mw, mh, mpx in levels:
-            mip_data.append((mw, mh, compress_to_dxt(mw, mh, mpx, fmt)))
+            mip_data.append((mw, mh, compress_to_dxt(mw, mh, mpx, fmt, legacy)))
         print(f"  Mipmaps:     {1 + len(mip_data)} levels "
               f"({width}x{height} → {mip_data[-1][0]}x{mip_data[-1][1]})")
 
@@ -401,6 +643,7 @@ def convert_tga_to_dds(tga_path, dds_path, fmt, mipmaps=False):
 def main():
     fmt     = None
     mipmaps = False
+    legacy  = False
     args    = []
 
     for arg in sys.argv[1:]:
@@ -411,13 +654,15 @@ def main():
             else:                          fmt = low[1:].upper()
         elif low == '-mip':
             mipmaps = True
+        elif low == '-legacy':
+            legacy = True
         else:
             args.append(arg)
 
     if not args or fmt is None:
         print("Source: https://github.com/RavenDS/flatout-blender-tools")
         print()
-        print("Usage: tga2dds.py -dxt1|-dxt3|-dxt5|-ati1|-bc4|-ati2|-bc5 [-mip] <input.tga or *.tga> [output.dds]")
+        print("Usage: tga2dds.py -dxt1|-dxt3|-dxt5|-ati1|-bc4|-ati2|-bc5 [-mip] [-legacy] <input.tga or *.tga> [output.dds]")
         print()
         print("Format guide:")
         print("  -dxt1        No alpha / 1-bit alpha  (smallest file)")
@@ -428,10 +673,12 @@ def main():
         print()
         print("Options:")
         print("  -mip         Generate full mipmap chain (box filter, down to 1×1)")
+        print("  -legacy      Use legacy AABB colour encoder instead of PCA+LSQ")
         print()
         print("Examples:")
         print("  python tga2dds.py -dxt5 texture.tga")
         print("  python tga2dds.py -dxt5 -mip texture.tga")
+        print("  python tga2dds.py -dxt5 -legacy texture.tga")
         print("  python tga2dds.py -dxt1 texture.tga output.dds")
         print("  python tga2dds.py -dxt3 *.tga")
         print("  python tga2dds.py -dxt5 folder/")
@@ -460,7 +707,7 @@ def main():
             continue
         dds_path = output or (os.path.splitext(tga_path)[0] + '.dds')
         try:
-            convert_tga_to_dds(tga_path, dds_path, fmt, mipmaps)
+            convert_tga_to_dds(tga_path, dds_path, fmt, mipmaps, legacy)
             converted += 1
         except Exception as e:
             print(f"  ERROR converting {tga_path}: {e}")
