@@ -4339,7 +4339,8 @@ def main():
 
     flags={'-clean','-optimize','-full','-menucar','-windflip',
            '-lighthacks','-lightorder','-convert','-strip','-samples',
-           'FO1','FO2','FOUC','PS2','PSP','XBOX'}
+           'FO1','FO2','FOUC','PS2','PSP','XBOX',
+           'fo1','fo2','fouc','ps2','psp','xbox'}
     if lighthacks_targets is not None:
         lh_idx=args.index('-lighthacks'); flags.add(args[lh_idx+1])
     if '-samples' in args:
@@ -4581,7 +4582,13 @@ def main():
             tmp_bgm=out+'.__tmp__'
             _remap_crash_dat(crash_src,tmp_bgm,models,*opt_crash_info,
                              is_fouc=src_is_fouc,is_standalone=crash_standalone)
-            tmp_crash=_crash_dst_path(tmp_bgm,crash_standalone)
+            # Use a fixed suffix for the temp crash so it never collides with
+            # dst_crash (_crash_dst_path strips '.__tmp__' as an extension
+            # when the output path has no .bgm extension).
+            tmp_crash=tmp_bgm+'_crash.dat'
+            _remap_wrote=_crash_dst_path(tmp_bgm,crash_standalone)
+            if _remap_wrote!=tmp_crash and os.path.exists(_remap_wrote):
+                os.replace(_remap_wrote,tmp_crash)
             dst_crash=_crash_dst_path(out,crash_standalone)
             print(f"  crash.dat: converting format "
                   f"({'FOUC→FO2/FO1' if src_is_fouc else 'FO2/FO1→FOUC'}) ...")
