@@ -5,6 +5,7 @@ setlocal EnableDelayedExpansion
 ::  BATCH FILE PROCESSOR - github.com/RavenDS
 :: ===========================================
 
+
 :: Optional prefix before command (e.g. "python", "C:/Python311/python.exe", "java -jar")
 set "Prefix="
 
@@ -17,7 +18,6 @@ set "ExePath=C:/path/to/exe-or-script.py"
 :: $OutputPath = output file path (default: $InputName_batch)
 ::
 set "Command=-convert $InputPath -output $OutputPath"
-
 
 
 :: Folder (leave empty to be prompted at runtime)
@@ -50,8 +50,8 @@ if not exist "!Folder!" echo ERROR: Folder "!Folder!" not found. & pause & exit 
 if "!OutputName!"=="" set "OutputName=$InputName_batch"
 
 set "FileCount=0"
-if "!Recursive!"=="1" ( for /r "!Folder!" %%F in (*!Extension!) do set /a FileCount+=1
-) else ( for %%F in ("!Folder!\*!Extension!") do set /a FileCount+=1 )
+if "!Recursive!"=="1" ( for /f "delims=" %%F in ('dir /b /s /on "!Folder!\*!Extension!" 2^>nul') do set /a FileCount+=1
+) else ( for /f "delims=" %%F in ('dir /b /on "!Folder!\*!Extension!" 2^>nul') do set /a FileCount+=1 )
 
 echo.
 echo ========================================
@@ -69,8 +69,8 @@ echo.
 if !FileCount! EQU 0 echo No *!Extension! files found. & pause & exit /b 0
 
 set "Current=0"
-if "!Recursive!"=="1" ( for /r "!Folder!" %%F in (*!Extension!) do call :Run "%%F"
-) else ( for %%F in ("!Folder!\*!Extension!") do call :Run "%%F" )
+if "!Recursive!"=="1" ( for /f "delims=" %%F in ('dir /b /s /on "!Folder!\*!Extension!" 2^>nul') do call :Run "%%F"
+) else ( for /f "delims=" %%F in ('dir /b /on "!Folder!\*!Extension!" 2^>nul') do call :Run "!Folder!\%%F" )
 
 echo.
 echo  Done. !Current! / !FileCount! files.
