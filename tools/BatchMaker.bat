@@ -9,14 +9,14 @@ setlocal EnableDelayedExpansion
 set "Prefix="
 
 :: Full path to executable/script
-set "ExePath=C:/path/to/exe-or-script"
+set "ExePath=C:/path/to/exe-or-script.py"
 
 :: Arguments to pass
 ::
 :: $InputPath  = current file being processed
 :: $OutputPath = output file path (default: $InputName_batch)
 ::
-set "Command=$InputPath -menucar"
+set "Command=-convert $InputPath -output $OutputPath"
 
 
 
