@@ -1,7 +1,7 @@
 bl_info = {
     "name":        "FlatOut BGM Export",
     "author":      "ravenDS",
-    "version":     (1, 6, 1),
+    "version":     (1, 6, 2),
     "blender":     (3, 6, 0),
     "location":    "File > Export > FlatOut Car BGM (.bgm)",
     "description": "Export FlatOut 1/2/UC model (BGM) files. Based on reverse-egineering work by Chloe (FlatOutW32BGMTool)",
@@ -2137,12 +2137,37 @@ def write_bones_ini(filepath_bgm, context, inv_scale):
     L.append("")
     L.append("")
 
-    # ---- Bones (Position/Orientation derived from ModelToBone, MTB written verbatim)
+    # ---- Bones (Position/Orientation derived from ModelToBone; MTB rebuilt from
+    # the live armature bone head so user edits flow through. Orientation is
+    # kept from the imported MTB — Blender edit-bones don't encode the game's
+    # rest orientation cleanly, and rotating the segment box is what actually
+    # reorients the ragdoll hull.)
     L.append("Bones = {")
+    arm_bones = arm.data.bones
+    arm_mw = arm.matrix_world
     for nm in bone_names:
-        flat = [float(v) for v in mtb_prop[nm]]
-        mcm = Matrix((flat[0:4], flat[4:8], flat[8:12], flat[12:16])).transposed()
-        bind = mcm.inverted_safe()
+        flat_orig = [float(v) for v in mtb_prop[nm]]
+        mcm_orig = Matrix((flat_orig[0:4], flat_orig[4:8],
+                           flat_orig[8:12], flat_orig[12:16])).transposed()
+        bind_orig = mcm_orig.inverted_safe()
+
+        arm_bone = arm_bones.get(nm)
+        if arm_bone is not None:
+            head_fo2 = Vector(blender_to_fo2_pos(arm_mw @ arm_bone.head_local, inv_scale))
+            # Only regenerate when the bone has actually moved. Passing the
+            # original bytes through when unchanged keeps driver bones.ini
+            # exports byte-identical for round-trip; matrix inversion would
+            # otherwise flip sign-of-zero on identity rows.
+            if (head_fo2 - bind_orig.translation).length > 1e-5:
+                bind = Matrix.Translation(head_fo2) @ bind_orig.to_3x3().to_4x4()
+                mcm = bind.inverted_safe()
+                mcm_T = mcm.transposed()
+                flat = [mcm_T[r][c] for r in range(4) for c in range(4)]
+            else:
+                flat, bind = flat_orig, bind_orig
+        else:
+            flat, bind = flat_orig, bind_orig
+
         pos = bind.translation
         ori = _mat3_to_fo2_quat(bind.to_3x3())
         L.append("\t-- %s" % nm)
