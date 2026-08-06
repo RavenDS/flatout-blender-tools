@@ -1,10 +1,10 @@
 bl_info = {
     "name":        "FlatOut 2 TrackAI Importer",
     "author":      "ravenDS",
-    "version":     (2, 2, 1),
+    "version":     (2, 3, 0),
     "blender":     (3, 6, 0),
     "location":    "File > Import > FlatOut 2 TrackAI (.bin)",
-    "description": "Import FlatOut 2 AI path data (trackai.bin +.bed)",
+    "description": "Import FlatOut 2 AI path data (trackai.bin +.bed +camera.ini)",
     "category":    "Import-Export",
     "doc_url":     "https://github.com/RavenDS",
     "tracker_url": "https://github.com/RavenDS/flatout-blender-tools/issues",
@@ -14,6 +14,7 @@ import bpy
 import struct
 import os
 import math
+import re
 import base64
 from bpy.props import (StringProperty, BoolProperty, FloatProperty, EnumProperty)
 from bpy_extras.io_utils import ImportHelper
@@ -89,7 +90,8 @@ class TrackAIData:
                  'ai_splines', 'splines_ai_raw',
                  'bed_splitpoints_raw', 'bed_startpoints_raw',
                  'bed_startpoints_parsed', 'bed_splitpoints_parsed',
-                 'ai_bvh_tree_data', 'ai_bvh_leaf_order')
+                 'ai_bvh_tree_data', 'ai_bvh_leaf_order',
+                 'cameras', 'camera_ini_raw')
 
     def __init__(self):
         self.sections = []
@@ -105,6 +107,8 @@ class TrackAIData:
         self.bed_splitpoints_parsed = []  # parsed from .bed text
         self.ai_bvh_tree_data = b''  # internal tree nodes (after leaf entries, before FILE_END)
         self.ai_bvh_leaf_order = []  # list of node_ref values for leaf ordering
+        self.cameras = []            # parsed TrackCamera list
+        self.camera_ini_raw = ''     # raw camera.ini text for verbatim round-trip
 
 
 class Startpoint:
@@ -118,6 +122,41 @@ class AIBorderSpline:
     def __init__(self, name=''):
         self.name = name
         self.points = []
+
+
+class TrackCamera:
+    """One track camera entry from camera.ini."""
+    __slots__ = (
+        'index',
+        'animation_type', 'position_type', 'target_type',
+        'zoom_type', 'tracker_type',
+        'near_clipping', 'far_clipping',
+        'min_display_time', 'max_display_time',
+        'lod_level',
+        'position_frames',    # list of (x,y,z)
+        'target_frames',      # list of {'key': 'Position'|'Offset', 'value': (x,y,z)}
+        'zoom_frames',        # list of {'fov': float, 'virtual_distance': float or None}
+        'animation_frames',   # list of (x,y,z) CarPosition
+        'area',               # list of (x, z) 2D
+    )
+
+    def __init__(self, index=0):
+        self.index = index
+        self.animation_type = 1
+        self.position_type = 1
+        self.target_type = 1
+        self.zoom_type = 1
+        self.tracker_type = 1
+        self.near_clipping = 0.5
+        self.far_clipping = 1000.0
+        self.min_display_time = 1.0
+        self.max_display_time = 4.0
+        self.lod_level = 1
+        self.position_frames = []
+        self.target_frames = []
+        self.zoom_frames = []
+        self.animation_frames = []
+        self.area = []
 
 
 # PARSER
@@ -415,6 +454,204 @@ def _parse_bed_splitpoints_text(text):
     return results
 
 
+# CAMERA.INI PARSER (no external dependencies)
+
+def _cam_extract_blocks(src):
+    """Yield (index, block_content) for each top-level [N]={ ... } in src,
+    using brace counting so nested blocks are not mistaken for new entries."""
+    pattern = re.compile(r'\[(\d+)\]\s*=\s*\{')
+    pos = 0
+    while pos < len(src):
+        m = pattern.search(src, pos)
+        if not m:
+            break
+        idx = int(m.group(1))
+        depth = 0
+        start = m.end() - 1  # the opening '{'
+        i = start
+        while i < len(src):
+            if src[i] == '{':
+                depth += 1
+            elif src[i] == '}':
+                depth -= 1
+                if depth == 0:
+                    yield idx, src[start + 1 : i]
+                    pos = i + 1
+                    break
+            i += 1
+        else:
+            break
+
+
+def _cam_find_named_block(block, name):
+    """Find Name={ ... } block content using brace counting. Returns content or None."""
+    m = re.search(name + r'\s*=\s*\{', block)
+    if not m:
+        return None
+    depth = 0
+    start = m.end() - 1
+    i = start
+    while i < len(block):
+        if block[i] == '{':
+            depth += 1
+        elif block[i] == '}':
+            depth -= 1
+            if depth == 0:
+                return block[start + 1 : i]
+        i += 1
+    return None
+
+
+def _cam_float(s):
+    try:
+        return float(s.strip())
+    except ValueError:
+        return 0.0
+
+def _cam_int(s):
+    try:
+        return int(s.strip())
+    except ValueError:
+        return 0
+
+def _cam_vec3(s):
+    nums = re.findall(r'[-+]?\d*\.?\d+', s)
+    return tuple(_cam_float(n) for n in nums[:3]) if len(nums) >= 3 else None
+
+def _cam_vec2(s):
+    nums = re.findall(r'[-+]?\d*\.?\d+', s)
+    return tuple(_cam_float(n) for n in nums[:2]) if len(nums) >= 2 else None
+
+def _cam_first_int(block, key):
+    m = re.search(key + r'\s*=\s*([-+]?\d+)', block)
+    return _cam_int(m.group(1)) if m else None
+
+def _cam_first_float(block, key):
+    m = re.search(key + r'\s*=\s*([-+]?\d*\.?\d+)', block)
+    return _cam_float(m.group(1)) if m else None
+
+def _cam_first_vec3(block, key):
+    m = re.search(key + r'\s*=\s*\{([^}]*)\}', block)
+    return _cam_vec3(m.group(1)) if m else None
+
+
+def parse_camera_ini(filepath):
+    """Parse a FlatOut 2 track camera.ini. Returns list of TrackCamera.
+    No external dependencies - uses regex + brace counting."""
+    cameras = []
+    try:
+        with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
+            text = f.read()
+    except (OSError, IOError):
+        return cameras
+
+    # strip Lua comments
+    text = re.sub(r'--[^\n]*', '', text)
+
+    # find outer Cameras = { ... }
+    outer = re.search(r'Cameras\s*=\s*\{', text)
+    if not outer:
+        return cameras
+
+    # extract content using brace counting
+    depth = 0
+    cam_body = ""
+    for i in range(outer.end() - 1, len(text)):
+        if text[i] == '{':
+            depth += 1
+        elif text[i] == '}':
+            depth -= 1
+            if depth == 0:
+                cam_body = text[outer.end() : i]
+                break
+
+    for idx, block in _cam_extract_blocks(cam_body):
+        cam = TrackCamera(index=idx)
+
+        # scalar int properties
+        for attr, key in [
+            ('animation_type', 'AnimationType'),
+            ('position_type',  'PositionType'),
+            ('target_type',    'TargetType'),
+            ('zoom_type',      'ZoomType'),
+            ('tracker_type',   'TrackerType'),
+            ('lod_level',      'LodLevel'),
+        ]:
+            v = _cam_first_int(block, key)
+            if v is not None:
+                setattr(cam, attr, v)
+
+        # scalar float properties
+        for attr, key in [
+            ('near_clipping',    'NearClipping'),
+            ('far_clipping',     'FarClipping'),
+            ('min_display_time', 'MinDisplayTime'),
+            ('max_display_time', 'MaxDisplayTime'),
+        ]:
+            v = _cam_first_float(block, key)
+            if v is not None:
+                setattr(cam, attr, v)
+
+        # PositionFrames - list of {Position={x,y,z}}
+        pf_body = _cam_find_named_block(block, 'PositionFrames')
+        if pf_body:
+            for _, fb in _cam_extract_blocks(pf_body):
+                v = _cam_first_vec3(fb, 'Position')
+                if v:
+                    cam.position_frames.append(v)
+
+        # TargetFrames - list of {Position={x,y,z}} or {Offset={x,y,z}}
+        tf_body = _cam_find_named_block(block, 'TargetFrames')
+        if tf_body:
+            for _, fb in _cam_extract_blocks(tf_body):
+                v = _cam_first_vec3(fb, 'Position')
+                if v:
+                    cam.target_frames.append({'key': 'Position', 'value': v})
+                else:
+                    v = _cam_first_vec3(fb, 'Offset')
+                    if v:
+                        cam.target_frames.append({'key': 'Offset', 'value': v})
+
+        # ZoomFrames - list of {FOV=float, optional VirtualDistance=float}
+        zf_body = _cam_find_named_block(block, 'ZoomFrames')
+        if zf_body:
+            for _, fb in _cam_extract_blocks(zf_body):
+                fov = _cam_first_float(fb, 'FOV')
+                vd = _cam_first_float(fb, 'VirtualDistance')
+                if fov is not None:
+                    cam.zoom_frames.append({'fov': fov, 'virtual_distance': vd})
+
+        # AnimationFrames - optional list of {CarPosition={x,y,z}}
+        af_body = _cam_find_named_block(block, 'AnimationFrames')
+        if af_body:
+            for _, fb in _cam_extract_blocks(af_body):
+                v = _cam_first_vec3(fb, 'CarPosition')
+                if v:
+                    cam.animation_frames.append(v)
+
+        # Area - list of inline {x, z} 2D points
+        area_body = _cam_find_named_block(block, 'Area')
+        if area_body:
+            for m in re.finditer(r'\[(\d+)\]\s*=\s*\{([^}]*)\}', area_body):
+                v = _cam_vec2(m.group(2))
+                if v:
+                    cam.area.append(v)
+
+        cameras.append(cam)
+
+    print(f"[TrackAI]   Parsed {len(cameras)} cameras from {filepath}")
+    return cameras
+
+
+def _parse_camera_ini_file(filepath, result):
+    """Parse camera.ini companion file and store on result."""
+    if not os.path.isfile(filepath):
+        return
+    with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
+        result.camera_ini_raw = f.read()
+    result.cameras = parse_camera_ini(filepath)
+
+
 def _parse_companion_files(filepath, result, custom_paths=None):
     """Load companion text files. Uses custom paths if provided, otherwise
     looks in the same directory as the .bin file."""
@@ -448,6 +685,12 @@ def _parse_companion_files(filepath, result, custom_paths=None):
         result.bed_startpoints_parsed = _parse_bed_startpoints_text(result.bed_startpoints_raw)
         print(f"[TrackAI]   Loaded startpoints.bed from {start_path}"
               f" ({len(result.bed_startpoints_parsed)} entries)")
+
+    # camera.ini
+    cam_path = cp.get('camera_ini_path', '')
+    if not cam_path:
+        cam_path = os.path.join(base_dir, "camera.ini")
+    _parse_camera_ini_file(cam_path, result)
 
 
 # COORDINATE TRANSFORMS
@@ -774,18 +1017,174 @@ def create_ai_splines(ai_splines, scale, collection):
             collection.objects.link(empty)
 
 
+# CAMERA SCENE CREATION
+
+CAMERA_ANIM_COLOR = (0.4, 1.0, 0.4, 1.0)   # Green  - car position empties
+CAMERA_AREA_COLOR = (0.8, 0.5, 0.2, 0.6)   # Orange - trigger area
+
+
+def create_camera_objects(cameras, scale, root_col):
+    """Create Blender camera objects for track cameras from camera.ini.
+
+    Each PositionFrame becomes a real Blender Camera with:
+      - FOV from the corresponding ZoomFrame
+      - Target from the corresponding TargetFrame (Track To constraint)
+    AnimationFrames become empties (CarPosition1, CarPosition2, …).
+    Area becomes an edge-only polygon mesh.
+
+    For TT=1: TargetFrame has Position={x,y,z} — target empty at that world pos.
+    For TT=2: TargetFrame has Offset (camera tracks car) —
+              target empty placed at corresponding AnimationFrame CarPosition.
+    """
+    cam_col = bpy.data.collections.new("TrackAI_Cameras")
+    root_col.children.link(cam_col)
+
+    mat_area = get_or_create_material("TrackAI_CamArea", CAMERA_AREA_COLOR)
+
+    for cam in cameras:
+        ci = cam.index
+        sub_col = bpy.data.collections.new(f"Camera{ci}")
+        cam_col.children.link(sub_col)
+
+        n_frames = len(cam.position_frames)
+
+        # --- One camera per PositionFrame ---
+        for fi in range(n_frames):
+            pf = cam.position_frames[fi]
+            cam_pos_bl = fo2_to_blender(pf, scale)
+
+            # FOV from corresponding ZoomFrame (fall back to 70 deg)
+            fov_deg = 70.0
+            if fi < len(cam.zoom_frames):
+                fov_deg = cam.zoom_frames[fi]['fov']
+
+            # Clipping
+            near = cam.near_clipping
+            far = cam.far_clipping
+
+            # Create Blender camera data
+            frame_name = f"Cam{ci}_{fi+1}"
+            cam_data = bpy.data.cameras.new(frame_name)
+            cam_data.clip_start = near
+            cam_data.clip_end = far
+            cam_data.angle = math.radians(fov_deg)
+            cam_data.type = 'PERSP'
+
+            cam_obj = bpy.data.objects.new(frame_name, cam_data)
+            cam_obj.location = cam_pos_bl
+            sub_col.objects.link(cam_obj)
+
+            # --- Per-camera custom properties ---
+            # Store original FO2 position for delta export
+            cam_obj['fo2_cam_position'] = list(pf)
+            cam_obj['fo2_cam_frame_index'] = fi
+
+            # Store camera-level props on every camera object (needed for export)
+            if fi == 0:
+                cam_obj['fo2_cam_index'] = ci
+                cam_obj['fo2_animation_type'] = cam.animation_type
+                cam_obj['fo2_position_type'] = cam.position_type
+                cam_obj['fo2_target_type'] = cam.target_type
+                cam_obj['fo2_zoom_type'] = cam.zoom_type
+                cam_obj['fo2_tracker_type'] = cam.tracker_type
+                cam_obj['fo2_near_clipping'] = near
+                cam_obj['fo2_far_clipping'] = far
+                cam_obj['fo2_min_display_time'] = cam.min_display_time
+                cam_obj['fo2_max_display_time'] = cam.max_display_time
+                cam_obj['fo2_lod_level'] = cam.lod_level
+
+                # Store ALL zoom data for export (fov + virtual_distance per frame)
+                cam_obj['fo2_zoom_fovs'] = [zf['fov'] for zf in cam.zoom_frames]
+                cam_obj['fo2_zoom_virtual_distances'] = [
+                    zf['virtual_distance'] if zf['virtual_distance'] is not None else -1.0
+                    for zf in cam.zoom_frames
+                ]
+
+                # Store all target frame data for export
+                cam_obj['fo2_target_keys'] = [tf['key'] for tf in cam.target_frames]
+                cam_obj['fo2_target_values'] = [v for tf in cam.target_frames for v in tf['value']]
+
+                # Store all animation frame data for export
+                cam_obj['fo2_animation_frames'] = [v for af in cam.animation_frames for v in af]
+
+                # Area points for export
+                if cam.area:
+                    cam_obj['fo2_cam_area_points'] = [v for pt in cam.area for v in pt]
+
+            # --- Target handling ---
+            has_target = False
+            tgt_pos_bl = None
+
+            if cam.target_type == 1 and fi < len(cam.target_frames):
+                # TT=1: fixed world position target
+                tgt_fo2 = cam.target_frames[fi]['value']
+                tgt_pos_bl = fo2_to_blender(tgt_fo2, scale)
+                has_target = True
+
+            elif cam.target_type == 2:
+                # TT=2: camera tracks the car — aim at corresponding CarPosition
+                if fi < len(cam.animation_frames):
+                    tgt_pos_bl = fo2_to_blender(cam.animation_frames[fi], scale)
+                    has_target = True
+
+            if has_target and tgt_pos_bl is not None:
+                tgt_name = f"Cam{ci}_{fi+1}_Target"
+                tgt_obj = bpy.data.objects.new(tgt_name, None)
+                tgt_obj.empty_display_type = 'SPHERE'
+                tgt_obj.empty_display_size = 1.0
+                tgt_obj.location = tgt_pos_bl
+                sub_col.objects.link(tgt_obj)
+
+                con = cam_obj.constraints.new('TRACK_TO')
+                con.target = tgt_obj
+                con.track_axis = 'TRACK_NEGATIVE_Z'
+                con.up_axis = 'UP_Y'
+            else:
+                # No target — face forward (+Y in Blender)
+                cam_obj.rotation_euler = (math.pi / 2, 0.0, 0.0)
+
+        # --- AnimationFrames as empties (CarPosition1, CarPosition2, …) ---
+        for fi, af in enumerate(cam.animation_frames):
+            pos_bl = fo2_to_blender(af, scale)
+            e = bpy.data.objects.new(f"Cam{ci}_CarPosition{fi+1}", None)
+            e.empty_display_type = 'SPHERE'
+            e.empty_display_size = 1.0
+            e.location = pos_bl
+            e.color = CAMERA_ANIM_COLOR
+            e['fo2_cam_frame_index'] = fi
+            e['fo2_car_position'] = list(af)
+            sub_col.objects.link(e)
+
+        # --- Area polygon (edges-only mesh) ---
+        if cam.area:
+            verts = [(pt[0] * scale, pt[1] * scale, 0.0) for pt in cam.area]
+            n_pts = len(verts)
+            edges = [(i, (i + 1) % n_pts) for i in range(n_pts)]
+
+            mesh = bpy.data.meshes.new(f"Cam{ci}_Area")
+            mesh.from_pydata(verts, edges, [])
+            mesh.update()
+
+            area_obj = bpy.data.objects.new(f"Cam{ci}_Area", mesh)
+            area_obj.data.materials.append(mat_area)
+            sub_col.objects.link(area_obj)
+
+    total_cams = sum(len(c.position_frames) for c in cameras)
+    print(f"[TrackAI]   Created {total_cams} cameras from {len(cameras)} camera entries")
+
+
 def import_trackai(filepath, context, options):
     """Main import function."""
     scale = options.get('global_scale', 1.0)
     import_boundaries = options.get('import_boundaries', True)
     import_ribbon = options.get('import_ribbon', True)
-    import_arrows = options.get('import_arrows', True)
     import_empties = options.get('import_empties', False)
     import_center_curve = options.get('import_center_curve', True)
     curve_width = options.get('curve_width', 0.15)
     import_startpoints = options.get('import_startpoints', True)
     import_splitpoints = options.get('import_splitpoints', True)
     import_ai_splines = options.get('import_ai_splines', True)
+    import_cameras = options.get('import_cameras', True)
 
     # parse the binary file
     ai_data = parse_trackai(filepath)
@@ -795,6 +1194,7 @@ def import_trackai(filepath, context, options):
         'startpoints_bed_path': options.get('startpoints_bed_path', ''),
         'splitpoints_bed_path': options.get('splitpoints_bed_path', ''),
         'splines_ai_path': options.get('splines_ai_path', ''),
+        'camera_ini_path': options.get('camera_ini_path', ''),
     }
     _parse_companion_files(filepath, ai_data, custom_paths)
 
@@ -810,6 +1210,8 @@ def import_trackai(filepath, context, options):
         root_col['fo2_splitpoints_bed'] = ai_data.bed_splitpoints_raw
     if ai_data.bed_startpoints_raw:
         root_col['fo2_startpoints_bed'] = ai_data.bed_startpoints_raw
+    if ai_data.camera_ini_raw:
+        root_col['fo2_camera_ini'] = ai_data.camera_ini_raw
     # store AI BVH internal tree for round-trip (reused when node count unchanged)
     if ai_data.ai_bvh_tree_data:
         root_col['fo2_ai_bvh_tree'] = base64.b64encode(ai_data.ai_bvh_tree_data).decode('ascii')
@@ -887,14 +1289,6 @@ def import_trackai(filepath, context, options):
             if ribbon:
                 sec_col.objects.link(ribbon)
 
-        # direction arrows
-        if import_arrows:
-            mat_arrow = get_or_create_material(f"TrackAI_{sec_name}_Arrow",
-                                                (1.0, 1.0, 0.0, 1.0))
-            arrows = create_direction_arrows(
-                f"{sec_name}_Arrows", nodes, scale, mat_arrow, arrow_scale=1.5)
-            sec_col.objects.link(arrows)
-
         # node empties with metadata
         if import_empties:
             create_node_empties(sec_name, nodes, scale, sec_col)
@@ -954,6 +1348,10 @@ def import_trackai(filepath, context, options):
         create_ai_splines(ai_data.ai_splines, scale, sp_col)
         print(f"[TrackAI]   Created {len(ai_data.ai_splines)} AI border splines")
 
+    # Track cameras (from camera.ini)
+    if import_cameras and ai_data.cameras:
+        create_camera_objects(ai_data.cameras, scale, root_col)
+
     return {'FINISHED'}
 
 
@@ -994,12 +1392,6 @@ class ImportTrackAI(bpy.types.Operator, ImportHelper):
         default=True,
     )
 
-    import_arrows: BoolProperty(
-        name="Direction Arrows",
-        description="Import direction indicator arrows at each node",
-        default=True,
-    )
-
     import_empties: BoolProperty(
         name="Node Empties (with metadata)",
         description="Import empties at each node with FO2 properties",
@@ -1021,7 +1413,13 @@ class ImportTrackAI(bpy.types.Operator, ImportHelper):
     import_ai_splines: BoolProperty(
         name="AI Splines (splines.ai)",
         description="AI border lines from companion splines.ai file",
-        default=True,
+        default=False,
+    )
+
+    import_cameras: BoolProperty(
+        name="Cameras (camera.ini)",
+        description="Track replay cameras from companion camera.ini file",
+        default=False,
     )
 
     curve_width: FloatProperty(
@@ -1053,6 +1451,13 @@ class ImportTrackAI(bpy.types.Operator, ImportHelper):
         subtype='FILE_PATH',
     )
 
+    camera_ini_path: StringProperty(
+        name="camera.ini",
+        description="Custom path to camera.ini (leave empty for auto-detect next to .bin)",
+        default="",
+        subtype='FILE_PATH',
+    )
+
     def draw(self, context):
         layout = self.layout
 
@@ -1066,7 +1471,6 @@ class ImportTrackAI(bpy.types.Operator, ImportHelper):
         box.prop(self, "import_center_curve")
         box.prop(self, "import_boundaries")
         box.prop(self, "import_ribbon")
-        box.prop(self, "import_arrows")
         box.prop(self, "import_empties")
 
         box = layout.box()
@@ -1074,6 +1478,7 @@ class ImportTrackAI(bpy.types.Operator, ImportHelper):
         box.prop(self, "import_startpoints")
         box.prop(self, "import_splitpoints")
         box.prop(self, "import_ai_splines")
+        box.prop(self, "import_cameras")
 
         box = layout.box()
         box.label(text="Companion Files (optional)", icon='FILE_FOLDER')
@@ -1081,22 +1486,24 @@ class ImportTrackAI(bpy.types.Operator, ImportHelper):
         box.prop(self, "startpoints_bed_path")
         box.prop(self, "splitpoints_bed_path")
         box.prop(self, "splines_ai_path")
+        box.prop(self, "camera_ini_path")
 
     def execute(self, context):
         options = {
             'global_scale': self.global_scale,
             'import_boundaries': self.import_boundaries,
             'import_ribbon': self.import_ribbon,
-            'import_arrows': self.import_arrows,
             'import_empties': self.import_empties,
             'import_center_curve': self.import_center_curve,
             'import_startpoints': self.import_startpoints,
             'import_splitpoints': self.import_splitpoints,
             'import_ai_splines': self.import_ai_splines,
+            'import_cameras': self.import_cameras,
             'curve_width': self.curve_width,
             'startpoints_bed_path': self.startpoints_bed_path,
             'splitpoints_bed_path': self.splitpoints_bed_path,
             'splines_ai_path': self.splines_ai_path,
+            'camera_ini_path': self.camera_ini_path,
         }
         try:
             result = import_trackai(self.filepath, context, options)

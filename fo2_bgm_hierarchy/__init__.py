@@ -24,7 +24,7 @@ Three reorganise operators are available in View3D > Object:
 bl_info = {
     "name":        "FlatOut BGM Hierarchy Reorganiser",
     "author":      "ravenDS",
-    "version":     (1, 4, 0),
+    "version":     (2, 0, 0),
     "blender":     (3, 6, 0),
     "location":    "View3D > Object > FO2: Reorganise",
     "description": "Flatten any scene hierarchy into the layout the BGM exporter expects",
@@ -34,6 +34,7 @@ bl_info = {
 import bpy
 import re
 import os
+import math
 
 
 # Shader / material property helpers
@@ -829,6 +830,1198 @@ class FO2_OT_ViewCollisionsAsEmpties(bpy.types.Operator):
         return {'FINISHED'}
 
 
+# Standard-startpoints template
+#
+#
+# Format: ((fo2_x, fo2_y=0, fo2_z), (rot_x[3], rot_y[3], rot_z[3]))
+_STARTPOINTS_TEMPLATE = [
+    (( 9.317154, 0.0,  5.890960),
+     (0.244631, 0.0, -0.969616,  0.0, 1.0, 0.0,  0.969616, 0.0, 0.244631)),
+    ((11.027939, 0.0, -0.380494),
+     (0.269929, 0.0, -0.962880,  0.0, 1.0, 0.0,  0.962880, 0.0, 0.269929)),
+    (( 4.489945, 0.0, -1.836701),
+     (0.253083, 0.0, -0.967444,  0.0, 1.0, 0.0,  0.967444, 0.0, 0.253083)),
+    (( 2.548997, 0.0,  3.927917),
+     (0.244631, 0.0, -0.969616,  0.0, 1.0, 0.0,  0.969616, 0.0, 0.244631)),
+    ((-2.429321, 0.0, -3.988037),
+     (0.261516, 0.0, -0.965199,  0.0, 1.0, 0.0,  0.965199, 0.0, 0.261516)),
+    ((-4.473190, 0.0,  1.924255),
+     (0.261516, 0.0, -0.965199,  0.0, 1.0, 0.0,  0.965199, 0.0, 0.261516)),
+    ((-9.231529, 0.0, -5.668457),
+     (0.244631, 0.0, -0.969616,  0.0, 1.0, 0.0,  0.969616, 0.0, 0.244631)),
+    ((-11.249992, 0.0,  0.130554),
+     (0.261516, 0.0, -0.965199,  0.0, 1.0, 0.0,  0.965199, 0.0, 0.261516)),
+]
+
+
+def _fo2_startpoint_rot_to_blender_matrix(rot):
+    """Convert FO2 startpoint rotation (9 floats, rows = [right, up, fwd] in
+    FO2 axes) into a Blender 3x3 rotation matrix.
+
+    FO2 uses Y-up, so each direction (x, y, z) → Blender (x, z, y). This is
+    the same mapping the fo2_trackai_import addon uses when importing existing
+    startpoints, so freshly-generated empties look identical to imported ones."""
+    from mathutils import Matrix
+    r = rot
+    return Matrix((
+        (r[0], r[6], r[3]),
+        (r[2], r[8], r[5]),
+        (r[1], r[7], r[4]),
+    ))
+
+
+class FO2_OT_AddStandardStartpoints(bpy.types.Operator):
+    """Add a set of 8 standard FO2 racing startpoints (grid pattern taken
+    from vanilla city1b, centered at world origin on Z=0). Empties get all
+    fo2_startpoint_* custom properties populated so they roundtrip cleanly
+    through the TrackAI exporter. The whole cluster can be freely rotated
+    afterward — its collection origin is at (0, 0, 0)."""
+    bl_idname  = "object.fo2_add_standard_startpoints"
+    bl_label   = "TrackAI: Add Standard Startpoints"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        from mathutils import Matrix, Vector
+
+        # Locate a TrackAI root (any TrackAI_* collection with an AI subsection
+        # or one it started as a section itself). If nothing found, create a
+        # bare `TrackAI_Custom` root so the exporter can pick it up.
+        root_col = None
+        SECTION_HINTS = ("AISplines", "Splitpoints", "Startpoints", "Path")
+        for col in bpy.data.collections:
+            if not col.name.startswith("TrackAI_"):
+                continue
+            has_ai_child = any(
+                any(child.name.startswith(f"TrackAI_{h}") for h in SECTION_HINTS)
+                for child in col.children
+            )
+            if has_ai_child:
+                root_col = col; break
+        if root_col is None:
+            # Loose fallback: first TrackAI_* collection at scene root
+            for col in context.scene.collection.children:
+                if col.name.startswith("TrackAI_"):
+                    root_col = col; break
+        if root_col is None:
+            root_col = bpy.data.collections.new("TrackAI_Custom")
+            context.scene.collection.children.link(root_col)
+            self.report({'INFO'}, "Created new TrackAI_Custom root collection")
+
+        # Locate or create the TrackAI_Startpoints sub-collection under root.
+        sp_col = None
+        for child in root_col.children:
+            if child.name == "TrackAI_Startpoints" or child.name.startswith("TrackAI_Startpoints"):
+                sp_col = child; break
+        if sp_col is None:
+            sp_col = bpy.data.collections.new("TrackAI_Startpoints")
+            root_col.children.link(sp_col)
+
+        # Refuse to clobber existing startpoints — safer than silent overwrite.
+        existing = [o for o in sp_col.objects
+                    if o.type == 'EMPTY' and o.name.startswith("Startpoint")]
+        if existing:
+            self.report({'WARNING'},
+                        f"TrackAI_Startpoints already contains {len(existing)} "
+                        f"startpoint empties — refusing to overwrite. Delete "
+                        f"them first if you want to reset the grid.")
+            return {'CANCELLED'}
+
+        # Materialise the 8 empties. The importer stores per-point:
+        #   fo2_startpoint_position/rotation  — from the binary blob
+        #   fo2_bed_startpoint_position/rotation  — from the .bed text file
+        #   fo2_import_rot_matrix  — for delta-detecting rotation edits
+        # We populate all of them from the same template so the exporter
+        # treats them like freshly-imported empties.
+        for i, (pos_fo2, rot9) in enumerate(_STARTPOINTS_TEMPLATE):
+            # FO2 (x, y, z) → Blender (x, z, y). y is already 0.
+            loc_bl = Vector((pos_fo2[0], pos_fo2[2], pos_fo2[1]))
+
+            empty = bpy.data.objects.new(f"Startpoint{i+1}", None)
+            empty.empty_display_type = 'ARROWS'
+            empty.empty_display_size = 3.0
+            empty.location = loc_bl
+
+            rot_mat = _fo2_startpoint_rot_to_blender_matrix(rot9)
+            empty.matrix_world = Matrix.Translation(loc_bl) @ rot_mat.to_4x4()
+
+            # Snapshot current rotation for future delta-detection on export.
+            m = empty.matrix_world.to_3x3()
+            empty['fo2_import_rot_matrix'] = [
+                m[0][0], m[0][1], m[0][2],
+                m[1][0], m[1][1], m[1][2],
+                m[2][0], m[2][1], m[2][2],
+            ]
+            empty['fo2_startpoint_index']       = i
+            empty['fo2_startpoint_position']    = list(pos_fo2)
+            empty['fo2_startpoint_rotation']    = list(rot9)
+            # .bed values default to the same as the binary blob — the
+            # exporter tracks any rotation delta and re-derives .bed from it.
+            empty['fo2_bed_startpoint_position'] = list(pos_fo2)
+            empty['fo2_bed_startpoint_rotation'] = list(rot9)
+
+            sp_col.objects.link(empty)
+
+        self.report({'INFO'},
+                    f"Added {len(_STARTPOINTS_TEMPLATE)} standard startpoints "
+                    f"to '{sp_col.name}' (rotate the collection to face them "
+                    f"any direction).")
+        return {'FINISHED'}
+
+
+class FO2_OT_SnapStartpointsToRibbon(bpy.types.Operator):
+    """Snap each TrackAI startpoint's Z position to the closest ribbon mesh
+    surface. Preserves X/Y position and rotation. Handles ribbon slopes by
+    querying each startpoint independently — every empty is snapped to the
+    closest point on the closest ribbon at its own X/Y location.
+
+    Usage: move startpoints around in top view without worrying about Z,
+    then run this to put them all cleanly on the track surface."""
+    bl_idname  = "object.fo2_snap_startpoints_to_ribbon"
+    bl_label   = "TrackAI: Snap Startpoints To Ribbon"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        from mathutils import Vector
+
+        # Ribbon meshes get named `{sec_name}_Ribbon` by the trackai import
+        # addon (e.g. Path0_Ribbon). Match on that suffix pattern; any MESH
+        # object whose name contains `_Ribbon` qualifies. Skip zero-vertex
+        # meshes so a stale placeholder doesn't crash closest_point_on_mesh.
+        ribbons = [o for o in bpy.data.objects
+                   if o.type == 'MESH'
+                   and '_Ribbon' in o.name
+                   and o.data is not None
+                   and len(o.data.vertices) > 0]
+        if not ribbons:
+            self.report({'WARNING'},
+                        "No ribbon meshes found in the scene (expected "
+                        "objects named like 'Path0_Ribbon')")
+            return {'CANCELLED'}
+
+        # Gather startpoints from every TrackAI_Startpoints collection. Use
+        # the fo2_startpoint_index custom property as the definitive marker —
+        # matches how the exporter identifies them, and skips unrelated
+        # empties that a user might have parked in the same collection.
+        startpoints = []
+        for col in bpy.data.collections:
+            if not col.name.startswith("TrackAI_Startpoints"):
+                continue
+            for obj in col.objects:
+                if (obj.type == 'EMPTY'
+                        and obj.get('fo2_startpoint_index', -1) >= 0):
+                    startpoints.append(obj)
+        if not startpoints:
+            self.report({'WARNING'},
+                        "No startpoints found in any TrackAI_Startpoints "
+                        "collection (need fo2_startpoint_index property)")
+            return {'CANCELLED'}
+
+        snapped = 0
+        for sp in startpoints:
+            # Startpoint world position. Empties in a Blender collection have
+            # no collection-level transform, so location == world coords unless
+            # the empty has been parented — we handle both by going through
+            # matrix_world.
+            world_pt = sp.matrix_world.translation.copy()
+
+            best_dist = float('inf')
+            best_world_z = None
+            for ribbon in ribbons:
+                # closest_point_on_mesh works in the mesh's local space, so
+                # translate the query point into ribbon coords first, then
+                # translate the result back to world.
+                try:
+                    inv_mw = ribbon.matrix_world.inverted()
+                except (ValueError, ZeroDivisionError):
+                    continue  # singular / non-invertible transform
+                local_pt = inv_mw @ world_pt
+                try:
+                    result = ribbon.closest_point_on_mesh(local_pt)
+                except Exception:
+                    continue
+                # API returns (success, location, normal, index)
+                if not result[0]:
+                    continue
+                closest_world = ribbon.matrix_world @ result[1]
+                dist = (closest_world - world_pt).length
+                if dist < best_dist:
+                    best_dist = dist
+                    best_world_z = closest_world.z
+
+            if best_world_z is None:
+                continue
+
+            # Update only the world Z — preserve X, Y, and rotation.
+            # For a parented empty we'd have to convert world Z back to local,
+            # but startpoints imported/created by the addon aren't parented,
+            # so direct assignment works.
+            if sp.parent is None:
+                sp.location.z = best_world_z
+            else:
+                # General case: recompute local coords from the parent transform
+                current_world = sp.matrix_world.translation.copy()
+                current_world.z = best_world_z
+                try:
+                    local = sp.parent.matrix_world.inverted() @ current_world
+                    sp.location = local
+                except (ValueError, ZeroDivisionError):
+                    continue
+            snapped += 1
+
+        self.report({'INFO'},
+                    f"Snapped {snapped}/{len(startpoints)} startpoints "
+                    f"to closest ribbon surface")
+        return {'FINISHED'}
+
+
+# Reverse-track helpers
+
+_TRACKAI_SECTION_RE = re.compile(r'^TrackAI_Path(\d+)$')
+
+
+def _find_trackai_root_col():
+    """Locate the TrackAI_* collection acting as the track's root."""
+    SECTION_HINTS = ("AISplines", "Splitpoints", "Startpoints", "Path")
+    # Prefer a collection with an AI-flavoured child
+    for col in bpy.data.collections:
+        if not col.name.startswith("TrackAI_"):
+            continue
+        for child in col.children:
+            if any(child.name.startswith(f"TrackAI_{h}") for h in SECTION_HINTS):
+                return col
+    # Fallback: first TrackAI_* found
+    for col in bpy.data.collections:
+        if col.name.startswith("TrackAI_"):
+            return col
+    return None
+
+
+def _reverse_nurbs_points_inplace(curve_obj):
+    """Reverse the point order of every NURBS spline on a curve object."""
+    if curve_obj is None or curve_obj.type != 'CURVE':
+        return
+    for spline in curve_obj.data.splines:
+        if spline.type != 'NURBS':
+            continue
+        pts = [(p.co.x, p.co.y, p.co.z, p.co.w) for p in spline.points]
+        for i, coords in enumerate(reversed(pts)):
+            spline.points[i].co = coords
+
+
+def _swap_and_reverse_curves(curve_a, curve_b):
+    """Move (reversed) point data from curve_a into curve_b and vice versa.
+    Used for Left↔Right boundary swap when reversing track direction: the
+    old left edge becomes the new right edge (with points in reverse order),
+    and the old right edge becomes the new left edge."""
+    if (curve_a is None or curve_b is None
+            or curve_a.type != 'CURVE' or curve_b.type != 'CURVE'):
+        return
+
+    def _read(curve):
+        splines = []
+        for sp in curve.data.splines:
+            if sp.type != 'NURBS':
+                continue
+            splines.append([(p.co.x, p.co.y, p.co.z, p.co.w) for p in sp.points])
+        return splines
+
+    def _write(curve, splines_data):
+        for i, sp in enumerate(curve.data.splines):
+            if sp.type != 'NURBS' or i >= len(splines_data):
+                continue
+            for j, coords in enumerate(reversed(splines_data[i])):
+                if j < len(sp.points):
+                    sp.points[j].co = coords
+
+    a_data = _read(curve_a)
+    b_data = _read(curve_b)
+    _write(curve_a, b_data)  # curve_a receives reversed b (new left = old right reversed)
+    _write(curve_b, a_data)  # curve_b receives reversed a (new right = old left reversed)
+
+
+def _delete_node_empties_in_section(sec_col):
+    """Remove every `{sec_name}_Node*` empty from a TrackAI section
+    collection. Nodes will be regenerated from curves on the next export."""
+    prefix_re = re.compile(r'.*_Node\d+$')
+    to_remove = []
+    for obj in list(sec_col.objects):
+        if obj.type == 'EMPTY' and prefix_re.match(obj.name):
+            to_remove.append(obj)
+    for obj in to_remove:
+        try:
+            bpy.data.objects.remove(obj, do_unlink=True)
+        except Exception:
+            pass
+    return len(to_remove)
+
+
+def _reindex_splitpoints(splitpoints_col):
+    """Reverse the fo2_splitpoint_index values (keeping the highest index
+    as-is — it's the start/finish line in vanilla convention).
+
+    For N splitpoints indexed 0..N-1, the last (N-1) stays; others get
+    remapped: new = (N-2) - old.
+
+    Also updates object names via a two-pass rename to avoid Blender's
+    duplicate-name auto-suffix."""
+    items = []
+    for obj in splitpoints_col.objects:
+        idx = obj.get('fo2_splitpoint_index', -1)
+        if idx is None or int(idx) < 0:
+            continue
+        items.append((int(idx), obj))
+    if len(items) < 2:
+        return 0
+
+    n = len(items)
+    last_idx = n - 1
+
+    # Two-pass rename: first give every reindexed object a unique temp name,
+    # then set the final name. Prevents "Splitpoint9_Gate.001" collisions.
+    tmp_names = {}
+    for old_idx, obj in items:
+        if old_idx == last_idx:
+            new_idx = last_idx
+        else:
+            new_idx = (n - 2) - old_idx
+        obj['fo2_splitpoint_index'] = new_idx
+        tmp = f"__fo2_reverse_tmp__Splitpoint{new_idx + 1}_Gate"
+        tmp_names[obj.name_full] = (obj, new_idx, obj.name)
+        obj.name = tmp
+
+    for _, (obj, new_idx, original_name) in tmp_names.items():
+        obj.name = f"Splitpoint{new_idx + 1}_Gate"
+
+    return n
+
+
+def _mirror_position_across_line(P, L, axis_dir):
+    """Reflect a 3-tuple position across the vertical plane through L with
+    horizontal direction `axis_dir`. Y (vertical) is preserved so the point
+    stays at the same elevation."""
+    ax = axis_dir[0]; az = axis_dir[2]
+    if ax*ax + az*az < 1e-12:
+        return tuple(P)
+    # Normal to reflection plane: perpendicular to axis in the XZ plane.
+    # For axis_dir=(ax, _, az), plane normal ∝ (-az, 0, ax).
+    nx, nz = -az, ax
+    nlen = math.sqrt(nx*nx + nz*nz)
+    nx /= nlen; nz /= nlen
+    dx = P[0] - L[0]
+    dy = P[1] - L[1]
+    dz = P[2] - L[2]
+    dot = dx * nx + dz * nz
+    rx = dx - 2.0 * dot * nx
+    rz = dz - 2.0 * dot * nz
+    return (L[0] + rx, L[1] + dy, L[2] + rz)
+
+
+def _mirror_vector_across_line(V, axis_dir):
+    """Reflect a 3-tuple vector (direction, not position) across the vertical
+    plane whose horizontal direction is `axis_dir`. Y is preserved."""
+    ax = axis_dir[0]; az = axis_dir[2]
+    if ax*ax + az*az < 1e-12:
+        return tuple(V)
+    nx, nz = -az, ax
+    nlen = math.sqrt(nx*nx + nz*nz)
+    nx /= nlen; nz /= nlen
+    dot = V[0] * nx + V[2] * nz
+    return (V[0] - 2.0 * dot * nx, V[1], V[2] - 2.0 * dot * nz)
+
+
+def _fo2_cross(a, b):
+    """Cross product of two 3-tuples."""
+    return (a[1]*b[2] - a[2]*b[1],
+            a[2]*b[0] - a[0]*b[2],
+            a[0]*b[1] - a[1]*b[0])
+
+
+class FO2_OT_ReverseTrack(bpy.types.Operator):
+    """Reverse the entire TrackAI direction in-place.
+
+    Executes, in order:
+      1. Reverse each section's curves — CenterLine and TargetLine get
+         point-order reversed; Left/Right boundaries swap contents and
+         reverse (old left becomes new right, reversed, and vice versa).
+      2. Delete every node empty (they will regenerate from the reversed
+         curves on the next export, with newly-computed forwards and
+         geometry-derived speed hints — matches your item 2 goal).
+      3. Reverse splitpoint indices — the highest-indexed splitpoint (the
+         start/finish line in vanilla convention) stays at its index; all
+         others get remapped so 0↔N-2, 1↔N-3, etc.
+      4. Mirror startpoint positions and rotations across the finish-line
+         axis (defined by the last splitpoint's Left→Right direction).
+      5. Snap startpoints to the ribbon surface for correct Z on slopes.
+
+    Note: this operator assumes the file's *curves* determine node order
+    on export (which they do — `build_section_nodes` iterates the sampled
+    curve points). Reversing splitpoint indices alone would not reverse
+    node direction; the curves have to be reversed too. Both are done."""
+    bl_idname = "object.fo2_reverse_track"
+    bl_label = "TrackAI: Reverse Track"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        from mathutils import Matrix, Vector
+
+        root_col = _find_trackai_root_col()
+        if root_col is None:
+            self.report({'ERROR'},
+                        "No TrackAI_* collection found in scene")
+            return {'CANCELLED'}
+
+        # 1. Reverse curves per section
+        sections = []
+        for child in root_col.children:
+            if _TRACKAI_SECTION_RE.match(child.name):
+                sections.append(child)
+        if not sections:
+            self.report({'WARNING'},
+                        "No TrackAI_Path{N} sub-collections found — "
+                        "nothing to reverse for the racing line itself")
+
+        curves_reversed = 0
+        nodes_deleted = 0
+        for sec_col in sections:
+            center = None; target = None; left = None; right = None
+            for obj in sec_col.objects:
+                if obj.type != 'CURVE':
+                    continue
+                if "_CenterLine" in obj.name:    center = obj
+                elif "_TargetLine" in obj.name:  target = obj
+                elif "_LeftBoundary" in obj.name: left = obj
+                elif "_RightBoundary" in obj.name: right = obj
+
+            if center is not None:
+                try:
+                    bpy.data.objects.remove(center, do_unlink=True)
+                except Exception:
+                    pass
+                curves_reversed += 1
+            if target is not None:
+                _reverse_nurbs_points_inplace(target)
+                curves_reversed += 1
+            # Boundary swap+reverse only if BOTH exist (otherwise partial
+            # state would be worse than doing nothing on that pair).
+            if left is not None and right is not None:
+                _swap_and_reverse_curves(left, right)
+                # Swap the object names too. Two-pass via a temp prefix so
+                # Blender doesn't auto-suffix with .001 when the second
+                # rename would collide.
+                left_original = left.name
+                right_original = right.name
+                left.name = "__fo2_reverse_tmp__" + left_original
+                right.name = left_original.replace("LeftBoundary", "RightBoundary")
+                left.name = right_original.replace("RightBoundary", "LeftBoundary")
+                curves_reversed += 2
+
+            # 2. Delete node empties in this section
+            nodes_deleted += _delete_node_empties_in_section(sec_col)
+
+        # 3. Reverse splitpoint indices
+        splitpoints_col = None
+        for child in root_col.children:
+            if child.name == "TrackAI_Splitpoints":
+                splitpoints_col = child; break
+        splits_reindexed = 0
+        finish_line = None
+        if splitpoints_col is not None:
+            # Capture the finish-line splitpoint (highest index) BEFORE the
+            # reindex — it stays highest, but we grab the object handle now
+            # to avoid re-searching after names change.
+            best_idx = -1
+            for obj in splitpoints_col.objects:
+                idx = obj.get('fo2_splitpoint_index', -1)
+                if idx is not None and int(idx) > best_idx:
+                    best_idx = int(idx); finish_line = obj
+            splits_reindexed = _reindex_splitpoints(splitpoints_col)
+
+        # 4. Mirror startpoints across finish-line axis
+        startpoints_col = None
+        for child in root_col.children:
+            if child.name.startswith("TrackAI_Startpoints"):
+                startpoints_col = child; break
+        startpoints_mirrored = 0
+        if startpoints_col is not None and finish_line is not None:
+            # Read L and R in world space from the finish-line splitpoint's
+            # mesh (vertices [0]=left, [1]=position, [2]=right — set by the
+            # trackai importer). Accounts for any user-applied movement of
+            # the splitpoint object itself.
+            try:
+                if len(finish_line.data.vertices) >= 3:
+                    v_left  = finish_line.matrix_world @ Vector(finish_line.data.vertices[0].co)
+                    v_right = finish_line.matrix_world @ Vector(finish_line.data.vertices[2].co)
+                else:
+                    v_left = v_right = None
+            except Exception:
+                v_left = v_right = None
+
+            if v_left is not None and v_right is not None:
+                # Convert Blender L/R → FO2 space for the mirror math (the
+                # startpoint's stored properties live in FO2 space, and the
+                # mirror is a linear operation that works in either frame).
+                # Blender (x, y, z) → FO2 (x, z, y).
+                L_fo2 = (v_left.x, v_left.z, v_left.y)
+                R_fo2 = (v_right.x, v_right.z, v_right.y)
+                axis_dir_fo2 = (R_fo2[0] - L_fo2[0],
+                                R_fo2[1] - L_fo2[1],
+                                R_fo2[2] - L_fo2[2])
+
+                for sp_obj in list(startpoints_col.objects):
+                    if sp_obj.type != 'EMPTY':
+                        continue
+                    if sp_obj.get('fo2_startpoint_index', -1) < 0:
+                        continue
+
+                    # Position in FO2 space, derived from current Blender loc
+                    # to respect any user edits. Blender (x, y, z) → FO2 (x, z, y).
+                    old_pos_fo2 = (sp_obj.location.x,
+                                   sp_obj.location.z,
+                                   sp_obj.location.y)
+                    new_pos_fo2 = _mirror_position_across_line(
+                        old_pos_fo2, L_fo2, axis_dir_fo2)
+
+                    # Rotation: mirror forward vector, keep up, recompute
+                    # right = up × forward (FO2's convention — verified via
+                    # roundtrip). This yields a valid rotation matrix for a
+                    # car facing the opposite direction.
+                    old_rot = sp_obj.get('fo2_startpoint_rotation')
+                    if old_rot and len(old_rot) == 9:
+                        old_fwd = (float(old_rot[6]), float(old_rot[7]), float(old_rot[8]))
+                        old_up  = (float(old_rot[3]), float(old_rot[4]), float(old_rot[5]))
+                    else:
+                        # Fallback: derive from current matrix_world
+                        m = sp_obj.matrix_world.to_3x3()
+                        # Blender local Y = FO2 forward (in Blender coords);
+                        # convert back via Blender (x, y, z) → FO2 (x, z, y).
+                        by = (m[0][1], m[1][1], m[2][1])
+                        bz = (m[0][2], m[1][2], m[2][2])
+                        old_fwd = (by[0], by[2], by[1])
+                        old_up  = (bz[0], bz[2], bz[1])
+
+                    new_fwd = _mirror_vector_across_line(old_fwd, axis_dir_fo2)
+                    new_up = old_up  # vertical, unaffected by horizontal mirror
+                    new_right = _fo2_cross(new_up, new_fwd)
+
+                    new_rot9 = (new_right[0], new_right[1], new_right[2],
+                                new_up[0],    new_up[1],    new_up[2],
+                                new_fwd[0],   new_fwd[1],   new_fwd[2])
+
+                    # Push new position back into Blender location
+                    # (FO2 (x, y, z) → Blender (x, z, y)).
+                    sp_obj.location = Vector((new_pos_fo2[0],
+                                              new_pos_fo2[2],
+                                              new_pos_fo2[1]))
+
+                    # Push new rotation via matrix_world. Use the same
+                    # FO2→Blender matrix helper the "add startpoints"
+                    # operator uses so the result matches importer output.
+                    rot_mat = _fo2_startpoint_rot_to_blender_matrix(new_rot9)
+                    sp_obj.matrix_world = (Matrix.Translation(sp_obj.location)
+                                           @ rot_mat.to_4x4())
+
+                    # Update custom properties
+                    sp_obj['fo2_startpoint_position'] = list(new_pos_fo2)
+                    sp_obj['fo2_startpoint_rotation'] = list(new_rot9)
+                    sp_obj['fo2_bed_startpoint_position'] = list(new_pos_fo2)
+                    sp_obj['fo2_bed_startpoint_rotation'] = list(new_rot9)
+
+                    # Snapshot new import matrix so the exporter's delta
+                    # detection treats this as the new "resting" state.
+                    m = sp_obj.matrix_world.to_3x3()
+                    sp_obj['fo2_import_rot_matrix'] = [
+                        m[0][0], m[0][1], m[0][2],
+                        m[1][0], m[1][1], m[1][2],
+                        m[2][0], m[2][1], m[2][2],
+                    ]
+
+                    startpoints_mirrored += 1
+
+        # 5. Snap startpoints to ribbon Z. Reuse the exact snap logic — call
+        # the operator directly so any future improvements to snapping are
+        # picked up for free.
+        snap_result = None
+        try:
+            snap_result = bpy.ops.object.fo2_snap_startpoints_to_ribbon()
+        except Exception:
+            pass
+
+        self.report({'INFO'},
+                    f"Reversed track: {curves_reversed} curves reversed, "
+                    f"{nodes_deleted} node empties deleted, "
+                    f"{splits_reindexed} splitpoints reindexed, "
+                    f"{startpoints_mirrored} startpoints mirrored"
+                    + (" & snapped to ribbon"
+                       if snap_result and 'FINISHED' in snap_result else ""))
+        return {'FINISHED'}
+
+
+# TrackAI Preview / Generation Operator
+#
+# Exposes the fo2_trackai_export generation pipeline as a modal properties
+# dialog — same tunable parameters, no file save. Users can preview the
+# generated CenterLines, TargetLines, node empties, and speed-hint values in
+# Blender, adjust, and only actually export when satisfied.
+#
+# Depends on fo2_trackai_export being installed & enabled. Uses dry_run=True
+# on the exporter's own function so there's zero logic duplication.
+
+
+def _find_export_trackai():
+    """Locate the export_trackai function from the sibling plugin, regardless
+    of whether it was installed as a legacy addon or a Blender 4.2+ extension
+    (bl_ext.user_default.*, bl_ext.blender_org.*, etc.)."""
+    import sys
+    for mod_name, mod in list(sys.modules.items()):
+        if mod is None:
+            continue
+        if mod_name.endswith('fo2_trackai_export') and hasattr(mod, 'export_trackai'):
+            return mod.export_trackai
+    return None
+
+
+class FO2_OT_PreviewTrackAI(bpy.types.Operator):
+    """Run the TrackAI generation pipeline in-scene without writing any files.
+
+    Opens a dialog with every knob the export operator exposes (CenterLine
+    offset, TargetLine method + LERP + smoothing, speed_hint lookahead +
+    radius). On OK, curves and node empties are created/updated in Blender
+    as if you had exported, but nothing hits disk. Inspect the result in the
+    Outliner, tweak manually if needed, then run the real export when ready.
+
+    Requires the fo2_trackai_export plugin to be installed and enabled."""
+    bl_idname = "object.fo2_preview_trackai"
+    bl_label = "TrackAI: Preview / Generate"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    # --- Properties (mirror fo2_trackai_export operator, minus file toggles)
+
+    auto_generate_center: bpy.props.BoolProperty(
+        name="Auto-generate CenterLine",
+        description="If a section has no _CenterLine curve, create one by "
+                    "offsetting RightBoundary perpendicular toward the track "
+                    "interior. Requires both boundaries.",
+        default=True,
+    )
+    center_offset: bpy.props.FloatProperty(
+        name="Offset",
+        description="Perpendicular distance from RightBoundary to the "
+                    "generated CenterLine (FO2 units). 3.40 matches the "
+                    "empirical mean across vanilla tracks",
+        default=3.40, min=0.0, max=50.0, step=10, precision=2,
+    )
+
+    auto_generate_target: bpy.props.BoolProperty(
+        name="Auto-generate TargetLine",
+        description="If a section has no _TargetLine curve, create one from "
+                    "the boundaries. Runs after CenterLine generation.",
+        default=True,
+    )
+    target_method: bpy.props.EnumProperty(
+        name="Method",
+        description="How to synthesise the TargetLine when auto-generating",
+        items=[
+            ('SMOOTH', "Smoothed racing line",
+             "Corridor-clamped Chaikin smoothing. Straights sit near t; turns "
+             "pull the curve toward the corridor edge."),
+            ('DUPLICATE', "Duplicate boundary",
+             "Copy one boundary verbatim (nascar-style AI)."),
+        ],
+        default='SMOOTH',
+    )
+    target_lerp: bpy.props.FloatProperty(
+        name="Base position",
+        description="Initial LERP position inside the ribbon. 0 = "
+                    "RightBoundary (inner), 0.5 = center, 1 = LeftBoundary "
+                    "(outer). 0.30 = vanilla mean",
+        default=0.30, min=0.0, max=1.0, step=5, precision=2,
+    )
+    target_smooth_iters: bpy.props.IntProperty(
+        name="Smoothing passes",
+        description="Chaikin iterations. 0 = plain LERP with no smoothing",
+        default=10, min=0, max=50,
+    )
+    target_source: bpy.props.EnumProperty(
+        name="Duplicate from",
+        description="Which boundary to duplicate when method is Duplicate",
+        items=[
+            ('RIGHT', "RightBoundary", "Duplicate the inner boundary"),
+            ('LEFT',  "LeftBoundary",  "Duplicate the outer boundary"),
+        ],
+        default='RIGHT',
+    )
+
+    generate_speed_hints: bpy.props.BoolProperty(
+        name="Generate speed hints from geometry",
+        description="Compute per-node fo2_speed_hint from curvature when "
+                    "generating nodes from scratch. Unchecked = all "
+                    "generated nodes get MAX (no limit). Existing empties "
+                    "are always preserved verbatim",
+        default=True,
+    )
+
+    speed_lookahead: bpy.props.IntProperty(
+        name="Lookahead",
+        description="How many nodes ahead the speed_hint algorithm scans "
+                    "for the tightest upcoming turn",
+        default=3, min=1, max=15,
+    )
+    speed_radius_threshold: bpy.props.FloatProperty(
+        name="Radius",
+        description="Corner radius above which speed uncaps to MAX. Lower = "
+                    "less sensitive (only tight turns slow the AI). Higher = "
+                    "more sensitive (mild curves also trigger slowdown)",
+        default=7071.0, min=100.0, max=30000.0, step=100, precision=1,
+    )
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=420)
+
+    def draw(self, context):
+        layout = self.layout
+
+        info = layout.box()
+        info.label(text="Runs the export generation pipeline without saving.",
+                   icon='INFO')
+        info.label(text="Curves & node empties appear in the Outliner.")
+
+        # CenterLine
+        box = layout.box()
+        box.label(text="Auto-generation", icon='NODETREE')
+        row = box.row(); row.prop(self, "auto_generate_center")
+        sub = box.column(); sub.enabled = self.auto_generate_center
+        sub.prop(self, "center_offset")
+
+        box.separator()
+
+        # TargetLine
+        row = box.row(); row.prop(self, "auto_generate_target")
+        sub = box.column(); sub.enabled = self.auto_generate_target
+        sub.prop(self, "target_method")
+        if self.target_method == 'SMOOTH':
+            sub.prop(self, "target_lerp", slider=True)
+            sub.prop(self, "target_smooth_iters")
+        else:
+            sub.prop(self, "target_source", expand=True)
+
+        # Speed hint
+        box = layout.box()
+        box.label(text="Speed hint (AI cornering)", icon='AUTO')
+        box.prop(self, "generate_speed_hints")
+        sub = box.column()
+        sub.enabled = self.generate_speed_hints
+        sub.prop(self, "speed_lookahead")
+        sub.prop(self, "speed_radius_threshold")
+
+    def execute(self, context):
+        export_fn = _find_export_trackai()
+        if export_fn is None:
+            self.report({'ERROR'},
+                        "fo2_trackai_export plugin not found. Install and "
+                        "enable it before running Preview.")
+            return {'CANCELLED'}
+
+        # Match the export operator's "disable auto-gen when nothing is
+        # missing" UX so a stale True doesn't try to clobber existing curves.
+        any_target_missing = _any_section_missing_targetline_for_preview()
+        any_center_missing = _any_section_missing_centerline_for_preview()
+
+        options = {
+            'dry_run': True,
+            # Companion-file toggles — irrelevant in dry-run (skipped entirely),
+            # but pass explicit False so the exporter never tries to touch disk.
+            'export_splines_ai': False,
+            'export_startpoints_bed': False,
+            'export_splitpoints_bed': False,
+            'auto_generate_center': self.auto_generate_center and any_center_missing,
+            'center_offset': float(self.center_offset),
+            'auto_generate_target': self.auto_generate_target and any_target_missing,
+            'target_method': self.target_method,
+            'target_source': self.target_source,
+            'target_lerp': float(self.target_lerp),
+            'target_smooth_iters': int(self.target_smooth_iters),
+            'speed_lookahead': int(self.speed_lookahead),
+            'speed_radius_threshold': float(self.speed_radius_threshold),
+            'generate_speed_hints': self.generate_speed_hints,
+        }
+
+        try:
+            # filepath is unused in dry-run mode (null-writer), but pass an
+            # empty string rather than None so any accidental os.path.* calls
+            # inside the exporter don't blow up on typing.
+            result = export_fn("", context, options)
+        except Exception as e:
+            self.report({'ERROR'}, f"Preview failed: {e}")
+            import traceback; traceback.print_exc()
+            return {'CANCELLED'}
+
+        # Force the Outliner / 3D viewport to redraw the newly-generated
+        # curves & node empties without needing a click-away.
+        try:
+            for area in context.screen.areas:
+                area.tag_redraw()
+        except Exception:
+            pass
+
+        self.report({'INFO'},
+                    "Preview complete — inspect the generated curves & "
+                    "node empties in the Outliner. Run the real export "
+                    "when you're happy with the result.")
+        return {'FINISHED'}
+
+
+def _any_section_missing_centerline_for_preview():
+    """Same check as fo2_trackai_export._any_section_missing_centerline but
+    inlined here so bgm_hierarchy doesn't have a hard import dependency on
+    the exporter's private helpers. Skips empty Path collections."""
+    for col in bpy.data.collections:
+        if not col.name.startswith("TrackAI_"):
+            continue
+        for child in col.children:
+            if not _TRACKAI_SECTION_RE.match(child.name):
+                continue
+            if len(child.objects) == 0:
+                continue  # empty placeholder — nothing to generate
+            has_center = any(
+                obj.type == 'CURVE' and "_CenterLine" in obj.name
+                for obj in child.objects
+            )
+            if not has_center:
+                return True
+    return False
+
+
+def _any_section_missing_targetline_for_preview():
+    """Same check as fo2_trackai_export._any_section_missing_targetline.
+    Skips empty Path collections."""
+    for col in bpy.data.collections:
+        if not col.name.startswith("TrackAI_"):
+            continue
+        for child in col.children:
+            if not _TRACKAI_SECTION_RE.match(child.name):
+                continue
+            if len(child.objects) == 0:
+                continue  # empty placeholder — nothing to generate
+            has_target = any(
+                obj.type == 'CURVE' and "_TargetLine" in obj.name
+                for obj in child.objects
+            )
+            if not has_target:
+                return True
+    return False
+
+
+# Make Hierarchy Operator
+#
+# Takes user-created ribbon meshes and builds the TrackAI collection tree
+# around them, so a rough scene turns into the
+# structured hierarchy the exporter expects. Doesn't generate curves or
+# nodes — that's the job of Preview / real Export.
+
+
+_RIBBON_NAME_RE = re.compile(
+    r'^(?:TrackAI[_-])?(?:Path)?(\d+)?[_-]?[Rr]ibbon(\d+)?(?:\.\d+)?$'
+)
+
+
+def _classify_ribbon_meshes():
+    """Find every MESH object in the scene whose name looks like a ribbon
+    (variously: 'Ribbon', 'Ribbon0', 'Path0_Ribbon', 'TrackAI_Ribbon', etc.).
+    Returns a list of (mesh_obj, section_index) tuples with section indices
+    assigned as follows:
+      - Explicit index in the name (Ribbon0, Path2_Ribbon, TrackAI_Ribbon3) → use it
+      - No index (Ribbon, TrackAI_Ribbon) → assign next available starting from 0
+    Any collisions are resolved by bumping later ribbons to unused indices."""
+    candidates = []
+    for obj in bpy.data.objects:
+        if obj.type != 'MESH':
+            continue
+        m = _RIBBON_NAME_RE.match(obj.name)
+        if not m:
+            continue
+        # The regex has two capture groups for a leading and trailing digit;
+        # prefer whichever is present (Path2_Ribbon → group 1, Ribbon2 → group 2)
+        idx = None
+        if m.group(1) is not None:
+            idx = int(m.group(1))
+        elif m.group(2) is not None:
+            idx = int(m.group(2))
+        candidates.append([obj, idx])
+
+    # Assign indices to unindexed ribbons using the lowest slot not already claimed
+    claimed = {c[1] for c in candidates if c[1] is not None}
+    next_free = 0
+    for entry in candidates:
+        if entry[1] is not None:
+            continue
+        while next_free in claimed:
+            next_free += 1
+        entry[1] = next_free
+        claimed.add(next_free)
+        next_free += 1
+
+    # Resolve collisions between two ribbons that both explicitly claimed the
+    # same index (unlikely but possible if user has both 'Ribbon0' and
+    # 'Path0_Ribbon'). First one wins, others get bumped to the next free slot.
+    seen = set()
+    for entry in candidates:
+        while entry[1] in seen:
+            entry[1] += 1
+        seen.add(entry[1])
+
+    candidates.sort(key=lambda c: c[1])
+    return [(obj, idx) for obj, idx in candidates]
+
+
+class FO2_OT_MakeTrackAIHierarchy(bpy.types.Operator):
+    """Build the TrackAI collection tree from ribbon meshes already present
+    in the scene. Auto-detects names like 'Ribbon', 'Ribbon0', 'Path0_Ribbon',
+    'TrackAI_Ribbon' etc.; unindexed ribbons get numbered 0, 1, 2, … in
+    Blender's object order.
+
+    Creates 'TrackAI_Custom' (or reuses any existing TrackAI_* root) and one
+    'TrackAI_Path{N}' sub-collection per detected ribbon, then moves and
+    renames each ribbon into its section. Nothing else is generated —
+    boundaries, centerlines, nodes, and everything else comes later from
+    the Preview / Export operators."""
+    bl_idname  = "object.fo2_make_trackai_hierarchy"
+    bl_label   = "TrackAI: Make Hierarchy"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        ribbons = _classify_ribbon_meshes()
+        if not ribbons:
+            self.report({'WARNING'},
+                        "No ribbon meshes found. Create a MESH named "
+                        "'Ribbon' (or 'Ribbon0', 'Path0_Ribbon', "
+                        "'TrackAI_Ribbon' …) first.")
+            return {'CANCELLED'}
+
+        # Reuse existing TrackAI_* root if present; otherwise create a fresh
+        # 'TrackAI_Custom' root at scene root.
+        root_col = _find_trackai_root_col()
+        if root_col is None:
+            root_col = bpy.data.collections.new("TrackAI_Custom")
+            context.scene.collection.children.link(root_col)
+            self.report({'INFO'},
+                        "Created new TrackAI_Custom root collection")
+
+        # Ensure a TrackAI_Path{N} sub-collection exists for each ribbon,
+        # move+rename the ribbon into it.
+        placed = 0
+        for obj, sec_idx in ribbons:
+            sec_name = f"TrackAI_Path{sec_idx}"
+            sec_col = None
+            for child in root_col.children:
+                if child.name == sec_name:
+                    sec_col = child; break
+            if sec_col is None:
+                sec_col = bpy.data.collections.new(sec_name)
+                root_col.children.link(sec_col)
+
+            # Unlink from every existing collection, then link into the
+            # section — moves the ribbon rather than duplicating it.
+            for col in list(obj.users_collection):
+                try:
+                    col.objects.unlink(obj)
+                except Exception:
+                    pass
+            sec_col.objects.link(obj)
+
+            # Rename to canonical form (Blender will auto-suffix if there's
+            # already a collision, but with distinct section indices there
+            # shouldn't be one).
+            target_name = f"Path{sec_idx}_Ribbon"
+            if obj.name != target_name:
+                obj.name = target_name
+            placed += 1
+
+        self.report({'INFO'},
+                    f"Placed {placed} ribbon(s) into "
+                    f"'{root_col.name}' as Path0..Path{ribbons[-1][1]}")
+        return {'FINISHED'}
+
+
+# Reverse Node Indexes Operator (experimental)
+#
+# Standalone counterpart to Reverse Track's step 2: only touches the
+# fo2_node_index values on node empties inside user-selected sections,
+# leaving curves, positions, and everything else alone. Marked experimental
+# because reversing only the index numbers (without also flipping forwards,
+# swapping boundaries, or re-ordering the sequence links) may or may not
+# produce an in-game correct reversal — that's for the user to test.
+
+
+def _sections_with_nodes_enum_items(self, context):
+    """Dynamic items callback for the section-selection ENUM_FLAG. Returns
+    every TrackAI_Path{N} collection that contains at least one node empty,
+    labelled with its current node count."""
+    node_name_re = re.compile(r'.*_Node\d+$')
+    items = []
+    slot = 0
+    matched_sections = []
+    for col in bpy.data.collections:
+        m = _TRACKAI_SECTION_RE.match(col.name)
+        if not m:
+            continue
+        n_nodes = sum(
+            1 for obj in col.objects
+            if obj.type == 'EMPTY' and node_name_re.match(obj.name)
+        )
+        if n_nodes > 0:
+            matched_sections.append((int(m.group(1)), col.name, n_nodes))
+
+    matched_sections.sort(key=lambda t: t[0])
+    for sec_num, name, n_nodes in matched_sections:
+        items.append((
+            name,
+            f"{name}  ({n_nodes} nodes)",
+            f"Reverse fo2_node_index across the {n_nodes} nodes of {name}",
+            1 << slot,
+        ))
+        slot += 1
+
+    if not items:
+        # Callback must return at least one item to keep Blender happy —
+        # invoke() has already refused entry when this list would be empty,
+        # so this sentinel is a safety net only.
+        return [('_NONE_', "(no sections with node empties)", "", 0)]
+    return items
+
+
+class FO2_OT_ReverseNodeIndexes(bpy.types.Operator):
+    """Reverse the fo2_node_index values on node empties inside selected
+    TrackAI_Path{N} sections. Node positions, forwards, boundaries, and
+    everything else are left untouched — only the sequence order changes.
+
+    Experimental: for a fully-consistent reversal (including forwards,
+    boundary swap, splitpoint reindex, startpoint mirror), use the
+    'TrackAI: Reverse Track' operator instead."""
+    bl_idname  = "object.fo2_reverse_node_indexes"
+    bl_label   = "TrackAI: Reverse Node Indexes (experimental)"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    selected_sections: bpy.props.EnumProperty(
+        name="Sections",
+        description="Which TrackAI_Path{N} sections should have their node "
+                    "indexes reversed. Multi-select supported",
+        items=_sections_with_nodes_enum_items,
+        options={'ENUM_FLAG'},
+    )
+
+    def invoke(self, context, event):
+        # Refuse to open the dialog when nothing is reversible — matches the
+        # 'throw error if there are no nodes' behaviour the task asked for.
+        node_name_re = re.compile(r'.*_Node\d+$')
+        has_any = False
+        for col in bpy.data.collections:
+            if not _TRACKAI_SECTION_RE.match(col.name):
+                continue
+            for obj in col.objects:
+                if obj.type == 'EMPTY' and node_name_re.match(obj.name):
+                    has_any = True; break
+            if has_any:
+                break
+        if not has_any:
+            self.report({'ERROR'},
+                        "No node empties found in any TrackAI_Path{N} "
+                        "section. Nothing to reverse.")
+            return {'CANCELLED'}
+        return context.window_manager.invoke_props_dialog(self, width=380)
+
+    def draw(self, context):
+        layout = self.layout
+        info = layout.box()
+        info.label(text="Experimental: only reverses fo2_node_index values.",
+                   icon='ERROR')
+        info.label(text="Positions and other node data are unchanged.")
+        layout.separator()
+        layout.label(text="Sections to reverse:", icon='SORTBYEXT')
+        layout.prop(self, "selected_sections", expand=True)
+
+    def execute(self, context):
+        selection = self.selected_sections
+        if not selection or selection == {'_NONE_'}:
+            self.report({'WARNING'}, "No sections selected — nothing to do")
+            return {'CANCELLED'}
+
+        node_name_re = re.compile(r'.*_Node\d+$')
+        total_sections = 0
+        total_nodes = 0
+        for sec_name in selection:
+            if sec_name == '_NONE_':
+                continue
+            col = bpy.data.collections.get(sec_name)
+            if col is None:
+                continue
+            # Collect node empties, sort by current fo2_node_index
+            nodes = [obj for obj in col.objects
+                     if obj.type == 'EMPTY' and node_name_re.match(obj.name)]
+            nodes.sort(key=lambda o: int(o.get('fo2_node_index', 0)))
+            N = len(nodes)
+            if N == 0:
+                continue
+            # Assign reversed indices. The node whose index was 0 becomes N-1,
+            # and so on. Nothing else on the empty is touched.
+            for i, obj in enumerate(nodes):
+                obj['fo2_node_index'] = N - 1 - i
+            total_sections += 1
+            total_nodes += N
+
+        self.report({'INFO'},
+                    f"Reversed {total_nodes} node index(es) across "
+                    f"{total_sections} section(s)")
+        return {'FINISHED'}
+
+
+# Reverse Splitpoint Indexes Operator
+#
+# Standalone counterpart to Reverse Track's step 3. Uses the exact same
+# reindex logic (highest index stays highest — that's the start/finish line
+# in vanilla convention), just without touching curves, nodes, or startpoints.
+
+
+class FO2_OT_ReverseSplitpointIndexes(bpy.types.Operator):
+    """Reverse the fo2_splitpoint_index values of every splitpoint in the
+    TrackAI_Splitpoints collection. The highest-indexed splitpoint stays at
+    its index (start/finish line — matches vanilla convention). All others
+    are remapped so 0 ↔ N-2, 1 ↔ N-3, etc.
+
+    Same reindex used by the full Reverse Track operator — just isolated to
+    splitpoints only."""
+    bl_idname  = "object.fo2_reverse_splitpoint_indexes"
+    bl_label   = "TrackAI: Reverse Splitpoint Indexes"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        # Find the TrackAI_Splitpoints collection wherever it lives — usually
+        # under a TrackAI_* root, but tolerate loose placement too.
+        split_col = bpy.data.collections.get("TrackAI_Splitpoints")
+        if split_col is None:
+            root = _find_trackai_root_col()
+            if root is not None:
+                for child in root.children:
+                    if child.name == "TrackAI_Splitpoints":
+                        split_col = child; break
+        if split_col is None:
+            self.report({'ERROR'},
+                        "No TrackAI_Splitpoints collection found")
+            return {'CANCELLED'}
+
+        # _reindex_splitpoints returns the count of items reindexed (0 or 1
+        # if there was nothing meaningful to do).
+        count = _reindex_splitpoints(split_col)
+        if count < 2:
+            self.report({'WARNING'},
+                        "Fewer than 2 splitpoints found — nothing to reverse")
+            return {'CANCELLED'}
+
+        self.report({'INFO'},
+                    f"Reversed {count} splitpoint index(es) (highest stayed "
+                    f"as start/finish line)")
+        return {'FINISHED'}
+
+
 # Registration
 
 def menu_func_object(self, context):
@@ -842,6 +2035,14 @@ def menu_func_object(self, context):
     self.layout.separator()
     self.layout.operator(FO2_OT_ViewCollisionsAsCubes.bl_idname)
     self.layout.operator(FO2_OT_ViewCollisionsAsEmpties.bl_idname)
+    self.layout.separator()
+    self.layout.operator(FO2_OT_MakeTrackAIHierarchy.bl_idname)
+    self.layout.operator(FO2_OT_AddStandardStartpoints.bl_idname)
+    self.layout.operator(FO2_OT_SnapStartpointsToRibbon.bl_idname)
+    self.layout.operator(FO2_OT_ReverseTrack.bl_idname)
+    self.layout.operator(FO2_OT_ReverseNodeIndexes.bl_idname)
+    self.layout.operator(FO2_OT_ReverseSplitpointIndexes.bl_idname)
+    self.layout.operator(FO2_OT_PreviewTrackAI.bl_idname)
 
 
 def register():
@@ -852,11 +2053,25 @@ def register():
     bpy.utils.register_class(FO2_OT_ViewDummiesAsAxes)
     bpy.utils.register_class(FO2_OT_ViewCollisionsAsCubes)
     bpy.utils.register_class(FO2_OT_ViewCollisionsAsEmpties)
+    bpy.utils.register_class(FO2_OT_MakeTrackAIHierarchy)
+    bpy.utils.register_class(FO2_OT_AddStandardStartpoints)
+    bpy.utils.register_class(FO2_OT_SnapStartpointsToRibbon)
+    bpy.utils.register_class(FO2_OT_ReverseTrack)
+    bpy.utils.register_class(FO2_OT_ReverseNodeIndexes)
+    bpy.utils.register_class(FO2_OT_ReverseSplitpointIndexes)
+    bpy.utils.register_class(FO2_OT_PreviewTrackAI)
     bpy.types.VIEW3D_MT_object.append(menu_func_object)
 
 
 def unregister():
     bpy.types.VIEW3D_MT_object.remove(menu_func_object)
+    bpy.utils.unregister_class(FO2_OT_PreviewTrackAI)
+    bpy.utils.unregister_class(FO2_OT_ReverseSplitpointIndexes)
+    bpy.utils.unregister_class(FO2_OT_ReverseNodeIndexes)
+    bpy.utils.unregister_class(FO2_OT_ReverseTrack)
+    bpy.utils.unregister_class(FO2_OT_SnapStartpointsToRibbon)
+    bpy.utils.unregister_class(FO2_OT_AddStandardStartpoints)
+    bpy.utils.unregister_class(FO2_OT_MakeTrackAIHierarchy)
     bpy.utils.unregister_class(FO2_OT_ViewCollisionsAsEmpties)
     bpy.utils.unregister_class(FO2_OT_ViewCollisionsAsCubes)
     bpy.utils.unregister_class(FO2_OT_ViewDummiesAsAxes)
