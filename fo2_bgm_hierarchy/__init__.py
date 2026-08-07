@@ -832,6 +832,12 @@ class FO2_OT_ViewCollisionsAsEmpties(bpy.types.Operator):
 
 # Standard-startpoints template
 #
+# Extracted verbatim from FO2 vanilla `city1b_startpoints.bed` (8 startpoints
+# in a 4×2 staggered grid), then translated so the cluster centroid sits at
+# (0, 0, 0) in FO2 space with all Y forced to 0 (Blender Z = 0 = ground plane).
+# Every inter-point distance is preserved exactly (translation is
+# distance-preserving); individual rotations are kept verbatim so the grid
+# reproduces the mild per-point rotation variation seen in vanilla.
 #
 # Format: ((fo2_x, fo2_y=0, fo2_z), (rot_x[3], rot_y[3], rot_z[3]))
 _STARTPOINTS_TEMPLATE = [
@@ -1574,6 +1580,17 @@ class FO2_OT_PreviewTrackAI(bpy.types.Operator):
         default=7071.0, min=100.0, max=30000.0, step=100, precision=1,
     )
 
+    flip_boundaries: bpy.props.BoolProperty(
+        name="Flip boundaries",
+        description="Swap Left and Right boundaries when they get derived "
+                    "from a Ribbon mesh. If CenterLine ends up on the "
+                    "outer edge of the track instead of down the middle, "
+                    "toggle this and re-run. Applied before every "
+                    "downstream generator (CenterLine, TargetLine, "
+                    "nodes, speed hints)",
+        default=False,
+    )
+
     def invoke(self, context, event):
         return context.window_manager.invoke_props_dialog(self, width=420)
 
@@ -1613,6 +1630,12 @@ class FO2_OT_PreviewTrackAI(bpy.types.Operator):
         sub.prop(self, "speed_lookahead")
         sub.prop(self, "speed_radius_threshold")
 
+        # Boundary side override — only matters when boundaries actually
+        # get derived from a Ribbon this run.
+        box = layout.box()
+        box.label(text="Boundaries", icon='MOD_MIRROR')
+        box.prop(self, "flip_boundaries")
+
     def execute(self, context):
         export_fn = _find_export_trackai()
         if export_fn is None:
@@ -1643,6 +1666,7 @@ class FO2_OT_PreviewTrackAI(bpy.types.Operator):
             'speed_lookahead': int(self.speed_lookahead),
             'speed_radius_threshold': float(self.speed_radius_threshold),
             'generate_speed_hints': self.generate_speed_hints,
+            'flip_boundaries': self.flip_boundaries,
         }
 
         try:
@@ -1714,7 +1738,7 @@ def _any_section_missing_targetline_for_preview():
 # Make Hierarchy Operator
 #
 # Takes user-created ribbon meshes and builds the TrackAI collection tree
-# around them, so a rough scene turns into the
+# around them, so a rough scene ("I made one Ribbon plane") turns into the
 # structured hierarchy the exporter expects. Doesn't generate curves or
 # nodes — that's the job of Preview / real Export.
 
@@ -1839,6 +1863,497 @@ class FO2_OT_MakeTrackAIHierarchy(bpy.types.Operator):
         self.report({'INFO'},
                     f"Placed {placed} ribbon(s) into "
                     f"'{root_col.name}' as Path0..Path{ribbons[-1][1]}")
+        return {'FINISHED'}
+
+
+# Rebuild Ribbon Operator
+#
+# Turns any track mesh (triangulated, over-detailed, self-crossing, closed
+# ring or open stem) into a clean L/R-alternating quad strip the exporter
+# can parse. The goal is vanilla-style ribbons, not geometric fidelity.
+#
+# Two shapes, auto-detected from border-loop topology:
+#
+#   RING (closed circuit): the mesh has two significant border loops —
+#   outer perimeter and inner hole. Strategy: resample the outer loop
+#   uniformly, generate the inner boundary by offsetting perpendicular-
+#   inward by the track width. Ignores the inner loop's messy topology
+#   (self-crossings etc.) entirely.
+#
+#   STEM (open branch): the mesh has ONE significant border loop that runs
+#   down one side, around the end cap, back up the other side. Strategy:
+#   "fold detection" — find the offset c such that arc positions s and
+#   (c - s) on the loop pair up across the track (minimising median pair
+#   distance). The fold's two fixed points are the track ends. Split the
+#   loop there into two sides, resample each side uniformly, then pair
+#   with a monotone closest-point pass (handles curved stems where the
+#   outer side is longer than the inner).
+
+
+def _list_mesh_objects_for_ribbon(self, context):
+    """Enum-items callback: every MESH object currently in the scene."""
+    items = []
+    for obj in bpy.data.objects:
+        if obj.type == 'MESH':
+            items.append((obj.name, obj.name, f"Rebuild from '{obj.name}'"))
+    if not items:
+        items = [('_NONE_', "(no meshes in scene)", "")]
+    return items
+
+
+def _extract_border_loops(mesh_obj):
+    """Group border edges of a mesh into ordered vertex loops (each a list
+    of vertex indices, in the order traversed by edge-walking).
+
+    Border edges are edges belonging to exactly one face — the mesh's
+    outer perimeter plus any interior holes. Loops shorter than 3 verts
+    are dropped."""
+    from collections import defaultdict
+    mesh = mesh_obj.data
+    edge_faces = defaultdict(list)
+    for fi, poly in enumerate(mesh.polygons):
+        vs = list(poly.vertices)
+        for i in range(len(vs)):
+            v0 = vs[i]; v1 = vs[(i + 1) % len(vs)]
+            edge_faces[(min(v0, v1), max(v0, v1))].append(fi)
+    border = [e for e, fs in edge_faces.items() if len(fs) == 1]
+    vert_edges = defaultdict(list)
+    for e in border:
+        vert_edges[e[0]].append(e)
+        vert_edges[e[1]].append(e)
+    visited = set(); loops = []
+    for start_edge in border:
+        if start_edge in visited:
+            continue
+        loop = [start_edge[0]]; cur = start_edge[0]
+        while True:
+            cand = [e for e in vert_edges[cur] if e not in visited]
+            if not cand:
+                break
+            ne = cand[0]; visited.add(ne)
+            nxt = ne[1] if ne[0] == cur else ne[0]
+            loop.append(nxt); cur = nxt
+            if cur == loop[0]:
+                loop.pop(); break
+        if len(loop) >= 3:
+            loops.append(loop)
+    return loops
+
+
+# --- arc-length helpers for closed polyline loops (world-space points) ---
+
+def _rr_dist(a, b):
+    import math
+    return math.sqrt((a[0] - b[0]) ** 2
+                     + (a[1] - b[1]) ** 2
+                     + (a[2] - b[2]) ** 2)
+
+
+def _rr_cumlens(pts):
+    """Cumulative arc lengths, including the closing wrap segment."""
+    cum = [0.0]
+    for i in range(len(pts)):
+        cum.append(cum[-1] + _rr_dist(pts[i], pts[(i + 1) % len(pts)]))
+    return cum
+
+
+def _rr_point_at(pts, cum, s):
+    """Point at arc position s (mod total) on the closed polyline."""
+    T = cum[-1]
+    s = s % T
+    lo, hi = 0, len(pts)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if cum[mid + 1] < s:
+            lo = mid + 1
+        else:
+            hi = mid
+    j = lo
+    seg = cum[j + 1] - cum[j]
+    t = (s - cum[j]) / seg if seg > 1e-9 else 0.0
+    p0 = pts[j]; p1 = pts[(j + 1) % len(pts)]
+    return [p0[k] + t * (p1[k] - p0[k]) for k in range(3)]
+
+
+def _rr_sample_range(pts, cum, s0, s1, N):
+    """N points from arc position s0 forward to s1 (wrapping if needed)."""
+    T = cum[-1]
+    span = (s1 - s0) % T
+    if span == 0:
+        span = T
+    if N == 1:
+        return [_rr_point_at(pts, cum, s0)]
+    return [_rr_point_at(pts, cum, s0 + span * (i / (N - 1)))
+            for i in range(N)]
+
+
+def _rr_find_stem_fold(pts, K=512, step=4):
+    """Find the fold offset of an open-stem border loop.
+
+    A stem's single border loop runs down one side of the track, around an
+    end cap, back up the other side, and around the second cap. So there
+    exists an offset c where arc positions s and (c - s) sit across the
+    track from each other. Searching c for the minimum median pair
+    distance finds it; the fold's fixed points (s = c/2 and c/2 + T/2)
+    are the two track ends.
+
+    Returns (e1, e2, median_width, T): the two end arc-positions, the
+    median across-track distance at the best fold, and the total loop
+    arc length."""
+    cum = _rr_cumlens(pts)
+    T = cum[-1]
+    P = [_rr_point_at(pts, cum, T * i / K) for i in range(K)]
+    idxs = list(range(0, K, step))
+    best_ci = 0
+    best_err = float('inf')
+    for ci in range(K):
+        ds = sorted(_rr_dist(P[i], P[(ci - i) % K]) for i in idxs)
+        med = ds[len(ds) // 2]
+        if med < best_err:
+            best_err = med
+            best_ci = ci
+    c = T * best_ci / K
+    e1 = (c / 2) % T
+    e2 = (c / 2 + T / 2) % T
+    return e1, e2, best_err, T
+
+
+class FO2_OT_RebuildRibbon(bpy.types.Operator):
+    """Rebuild any track mesh into a clean L/R-alternating quad strip ribbon.
+
+    Auto-detects closed circuits (ring: outer boundary + inward offset)
+    vs open stems (fold detection to find the track ends, then pair the
+    two sides). Aims for vanilla-style ribbons, not geometric fidelity."""
+    bl_idname  = "object.fo2_rebuild_ribbon"
+    bl_label   = "TrackAI: Rebuild Ribbon from Mesh"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    source_mesh: bpy.props.EnumProperty(
+        name="Source mesh",
+        description="Which mesh in the scene to convert into a ribbon",
+        items=_list_mesh_objects_for_ribbon,
+    )
+    shape_mode: bpy.props.EnumProperty(
+        name="Track shape",
+        description="Closed circuit vs open stem branch",
+        items=[
+            ('AUTO', "Auto-detect",
+             "Ring if the mesh has a significant second border loop "
+             "(inner hole), stem otherwise"),
+            ('RING', "Closed loop",
+             "Force ring handling: outer boundary + inward offset, "
+             "closed ribbon"),
+            ('STEM', "Open stem",
+             "Force stem handling: fold detection + two-side pairing, "
+             "open ribbon"),
+        ],
+        default='AUTO',
+    )
+    num_pairs: bpy.props.IntProperty(
+        name="Resolution (L/R pairs)",
+        description="Number of L/R vertex pairs in the new ribbon. Total "
+                    "vertex count = 2× this. Vanilla ribbons range 30–500 "
+                    "pairs depending on track length",
+        default=100, min=4, max=2000,
+    )
+    width_mode: bpy.props.EnumProperty(
+        name="Track width",
+        description="How to determine the ribbon's width",
+        items=[
+            ('AUTO',   "Auto-detect from mesh",
+             "Ring: median outer-to-inner-loop distance. Stem: actual "
+             "across-track pairing from the mesh geometry (follows "
+             "narrowing/widening roads)"),
+            ('MANUAL', "Manual",
+             "Force a fixed width everywhere (direction still derived "
+             "from the mesh)"),
+        ],
+        default='AUTO',
+    )
+    manual_width: bpy.props.FloatProperty(
+        name="Width",
+        description="Track width in Blender units. Used only when Track "
+                    "width is set to Manual",
+        default=20.0, min=0.1, max=1000.0, precision=2,
+    )
+    end_trim: bpy.props.FloatProperty(
+        name="End trim (× width)",
+        description="Stems only: how much arc to trim off each track end, "
+                    "as a multiple of the track width. Trimming skips the "
+                    "end caps so the ribbon starts at (near-)full width "
+                    "instead of converging to a point. ~0.5 for squared "
+                    "caps, ~0.8 for rounded caps",
+        default=0.75, min=0.0, max=3.0, precision=2,
+    )
+    flip_inward: bpy.props.BoolProperty(
+        name="Flip inward / swap sides",
+        description="Ring: reverse the inward-offset direction (use if the "
+                    "generated boundary lands outside the track). Stem: "
+                    "swap which side is Left vs Right",
+        default=False,
+    )
+    output_name: bpy.props.StringProperty(
+        name="Output name",
+        description="Name for the new ribbon object. Use 'Ribbon' or "
+                    "'Path0_Ribbon' so 'Make Hierarchy' picks it up later",
+        default="Ribbon",
+    )
+    keep_source: bpy.props.BoolProperty(
+        name="Keep source mesh",
+        description="Add the ribbon alongside the source; uncheck to delete "
+                    "the source after rebuilding",
+        default=True,
+    )
+
+    def invoke(self, context, event):
+        if (context.active_object is not None
+                and context.active_object.type == 'MESH'):
+            self.source_mesh = context.active_object.name
+        return context.window_manager.invoke_props_dialog(self, width=420)
+
+    def draw(self, context):
+        layout = self.layout
+        info = layout.box()
+        info.label(text="Rebuilds a clean vanilla-style ribbon from any mesh.",
+                   icon='MESH_GRID')
+        info.label(text="Handles closed circuits AND open stem branches.")
+        col = layout.column()
+        col.prop(self, "source_mesh")
+        col.prop(self, "shape_mode")
+        col.prop(self, "num_pairs")
+        col.prop(self, "width_mode")
+        if self.width_mode == 'MANUAL':
+            col.prop(self, "manual_width")
+        col.prop(self, "end_trim")
+        col.prop(self, "flip_inward")
+        col.prop(self, "output_name")
+        col.prop(self, "keep_source")
+
+    # --- shape-specific builders -----------------------------------------
+
+    def _build_ring(self, loops_pts, N):
+        """Outer loop + perpendicular inward offset. Returns (L, R, width,
+        closed=True)."""
+        import math
+        outer = loops_pts[0]
+        xs = [p[0] for p in outer]
+        ys = [p[1] for p in outer]
+        zs = [p[2] for p in outer]
+        ext = [max(xs) - min(xs), max(ys) - min(ys), max(zs) - min(zs)]
+        vax = ext.index(min(ext))
+        h1, h2 = [a for a in range(3) if a != vax]
+
+        if self.width_mode == 'AUTO':
+            if len(loops_pts) < 2:
+                self.report({'WARNING'},
+                            "Only one border loop; using Manual width "
+                            f"{self.manual_width}")
+                width = float(self.manual_width)
+            else:
+                inner = loops_pts[1]
+                stride = max(1, len(outer) // 30)
+                ds = sorted(min(_rr_dist(outer[i], q) for q in inner)
+                            for i in range(0, len(outer), stride))
+                width = ds[len(ds) // 2]
+                if width < 0.01:
+                    self.report({'WARNING'},
+                                f"Auto width tiny ({width:.3f}); using "
+                                f"Manual {self.manual_width}")
+                    width = float(self.manual_width)
+        else:
+            width = float(self.manual_width)
+
+        cum = _rr_cumlens(outer)
+        sA = _rr_sample_range(outer, cum, 0.0, cum[-1], N + 1)[:-1]
+        cx = sum(p[h1] for p in sA) / N
+        cy = sum(p[h2] for p in sA) / N
+
+        def build_R(sign):
+            import math as _m
+            out = []
+            for i in range(N):
+                pp = sA[(i - 1) % N]; pn = sA[(i + 1) % N]
+                tx = pn[h1] - pp[h1]; ty = pn[h2] - pp[h2]
+                tl = _m.sqrt(tx * tx + ty * ty)
+                if tl < 1e-9:
+                    out.append(list(sA[i])); continue
+                tx /= tl; ty /= tl
+                nx, ny = (-ty, tx) if sign > 0 else (ty, -tx)
+                r = list(sA[i])
+                r[h1] += nx * width
+                r[h2] += ny * width
+                out.append(r)
+            return out
+
+        R_plus = build_R(+1)
+        R_minus = build_R(-1)
+        d_plus = sum(math.sqrt((r[h1] - cx) ** 2 + (r[h2] - cy) ** 2)
+                     for r in R_plus)
+        d_minus = sum(math.sqrt((r[h1] - cx) ** 2 + (r[h2] - cy) ** 2)
+                      for r in R_minus)
+        R = R_plus if d_plus < d_minus else R_minus
+        if self.flip_inward:
+            R = R_minus if R is R_plus else R_plus
+        return sA, R, width, True
+
+    def _build_stem(self, loops_pts, N):
+        """Fold-detect the track ends on the single border loop, split into
+        two sides, resample each, pair with a monotone closest-point pass.
+        Returns (L, R, median_width, closed=False)."""
+        import math
+        loop = loops_pts[0]
+        cum = _rr_cumlens(loop)
+        e1, e2, fold_w, T = _rr_find_stem_fold(loop)
+
+        # Misclassification guard: on a closed ring forced (or auto-mis-
+        # detected) into stem mode, folding pairs diametrically-opposite
+        # points and the "width" comes out as a huge fraction of the mesh.
+        xs = [p[0] for p in loop]; ys = [p[1] for p in loop]
+        zs = [p[2] for p in loop]
+        diag = math.sqrt((max(xs) - min(xs)) ** 2
+                         + (max(ys) - min(ys)) ** 2
+                         + (max(zs) - min(zs)) ** 2)
+        if diag > 1e-6 and fold_w > 0.15 * diag:
+            self.report({'WARNING'},
+                        f"Fold width {fold_w:.1f} is {100 * fold_w / diag:.0f}% "
+                        f"of the mesh size — this mesh may actually be a "
+                        f"closed loop. Try Track shape = Closed loop.")
+
+        margin = float(self.end_trim) * max(fold_w, 1e-3)
+        side_len = (e2 - e1) % T
+        other_len = T - side_len
+        margin = min(margin, 0.25 * side_len, 0.25 * other_len)
+
+        A = _rr_sample_range(loop, cum, e1 + margin, e2 - margin, N)
+        M = max(4 * N, 400)
+        wrap = T if (e1 - margin) % T < (e2 + margin) % T else 0
+        B_dense = _rr_sample_range(loop, cum, e2 + margin,
+                                   e1 - margin + wrap, M)
+        B_dense = list(reversed(B_dense))
+
+        # Monotone closest-point pairing: handles curved stems where the
+        # two sides have different arc lengths without letting pairs
+        # cross each other.
+        B = []
+        j_prev = 0
+        win = max(3, (M // N) * 3)
+        for k in range(N):
+            j_hi = min(M - 1, j_prev + win)
+            best_j = j_prev
+            best_d = float('inf')
+            for j in range(j_prev, j_hi + 1):
+                d = _rr_dist(A[k], B_dense[j])
+                if d < best_d:
+                    best_d = d
+                    best_j = j
+            B.append(B_dense[best_j])
+            j_prev = best_j
+
+        if self.width_mode == 'MANUAL':
+            manual = float(self.manual_width)
+            R = []
+            prev_dir = None
+            for k in range(N):
+                dx = [B[k][i] - A[k][i] for i in range(3)]
+                dl = math.sqrt(sum(d * d for d in dx))
+                if dl < 1e-9:
+                    dirv = prev_dir if prev_dir else [0.0, 0.0, 1.0]
+                else:
+                    dirv = [d / dl for d in dx]
+                    prev_dir = dirv
+                R.append([A[k][i] + dirv[i] * manual for i in range(3)])
+            B = R
+
+        if self.flip_inward:
+            A, B = B, A
+
+        widths = sorted(_rr_dist(A[i], B[i]) for i in range(N))
+        return A, B, widths[N // 2], False
+
+    # ----------------------------------------------------------------------
+
+    def execute(self, context):
+        # Resolve source
+        if self.source_mesh in ('', '_NONE_'):
+            self.report({'ERROR'}, "No source mesh selected")
+            return {'CANCELLED'}
+        source = bpy.data.objects.get(self.source_mesh)
+        if source is None or source.type != 'MESH':
+            self.report({'ERROR'},
+                        f"'{self.source_mesh}' is not a mesh object")
+            return {'CANCELLED'}
+        if len(source.data.vertices) < 3:
+            self.report({'ERROR'},
+                        f"'{source.name}' has fewer than 3 vertices")
+            return {'CANCELLED'}
+
+        loops_idx = _extract_border_loops(source)
+        if not loops_idx:
+            self.report({'ERROR'},
+                        f"'{source.name}' has no border edges — mesh is "
+                        f"fully closed (no boundary). Cannot rebuild.")
+            return {'CANCELLED'}
+
+        # World-space loops, sorted by arc length (not vertex count — a
+        # dense small loop must not outrank a sparse big one)
+        mw = source.matrix_world
+        loops_pts = [[tuple(mw @ source.data.vertices[i].co) for i in loop]
+                     for loop in loops_idx]
+        loops_pts.sort(key=lambda L: _rr_cumlens(L)[-1], reverse=True)
+
+        # Shape classification
+        if self.shape_mode == 'AUTO':
+            if (len(loops_pts) >= 2
+                    and _rr_cumlens(loops_pts[1])[-1]
+                        > 0.3 * _rr_cumlens(loops_pts[0])[-1]):
+                shape = 'RING'
+            else:
+                shape = 'STEM'
+        else:
+            shape = self.shape_mode
+
+        N = int(self.num_pairs)
+        if shape == 'RING':
+            L, R, width, closed = self._build_ring(loops_pts, N)
+        else:
+            L, R, width, closed = self._build_stem(loops_pts, N)
+
+        # Assemble mesh: alternating L, R, L, R, ... in file order
+        new_verts = []
+        for i in range(N):
+            new_verts.append(tuple(L[i]))
+            new_verts.append(tuple(R[i]))
+        new_faces = []
+        quad_count = N if closed else N - 1
+        for i in range(quad_count):
+            L0 = 2 * i
+            R0 = 2 * i + 1
+            L1 = 2 * ((i + 1) % N)
+            R1 = 2 * ((i + 1) % N) + 1
+            new_faces.append((L0, R0, R1, L1))
+
+        me = bpy.data.meshes.new(self.output_name)
+        me.from_pydata(new_verts, [], new_faces)
+        me.update()
+        new_obj = bpy.data.objects.new(self.output_name, me)
+
+        if source.users_collection:
+            source.users_collection[0].objects.link(new_obj)
+        else:
+            context.scene.collection.objects.link(new_obj)
+
+        if not self.keep_source and source != new_obj:
+            source_name = source.name
+            bpy.data.objects.remove(source, do_unlink=True)
+            note = f" (deleted source '{source_name}')"
+        else:
+            note = ""
+
+        self.report({'INFO'},
+                    f"Built {'closed' if closed else 'open'} "
+                    f"{shape.lower()} ribbon '{new_obj.name}': {N} L/R "
+                    f"pairs, width~{width:.2f}u, {len(new_faces)} quads"
+                    + note)
         return {'FINISHED'}
 
 
@@ -2037,6 +2552,7 @@ def menu_func_object(self, context):
     self.layout.operator(FO2_OT_ViewCollisionsAsEmpties.bl_idname)
     self.layout.separator()
     self.layout.operator(FO2_OT_MakeTrackAIHierarchy.bl_idname)
+    self.layout.operator(FO2_OT_RebuildRibbon.bl_idname)
     self.layout.operator(FO2_OT_AddStandardStartpoints.bl_idname)
     self.layout.operator(FO2_OT_SnapStartpointsToRibbon.bl_idname)
     self.layout.operator(FO2_OT_ReverseTrack.bl_idname)
@@ -2054,6 +2570,7 @@ def register():
     bpy.utils.register_class(FO2_OT_ViewCollisionsAsCubes)
     bpy.utils.register_class(FO2_OT_ViewCollisionsAsEmpties)
     bpy.utils.register_class(FO2_OT_MakeTrackAIHierarchy)
+    bpy.utils.register_class(FO2_OT_RebuildRibbon)
     bpy.utils.register_class(FO2_OT_AddStandardStartpoints)
     bpy.utils.register_class(FO2_OT_SnapStartpointsToRibbon)
     bpy.utils.register_class(FO2_OT_ReverseTrack)
@@ -2071,6 +2588,7 @@ def unregister():
     bpy.utils.unregister_class(FO2_OT_ReverseTrack)
     bpy.utils.unregister_class(FO2_OT_SnapStartpointsToRibbon)
     bpy.utils.unregister_class(FO2_OT_AddStandardStartpoints)
+    bpy.utils.unregister_class(FO2_OT_RebuildRibbon)
     bpy.utils.unregister_class(FO2_OT_MakeTrackAIHierarchy)
     bpy.utils.unregister_class(FO2_OT_ViewCollisionsAsEmpties)
     bpy.utils.unregister_class(FO2_OT_ViewCollisionsAsCubes)

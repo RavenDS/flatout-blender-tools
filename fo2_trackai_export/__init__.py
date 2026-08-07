@@ -285,24 +285,92 @@ def _extract_boundaries_from_ribbon(sec_col):
     left/right vertices in file order (v[0]=left[0], v[1]=right[0],
     v[2]=left[1], v[3]=right[1], ...).
 
+    Handles odd-length vertex lists by trimming the trailing unpaired vertex,
+    which is the common failure mode when a user post-edits the ribbon
+    (Merge by Distance, manual delete) and knocks the count off-parity.
+
     Returns (lefts, rights) in FO2 coordinates, or (None, None) if no valid
-    ribbon is present or its structure doesn't match the expected pattern.
+    ribbon is present. Every failure path prints a diagnostic to the system
+    console — silent no-ops were causing "Preview generates nothing and
+    there's no error" reports.
     """
     ribbon_obj = find_object_containing(sec_col, "_Ribbon")
-    if ribbon_obj is None or ribbon_obj.type != 'MESH':
+    if ribbon_obj is None:
+        print(f"[TrackAI Export] '{sec_col.name}': no _Ribbon mesh found in "
+              f"section — nothing to fall back on")
+        return None, None
+    if ribbon_obj.type != 'MESH':
+        print(f"[TrackAI Export] '{sec_col.name}': '{ribbon_obj.name}' is "
+              f"not a MESH (type={ribbon_obj.type}); cannot use as ribbon")
         return None, None
     verts = ribbon_obj.data.vertices
-    if len(verts) < 4 or len(verts) % 2 != 0:
+    n_verts = len(verts)
+    if n_verts < 4:
+        print(f"[TrackAI Export] '{sec_col.name}': ribbon "
+              f"'{ribbon_obj.name}' has only {n_verts} vertices, need >=4")
         return None, None
+    # Trim odd counts to the even prefix. Otherwise range(0, n_verts, 2)
+    # would try to read verts[n_verts] on the final iteration and crash;
+    # rejecting outright caused silent export failures whenever a user
+    # nudged the mesh count off-parity (Merge by Distance is a common
+    # culprit — collapsing one L/R pair into a single vertex takes the
+    # total down to 2N-1).
+    if n_verts % 2 != 0:
+        print(f"[TrackAI Export] '{sec_col.name}': ribbon "
+              f"'{ribbon_obj.name}' has odd vertex count {n_verts}; "
+              f"trimming last vertex and proceeding with {n_verts - 1} "
+              f"(pairing may be slightly off — inspect the mesh if the "
+              f"generated boundaries look wrong)")
+        n_verts -= 1
     lefts = []
     rights = []
     mw = ribbon_obj.matrix_world
-    for i in range(0, len(verts), 2):
+    for i in range(0, n_verts, 2):
         left_world = mw @ verts[i].co
         right_world = mw @ verts[i + 1].co
         lefts.append(blender_to_fo2(left_world))
         rights.append(blender_to_fo2(right_world))
     return lefts, rights
+
+
+def _detect_ribbon_closure(lefts_fo2, rights_fo2):
+    """Auto-detect whether a ribbon extracted from a mesh is closed (race
+    circuit) or open (stem branch, pit spur, dead-end).
+
+    Rationale: relying on the section's `fo2_is_closed` custom property is
+    unsafe — it defaults to True at section-discovery time, which forces
+    stems into cyclic NURBS boundaries and corrupts every downstream
+    generator (CenterLine, TargetLine, node graph, speed hints). The
+    ribbon mesh's own geometry is the source of truth: a closed loop has
+    its first and last L/R pairs adjacent (the ribbon wraps around), a
+    stem has them at opposite ends of the track.
+
+    Threshold: closed if `dist(first_pair, last_pair) < 1.5× average step
+    size between consecutive pairs`. Requires at least 3 pairs to make a
+    meaningful judgement — shorter ribbons return False (open) since a
+    2-pair ribbon has no interior for the notion of "closure" to be
+    distinct from the whole thing.
+    """
+    import math
+    if lefts_fo2 is None or rights_fo2 is None:
+        return False
+    n = len(lefts_fo2)
+    if n < 3 or len(rights_fo2) < 3:
+        return False
+
+    def d(a, b):
+        return math.sqrt((a[0] - b[0]) ** 2
+                         + (a[1] - b[1]) ** 2
+                         + (a[2] - b[2]) ** 2)
+
+    step_sum = sum(d(lefts_fo2[i], lefts_fo2[i + 1]) for i in range(n - 1))
+    if step_sum < 1e-6:
+        return False
+    avg_step = step_sum / (n - 1)
+    gap_l = d(lefts_fo2[0], lefts_fo2[-1])
+    gap_r = d(rights_fo2[0], rights_fo2[-1])
+    threshold = 1.5 * avg_step
+    return gap_l < threshold and gap_r < threshold
 
 
 def _create_track_curve(sec_col, name, fo2_points, is_closed):
@@ -1096,6 +1164,7 @@ def export_trackai(filepath, context, options):
         speed_lookahead = int(options.get('speed_lookahead', 3))
         speed_radius_threshold = float(options.get('speed_radius_threshold', 7071.0))
         generate_speed_hints = bool(options.get('generate_speed_hints', True))
+        flip_boundaries = bool(options.get('flip_boundaries', False))
 
         for sec_i, (sec_name, sec_col) in enumerate(section_cols):
             is_closed = sec_col.get('fo2_is_closed', True)
@@ -1119,6 +1188,36 @@ def export_trackai(filepath, context, options):
             if not lefts or not rights:
                 r_lefts, r_rights = _extract_boundaries_from_ribbon(sec_col)
                 if r_lefts is not None:
+                    # Flip Boundaries: on some ribbon geometries the L/R
+                    # sides come out inverted (auto-detection can't always
+                    # know which side of the strip is "outside" of the
+                    # eventual racing line). Swap here — before anything
+                    # else uses r_lefts/r_rights — so CenterLine,
+                    # TargetLine, nodes, and speed hints all cascade off
+                    # the corrected assignment.
+                    if flip_boundaries:
+                        print(f"[TrackAI Export] Section '{sec_name}': "
+                              f"flip_boundaries=True, swapping L/R "
+                              f"before generation")
+                        r_lefts, r_rights = r_rights, r_lefts
+
+                    # Auto-detect closure from the ribbon's actual geometry.
+                    # The section's `fo2_is_closed` defaults to True (line
+                    # 275-276) — safe for a race circuit's main loop, but
+                    # catastrophically wrong for stem branches: forcing a stem
+                    # into cyclic NURBS wraps the last boundary point back to
+                    # the first, corrupting CenterLine, TargetLine, node graph
+                    # and speed hints. Overriding here (and updating the prop
+                    # so downstream reads see the correct value) is the fix.
+                    detected_closed = _detect_ribbon_closure(r_lefts, r_rights)
+                    if detected_closed != is_closed:
+                        print(f"[TrackAI Export] Section '{sec_name}': "
+                              f"ribbon geometry indicates "
+                              f"{'closed' if detected_closed else 'open'}, "
+                              f"overriding fo2_is_closed={is_closed}")
+                        is_closed = detected_closed
+                        sec_col['fo2_is_closed'] = detected_closed
+
                     derived = []
                     if not lefts:
                         lefts = r_lefts
@@ -2050,7 +2149,20 @@ class TRACKAI_OT_boundaries_from_ribbon(bpy.types.Operator):
             return {'CANCELLED'}
 
         sec_name = sec_col.name.replace("TrackAI_", "", 1)
-        is_closed = bool(sec_col.get('fo2_is_closed', True))
+
+        # Auto-detect closure from the ribbon's geometry rather than trusting
+        # the section's `fo2_is_closed` prop (which defaults to True and
+        # would force stem branches into cyclic NURBS, breaking every
+        # downstream generator). Update the prop so the exporter sees the
+        # corrected value on the next run.
+        detected_closed = _detect_ribbon_closure(lefts_fo2, rights_fo2)
+        prev_closed = bool(sec_col.get('fo2_is_closed', True))
+        if detected_closed != prev_closed:
+            print(f"[TrackAI] Section '{sec_name}': ribbon geometry "
+                  f"indicates {'closed' if detected_closed else 'open'}, "
+                  f"updating fo2_is_closed accordingly")
+            sec_col['fo2_is_closed'] = detected_closed
+        is_closed = detected_closed
 
         # Remove existing boundary curves to avoid duplicates
         for suffix in ("_LeftBoundary", "_RightBoundary"):
@@ -2201,6 +2313,20 @@ class ExportTrackAI(bpy.types.Operator, ExportHelper):
         default=True,
     )
 
+    flip_boundaries: BoolProperty(
+        name="Flip boundaries",
+        description="Swap Left and Right boundaries when they get derived "
+                    "from a Ribbon mesh. Ribbon geometry doesn't always "
+                    "self-identify which side is which — if CenterLine "
+                    "ends up on the outer edge of the track instead of "
+                    "down the middle (because RightBoundary was really "
+                    "the outer one), toggle this and re-export. Applied "
+                    "before every downstream generator (CenterLine, "
+                    "TargetLine, nodes, speed hints), so the swap "
+                    "cascades cleanly",
+        default=False,
+    )
+
     speed_lookahead: IntProperty(
         name="Lookahead",
         description="How many nodes ahead the speed_hint algorithm scans for "
@@ -2288,6 +2414,13 @@ class ExportTrackAI(bpy.types.Operator, ExportHelper):
         sub.prop(self, "speed_lookahead")
         sub.prop(self, "speed_radius_threshold")
 
+        # Boundary side override. Enabled only when there's actually a
+        # from-scratch derivation about to happen; a stale True while every
+        # section already has explicit L/R curves would be a silent no-op.
+        box = layout.box()
+        box.label(text="Boundaries", icon='MOD_MIRROR')
+        box.prop(self, "flip_boundaries")
+
     def execute(self, context):
         # Only pass the auto-gen flags when they can actually do something —
         # matches the disabled-checkbox UX so a stale True doesn't try to
@@ -2308,6 +2441,7 @@ class ExportTrackAI(bpy.types.Operator, ExportHelper):
             'speed_lookahead': int(self.speed_lookahead),
             'speed_radius_threshold': float(self.speed_radius_threshold),
             'generate_speed_hints': self.generate_speed_hints,
+            'flip_boundaries': self.flip_boundaries,
         }
         try:
             result = export_trackai(self.filepath, context, options)
