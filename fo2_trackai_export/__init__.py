@@ -1494,8 +1494,53 @@ def _gather_startpoint_empties(root_col):
     return items
 
 
+def _splitpoint_world_positions(obj):
+    """Read (pos, left, right) FO2-space positions of a splitpoint gate by
+    transforming its three mesh vertices through the object's world matrix.
+
+    The importer builds each gate mesh with:
+        vertex 0 = left, vertex 1 = pos, vertex 2 = right
+    all placed in Blender space at import time (create_splitpoints in the
+    importer, line ~975 of fo2_trackai_import). Reading world positions
+    honours every transform the user may apply — translate, rotate, scale,
+    edit-mode vertex moves, parenting — where the old obj.location-only
+    "delta" read silently dropped rotations, scale, and per-vertex edits.
+
+    Returns (pos_fo2, left_fo2, right_fo2) or None if the object is not a
+    mesh or has fewer than 3 vertices.
+    """
+    if obj is None or obj.type != 'MESH':
+        return None
+    verts = obj.data.vertices
+    if len(verts) < 3:
+        return None
+    mw = obj.matrix_world
+    left_w  = mw @ verts[0].co
+    pos_w   = mw @ verts[1].co
+    right_w = mw @ verts[2].co
+    return (
+        blender_to_fo2(pos_w),
+        blender_to_fo2(left_w),
+        blender_to_fo2(right_w),
+    )
+
+
 def _gather_splitpoint_objects(root_col):
-    """Collect splitpoint objects sorted by index."""
+    """Collect (idx, pos, left, right) tuples in FO2 space for every
+    splitpoint gate under TrackAI_Splitpoints. Sorted by index.
+
+    Reads world-space vertex positions rather than adding an obj.location
+    "delta" to a stored original — this is what makes rotation and
+    per-vertex edits actually export instead of being silently dropped.
+
+    Side effect: refreshes the fo2_splitpoint_* custom properties (and
+    the fo2_bed_splitpoint_* mirrors if present) so they reflect the
+    current effective state after any user edits. The .bed mirrors get
+    the same values because the importer places both from a single
+    game-space triplet — if a vanilla file ever splits them, the mesh
+    was built from the embedded triplet, so that's the authoritative
+    source anyway.
+    """
     sp_col = None
     for child in root_col.children:
         if child.name == "TrackAI_Splitpoints":
@@ -1507,22 +1552,32 @@ def _gather_splitpoint_objects(root_col):
     items = []
     for obj in sp_col.objects:
         idx = obj.get('fo2_splitpoint_index', -1)
-        pos_orig = obj.get('fo2_splitpoint_position')
-        left_orig = obj.get('fo2_splitpoint_left')
-        right_orig = obj.get('fo2_splitpoint_right')
-        if idx >= 0 and pos_orig and left_orig and right_orig:
-            # Mesh origin is at world origin; obj.location is the movement delta
-            delta = blender_to_fo2(obj.location)
-            pos = (float(pos_orig[0]) + delta[0],
-                   float(pos_orig[1]) + delta[1],
-                   float(pos_orig[2]) + delta[2])
-            left = (float(left_orig[0]) + delta[0],
-                    float(left_orig[1]) + delta[1],
-                    float(left_orig[2]) + delta[2])
-            right = (float(right_orig[0]) + delta[0],
-                     float(right_orig[1]) + delta[1],
-                     float(right_orig[2]) + delta[2])
-            items.append((idx, pos, left, right))
+        if idx < 0:
+            continue
+        world = _splitpoint_world_positions(obj)
+        if world is None:
+            # Object was somehow stripped of its mesh — fall back to the
+            # stored embedded coords so we don't drop the splitpoint
+            # entirely, but nothing user-edited will be captured.
+            pos = obj.get('fo2_splitpoint_position')
+            left = obj.get('fo2_splitpoint_left')
+            right = obj.get('fo2_splitpoint_right')
+            if pos and left and right:
+                items.append((idx,
+                              tuple(float(v) for v in pos),
+                              tuple(float(v) for v in left),
+                              tuple(float(v) for v in right)))
+            continue
+        pos, left, right = world
+        items.append((idx, pos, left, right))
+        # Refresh props to reflect the current effective state.
+        obj['fo2_splitpoint_position'] = list(pos)
+        obj['fo2_splitpoint_left']     = list(left)
+        obj['fo2_splitpoint_right']    = list(right)
+        if 'fo2_bed_splitpoint_position' in obj:
+            obj['fo2_bed_splitpoint_position'] = list(pos)
+            obj['fo2_bed_splitpoint_left']     = list(left)
+            obj['fo2_bed_splitpoint_right']    = list(right)
     items.sort(key=lambda x: x[0])
     return items
 
@@ -1920,60 +1975,13 @@ def _export_splines_from_empties(root_col, base_dir):
 
 
 def _export_splitpoints_from_objects(root_col, base_dir):
-    """Generate splitpoints.bed from splitpoint objects using delta approach. Returns True if written."""
-    split_col = None
-    for child in root_col.children:
-        if child.name == "TrackAI_Splitpoints":
-            split_col = child
-            break
-    if not split_col:
-        return False
-
-    splitpoints = []
-    for obj in split_col.objects:
-        idx = obj.get('fo2_splitpoint_index', -1)
-        if idx < 0:
-            continue
-
-        # Try delta approach using .bed coords
-        bed_pos = obj.get('fo2_bed_splitpoint_position')
-        bed_left = obj.get('fo2_bed_splitpoint_left')
-        bed_right = obj.get('fo2_bed_splitpoint_right')
-
-        if bed_pos and bed_left and bed_right:
-            # Splitpoint mesh origin is at world origin, so delta = obj.location
-            delta_bl = (obj.location[0], obj.location[1], obj.location[2])
-            # Convert delta to game space (swap Y/Z)
-            delta_game = (delta_bl[0], delta_bl[2], delta_bl[1])
-            # Apply delta to all three .bed points
-            pos = (bed_pos[0] + delta_game[0],
-                   bed_pos[1] + delta_game[1],
-                   bed_pos[2] + delta_game[2])
-            left = (bed_left[0] + delta_game[0],
-                    bed_left[1] + delta_game[1],
-                    bed_left[2] + delta_game[2])
-            right = (bed_right[0] + delta_game[0],
-                     bed_right[1] + delta_game[1],
-                     bed_right[2] + delta_game[2])
-        else:
-            # Fallback: read binary coords from custom properties
-            bin_pos = obj.get('fo2_splitpoint_position')
-            bin_left = obj.get('fo2_splitpoint_left')
-            bin_right = obj.get('fo2_splitpoint_right')
-            if bin_pos and bin_left and bin_right:
-                pos = tuple(float(v) for v in bin_pos)
-                left = tuple(float(v) for v in bin_left)
-                right = tuple(float(v) for v in bin_right)
-            else:
-                continue
-
-        splitpoints.append((idx, pos, left, right))
-
+    """Generate splitpoints.bed from splitpoint objects. Returns True if
+    written. Delegates gathering to _gather_splitpoint_objects so the .bed
+    output picks up rotation/scale/vertex edits and prop refreshes for
+    free — no more delta-only path that quietly ignored rotations."""
+    splitpoints = _gather_splitpoint_objects(root_col)
     if not splitpoints:
         return False
-
-    # Sort by index
-    splitpoints.sort(key=lambda x: x[0])
 
     out_path = os.path.join(base_dir, "splitpoints.bed")
     with open(out_path, 'w', newline='\n') as f:
