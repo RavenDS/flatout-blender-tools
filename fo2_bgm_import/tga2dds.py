@@ -49,22 +49,23 @@ def read_tga(filepath):
             f"Unsupported TGA image type {image_type} "
             "(only uncompressed=2 or RLE=10 true-color supported)"
         )
-    if bpp != 32:
-        raise ValueError(f"Expected 32-bit TGA, got {bpp}-bit")
+    if bpp not in (24, 32):
+        raise ValueError(f"Expected 24- or 32-bit TGA, got {bpp}-bit")
+    bypp = bpp // 8
 
     pixel_data = raw[18 + id_length:]
     if image_type == 10:
-        pixel_data = decode_tga_rle(pixel_data, width * height, 4)
+        pixel_data = decode_tga_rle(pixel_data, width * height, bypp)
 
     top_left = bool((image_desc >> 5) & 1)
 
-    # BGRA to RGBA
+    # BGR(A) to RGBA (24-bit TGAs are opaque: alpha = 255)
     pixels = []
     for i in range(width * height):
-        b = pixel_data[i * 4 + 0]
-        g = pixel_data[i * 4 + 1]
-        r = pixel_data[i * 4 + 2]
-        a = pixel_data[i * 4 + 3]
+        b = pixel_data[i * bypp + 0]
+        g = pixel_data[i * bypp + 1]
+        r = pixel_data[i * bypp + 2]
+        a = pixel_data[i * bypp + 3] if bypp == 4 else 255
         pixels.append((r, g, b, a))
 
     if not top_left:
