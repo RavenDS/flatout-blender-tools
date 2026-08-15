@@ -24,7 +24,7 @@ Three reorganise operators are available in View3D > Object:
 bl_info = {
     "name":        "FlatOut BGM Hierarchy Reorganiser",
     "author":      "ravenDS",
-    "version":     (2, 0, 0),
+    "version":     (2, 0, 1),
     "blender":     (3, 6, 0),
     "location":    "View3D > Object > FO2: Reorganise",
     "description": "Flatten any scene hierarchy into the layout the BGM exporter expects",
@@ -49,6 +49,9 @@ SHADER_CAR_SHEAR      = 11
 SHADER_CAR_SCALE      = 12
 SHADER_SHADOW_PROJECT = 13
 SHADER_SKINNING       = 26
+# FOUC-only shaders (FO1/FO2 use SHADER_CAR_DIFFUSE for these material names)
+SHADER_FOUC_INTERIOR  = 43
+SHADER_FOUC_TIRE      = 44
 
 
 def _get_texture_name_from_material(bl_mat) -> str:
@@ -70,13 +73,12 @@ def _get_shader_for_material(mat_name: str, tex_name: str,
                               game_mode: str = 'FO2') -> tuple:
     """Return (shader_id, alpha, v92, tex_override).
 
-    game_mode affects v92 for light materials:
-      FO1        -> v92 = 0  (original FO1 files have v92=0 on all materials)
-      FO2 / FOUC -> v92 = 2
+    Fallback for materials with no shader set.
     """
     name  = mat_name.lower()
     shader, alpha, v92 = SHADER_CAR_METAL, 0, 0
     tex_override = None
+    is_fouc = (game_mode == 'FOUC')
 
     if name.startswith("shadow") or name.endswith("shadow"):
         shader       = SHADER_SHADOW_PROJECT
@@ -85,19 +87,24 @@ def _get_shader_for_material(mat_name: str, tex_name: str,
         shader       = SHADER_CAR_BODY
         tex_override = "skin1.tga"
     elif name.startswith("interior"):
-        shader = SHADER_CAR_DIFFUSE
+        shader = SHADER_FOUC_INTERIOR if is_fouc else SHADER_CAR_DIFFUSE
     elif name.startswith("grille"):
         shader, alpha = SHADER_CAR_DIFFUSE, 1
     elif name.startswith("window"):
         shader = SHADER_CAR_WINDOW
     elif name.startswith("shear"):
+        # also catches shearhock / shearshock — vanilla puts all of them on 11
         shader = SHADER_CAR_SHEAR
-    elif name.startswith("scaleshock") or name.startswith("shearhock") or name.startswith("shearshock"):
+    elif name.startswith("scaleshock") or name.startswith("scalespring"):
         shader, alpha = SHADER_CAR_SCALE, 0
-    elif name.startswith("shock") or name.startswith("spring") or name.startswith("scale"):
+    elif name.startswith("scale"):
         shader = SHADER_CAR_SCALE
+    elif name.startswith("shock") or name.startswith("spring"):
+        # bare shock/spring are shear (11) in vanilla, not scale (12)
+        shader = SHADER_CAR_SHEAR
     elif name.startswith("tire"):
-        shader = SHADER_CAR_DIFFUSE
+        shader = (SHADER_FOUC_TIRE if is_fouc else
+                  (SHADER_CAR_TIRE if game_mode == 'FO1' else SHADER_CAR_DIFFUSE))
     elif name.startswith("rim"):
         shader, alpha = SHADER_CAR_TIRE, 1
     elif name.startswith("light"):
@@ -140,15 +147,6 @@ def _sanitize_mesh_and_material_props(mesh_objects, game_mode: str = 'FO2'):
         if changed:
             obj.update_tag()
 
-    used_shader_ids: set = set()
-    for obj in mesh_objects:
-        for slot in obj.material_slots:
-            if slot.material and "bgm_shader_id" in slot.material:
-                try:
-                    used_shader_ids.add(int(slot.material["bgm_shader_id"]))
-                except (TypeError, ValueError):
-                    pass
-
     seen: set = set()
     for obj in mesh_objects:
         for slot in obj.material_slots:
@@ -183,13 +181,11 @@ def _sanitize_mesh_and_material_props(mesh_objects, game_mode: str = 'FO2'):
                 bl_mat["bgm_shader_id"] = shader_id
                 bl_mat["bgm_alpha"]     = alpha
                 bl_mat["bgm_v92"]       = v92
-                used_shader_ids.add(shader_id)
                 changed = True
             else:
                 # Already has a shader — update v92 on lights if it was set to the wrong game-mode default (0 vs 2).
                 try:
                     sid = int(bl_mat["bgm_shader_id"])
-                    used_shader_ids.add(sid)
                     if sid == SHADER_CAR_LIGHTS:
                         correct_v92 = 0 if game_mode == 'FO1' else 2
                         if bl_mat.get("bgm_v92", correct_v92) != correct_v92:
