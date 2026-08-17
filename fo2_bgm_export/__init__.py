@@ -1,7 +1,7 @@
 bl_info = {
     "name":        "FlatOut BGM Export",
     "author":      "ravenDS",
-    "version":     (1, 6, 2),
+    "version":     (1, 6, 3),
     "blender":     (3, 6, 0),
     "location":    "File > Export > FlatOut Car BGM (.bgm)",
     "description": "Export FlatOut 1/2/UC model (BGM) files. Based on reverse-egineering work by Chloe (FlatOutW32BGMTool)",
@@ -57,6 +57,10 @@ SHADER_CAR_SCALE        = 12
 SHADER_SHADOW_PROJECT   = 13
 SHADER_SKINNING         = 26
 
+# FOUC-only shaders (FO1/FO2 use SHADER_CAR_DIFFUSE for these)
+SHADER_FOUC_INTERIOR    = 43
+SHADER_FOUC_TIRE        = 44
+
 
 # MATERIAL PRIORITY TABLE
 # Higher value = drawn later. Materials not listed default to 0.
@@ -96,16 +100,20 @@ def get_material_priority(name: str) -> int:
 
 # SHADER CONFIG  (from shaders.txt / FixupFBXCarMaterial)
 
-def get_shader_for_material(mat_name: str, tex_name: str) -> tuple:
+def get_shader_for_material(mat_name: str, tex_name: str,
+                            game_mode: str = 'FO2') -> tuple:
     """Determine shader_id, alpha, v92, texture_override from material name.
 
     Returns (shader_id, alpha, v92, texture_name_override_or_None).
+
+    Fallback only, used when material carries no bgm_shader_id.
     """
     name = mat_name.lower()
     shader = SHADER_CAR_METAL  # default
     alpha = 0
     v92 = 0
     tex_override = None
+    is_fouc = (game_mode == 'FOUC')
 
     # name-prefix rules (order matters, first match wins)
     if name.startswith("shadow") or name.endswith("shadow"):
@@ -114,27 +122,32 @@ def get_shader_for_material(mat_name: str, tex_name: str) -> tuple:
         shader = SHADER_CAR_BODY
         tex_override = "skin1.tga"
     elif name.startswith("interior"):
-        shader = SHADER_CAR_DIFFUSE
+        shader = SHADER_FOUC_INTERIOR if is_fouc else SHADER_CAR_DIFFUSE
     elif name.startswith("grille"):
         shader = SHADER_CAR_DIFFUSE
         alpha = 1
     elif name.startswith("window"):
         shader = SHADER_CAR_WINDOW
     elif name.startswith("shear"):
+        # also catches shearhock / shearshock — vanilla puts all of them on 11
         shader = SHADER_CAR_SHEAR
-    elif name.startswith("scaleshock") or name.startswith("shearhock"):
+    elif name.startswith("scaleshock") or name.startswith("scalespring"):
         shader = SHADER_CAR_SCALE
         alpha = 0  # forced no alpha (FORCENOALPHA)
-    elif name.startswith("shock") or name.startswith("spring") or name.startswith("scale"):
+    elif name.startswith("scale"):
         shader = SHADER_CAR_SCALE
+    elif name.startswith("shock") or name.startswith("spring"):
+        # bare shock/spring are shear (11) in vanilla, not scale (12)
+        shader = SHADER_CAR_SHEAR
     elif name.startswith("tire"):
-        shader = SHADER_CAR_DIFFUSE  # TIRE -> shader 7 in FO2
+        shader = (SHADER_FOUC_TIRE if is_fouc else
+                  (SHADER_CAR_TIRE if game_mode == 'FO1' else SHADER_CAR_DIFFUSE))
     elif name.startswith("rim"):
         shader = SHADER_CAR_TIRE  # RIM -> shader 9
         alpha = 1
     elif name.startswith("light"):
         shader = SHADER_CAR_LIGHTS
-        v92 = 2
+        v92 = 0 if game_mode == 'FO1' else 2
     elif name.startswith("terrain") or name.startswith("groundplane"):
         shader = SHADER_CAR_DIFFUSE
         alpha = 1
@@ -710,7 +723,8 @@ def build_buffers_for_material(obj, mat_index, flags, vertex_size,
 
 # BUILD FO2 MATERIAL FROM BLENDER MATERIAL
 
-def build_fo2_material(bl_mat, is_fo1: bool = False, override_light_shader: bool = True) -> FO2Material:
+def build_fo2_material(bl_mat, is_fo1: bool = False, override_light_shader: bool = True,
+                       game_mode: str = 'FO2') -> FO2Material:
     """Convert a Blender material to an FO2 material struct."""
     mat = FO2Material()
     mat.name = bl_mat.name
@@ -758,7 +772,7 @@ def build_fo2_material(bl_mat, is_fo1: bool = False, override_light_shader: bool
     else:
         # infer everything from name
         shader_id, alpha, v92, tex_override = get_shader_for_material(
-            mat.name, tex_name)
+            mat.name, tex_name, game_mode=game_mode)
         if not override_light_shader and shader_id == SHADER_CAR_LIGHTS:
             v92 = 0
             alpha = 0
@@ -876,6 +890,46 @@ def triangulate_mesh(obj):
     return new_mesh, True
 
 
+def _topology_key(mesh):
+    """Geometry-independent identity of a mesh topology.
+
+    (vertex count, per-polygon loop totals, per-loop vertex indices). 
+
+    Two meshes with equal keys differ only in vertex coordinates.
+    """
+    lv = [0] * len(mesh.loops)
+    mesh.loops.foreach_get("vertex_index", lv)
+    lt = [0] * len(mesh.polygons)
+    mesh.polygons.foreach_get("loop_total", lt)
+    return (len(mesh.vertices), lt, lv)
+
+
+def build_crash_work_mesh(obj, work_mesh, crash_obj, auto_triangulate):
+    """Return (mesh, is_temp, how), crash mesh to sample matching work_mesh."""
+    crash_mesh = crash_obj.data
+
+    if auto_triangulate:
+        base_needs_tri = any(len(p.vertices) != 3 for p in obj.data.polygons)
+        if base_needs_tri and _topology_key(obj.data) == _topology_key(crash_mesh):
+            new_mesh = work_mesh.copy()
+            co = [0.0] * (len(crash_mesh.vertices) * 3)
+            crash_mesh.vertices.foreach_get("co", co)
+            new_mesh.vertices.foreach_set("co", co)
+            # copy inherits the base mesh custom split normals
+            if getattr(new_mesh, "has_custom_normals", False):
+                try:
+                    new_mesh.normals_split_custom_set(
+                        [(0.0, 0.0, 0.0)] * len(new_mesh.loops))
+                except (RuntimeError, ValueError, TypeError):
+                    pass
+            new_mesh.update()
+            return new_mesh, True, 'derived from base triangulation'
+        m, t = triangulate_mesh(crash_obj)
+        return m, t, 'independent triangulation'
+
+    return crash_mesh, False, 'no triangulation'
+
+
 def write_crash_dat(filepath: str, crash_data: list, is_fouc: bool = False):
     """Write a FO2 or FOUC crash.dat file.
 
@@ -895,7 +949,10 @@ def write_crash_dat(filepath: str, crash_data: list, is_fouc: bool = False):
             f.write(name.encode('ascii') + b'\x00')
 
             f.write(struct.pack('<I', len(surfaces)))
-            for base_vdata, crash_vdata, vsize, vcount in surfaces:
+            for surf in surfaces:
+                base_vdata, crash_vdata, vsize, vcount = surf[0], surf[1], surf[2], surf[3]
+                # surface flags are optional (older 4-tuples still work)
+                sflags = surf[4] if len(surf) > 4 else None
                 f.write(struct.pack('<I', vcount))
 
                 if is_fouc:
@@ -905,7 +962,9 @@ def write_crash_dat(filepath: str, crash_data: list, is_fouc: bool = False):
                     # uint8[4] baseUnkBump2, uint8[4] crashUnkBump2,
                     # uint8[4] baseNorm, uint8[4] crashNorm,
                     # uint16[2] baseUV
-                    SCALE_INV = FOUC_VERTEX_SCALE_INV
+                    if vsize != 32:
+                        print(f"[BGM Export] ERROR: {name} surface has FOUC vertex size {vsize}, expected 32 — crash.dat would be malformed")
+                        return
                     for i in range(vcount):
                         off = i * vsize  # vsize=32 for FOUC
                         # read int16 positions from packed vdata
@@ -930,15 +989,27 @@ def write_crash_dat(filepath: str, crash_data: list, is_fouc: bool = False):
                         f.write(crash_nrm)                             # crash normals
                         f.write(base_uv)                               # base UV (no crash UV)
                 else:
-                    # FO2: vcount, vbytes, vbuf, then 48-byte weights
+                    # FO2/FO1: vcount, vbytes, vbuf, then 48-byte weights
                     f.write(struct.pack('<I', vcount * vsize))
                     f.write(base_vdata)
+
+                    if sflags is None:
+                        has_normal = vsize >= 24
+                    else:
+                        has_normal = bool(sflags & VERTEX_NORMAL) and vsize >= 24
+                    if not has_normal:
+                        print(f"[BGM Export] WARNING: {name} has a crash surface whose vertex format carries no normals ({vsize}B, shadow shader?).")
+                    zero_nrm = b'\x00' * 12
+
                     for i in range(vcount):
                         off = i * vsize
                         base_pos  = base_vdata[off:off + 12]
                         crash_pos = crash_vdata[off:off + 12]
-                        base_nrm  = base_vdata[off + 12:off + 24]
-                        crash_nrm = crash_vdata[off + 12:off + 24]
+                        if has_normal:
+                            base_nrm  = base_vdata[off + 12:off + 24]
+                            crash_nrm = crash_vdata[off + 12:off + 24]
+                        else:
+                            base_nrm = crash_nrm = zero_nrm
                         f.write(base_pos)
                         f.write(crash_pos)
                         f.write(base_nrm)
@@ -953,8 +1024,9 @@ def write_bgm(filepath: str, context, options: dict):
     inv_scale = 1.0 / global_scale if global_scale != 0 else 1.0
     use_priorities = options.get('use_priorities', True)
     auto_triangulate = options.get('auto_triangulate', True)
-    is_fouc = options.get('game_mode', 'FO2') == 'FOUC'
-    is_fo1  = options.get('game_mode', 'FO2') == 'FO1'
+    game_mode = options.get('game_mode', 'FO2')
+    is_fouc = game_mode == 'FOUC'
+    is_fo1  = game_mode == 'FO1'
     override_light_shader = options.get('override_light_shader', True)
 
     root = find_root_empty(context)
@@ -964,9 +1036,18 @@ def write_bgm(filepath: str, context, options: dict):
     crash_root = find_crash_root_empty(context)
     crash_mesh_map = {}  # base_model_name -> crash Blender object
     if crash_root:
+        # mirror collect_objects_under(): accept direct mesh children and meshes one
+        # level down under an intermediate empty, so a crash hierarchy that mirrors
+        # the body hierarchy is still found
+        crash_candidates = []
         for obj in crash_root.children:
-            if obj.type != 'MESH' or not obj.data:
-                continue
+            if obj.type == 'MESH' and obj.data:
+                crash_candidates.append(obj)
+            elif obj.type == 'EMPTY':
+                crash_candidates.extend(
+                    c for c in obj.children if c.type == 'MESH' and c.data
+                )
+        for obj in crash_candidates:
             name = re.sub(r'\.\d{3}$', '', obj.name)
             if name.endswith('_crash'):
                 base_name = name[:-6]
@@ -1008,23 +1089,6 @@ def write_bgm(filepath: str, context, options: dict):
             print(f"[BGM Export] Initialized missing BGM properties on mesh: {obj.name}")
 
     # sanitize material custom properties
-    # Collect all unique shader IDs already in use, so we can assign a fresh one if bgm_shader_id is missing from a material
-    used_shader_ids = set()
-    for obj in mesh_objects:
-        for slot in obj.material_slots:
-            if slot.material and "bgm_shader_id" in slot.material:
-                try:
-                    used_shader_ids.add(int(slot.material["bgm_shader_id"]))
-                except (TypeError, ValueError):
-                    pass
-
-    def _next_unused_shader_id():
-        sid = 0
-        while sid in used_shader_ids:
-            sid += 1
-        used_shader_ids.add(sid)
-        return sid
-
     seen_materials = set()
     for obj in mesh_objects:
         for slot in obj.material_slots:
@@ -1044,21 +1108,26 @@ def write_bgm(filepath: str, context, options: dict):
             else:
                 tex_name = re.sub(r'\.\d{3}$', '', bl_mat.name) + '.tga'
 
+            # no stored shader, fall back to name inference
+            inf_shader, inf_alpha, inf_v92, inf_tex = get_shader_for_material(
+                re.sub(r'\.\d{3}$', '', bl_mat.name), tex_name, game_mode=game_mode)
+            if not override_light_shader and inf_shader == SHADER_CAR_LIGHTS:
+                inf_v92 = 0
+                inf_alpha = 0
+            if inf_tex is not None:
+                tex_name = inf_tex
+
             if "bgm_alpha" not in bl_mat:
-                bl_mat["bgm_alpha"] = 0
+                bl_mat["bgm_alpha"] = inf_alpha
                 mat_changed = True
             if "bgm_num_textures" not in bl_mat:
                 bl_mat["bgm_num_textures"] = 1
                 mat_changed = True
             if "bgm_shader_id" not in bl_mat:
-                bl_mat["bgm_shader_id"] = _next_unused_shader_id()
+                bl_mat["bgm_shader_id"] = inf_shader
                 mat_changed = True
-            else:
-                # still register the existing one so _next_unused_shader_id stays correct
-                try:
-                    used_shader_ids.add(int(bl_mat["bgm_shader_id"]))
-                except (TypeError, ValueError):
-                    pass
+                print(f"[BGM Export] '{bl_mat.name}' has no shader set — guessed {inf_shader} from its name ({game_mode})."
+                      f"Edit in the FlatOut Shader panel if that is wrong.")
             if "bgm_texture" not in bl_mat:
                 bl_mat["bgm_texture"] = tex_name
                 mat_changed = True
@@ -1081,7 +1150,7 @@ def write_bgm(filepath: str, context, options: dict):
                 bl_mat["bgm_v74"] = 0
                 mat_changed = True
             if "bgm_v92" not in bl_mat:
-                bl_mat["bgm_v92"] = 0
+                bl_mat["bgm_v92"] = inf_v92
                 mat_changed = True
 
             if mat_changed:
@@ -1105,7 +1174,9 @@ def write_bgm(filepath: str, context, options: dict):
         all_mat_slots.sort(key=lambda m: get_material_priority(m.name))
 
     for i, bl_mat in enumerate(all_mat_slots):
-        fo2_mat = build_fo2_material(bl_mat, is_fo1=is_fo1, override_light_shader=override_light_shader)
+        fo2_mat = build_fo2_material(bl_mat, is_fo1=is_fo1,
+                                     override_light_shader=override_light_shader,
+                                     game_mode=game_mode)
         bl_mat_to_fo2_id[bl_mat] = i
         fo2_materials.append(fo2_mat)
 
@@ -1302,15 +1373,13 @@ def write_bgm(filepath: str, context, options: dict):
             model_name = re.sub(r'\.\d{3}$', '', obj.name)
             crash_obj = crash_mesh_map.get(model_name)
             if crash_obj and surface_build_info:
-                if auto_triangulate:
-                    crash_work_mesh, crash_is_temp = triangulate_mesh(crash_obj)
-                else:
-                    crash_work_mesh, crash_is_temp = crash_obj.data, False
+                crash_work_mesh, crash_is_temp, crash_how = build_crash_work_mesh(
+                    obj, work_mesh, crash_obj, auto_triangulate)
                 if crash_is_temp:
                     temp_meshes.append(crash_work_mesh)
 
-                # make sure the crash mesh's split (loop) normals are available —
-                # these carry the deformation and are read per-vertex below.
+                # make sure the crash mesh's split (loop) normals are available
+                # these carry the deformation and are read per-vertex
                 if hasattr(crash_work_mesh, 'calc_normals_split'):
                     crash_work_mesh.calc_normals_split()
 
@@ -1321,12 +1390,26 @@ def write_bgm(filepath: str, context, options: dict):
                 base_loop_count  = len(work_mesh.loops)
 
                 # determine lookup strategy:
-                # 1. loop_idx in range -> crash was built from same topology, use loop vertex
-                # 2. bvi in range (same vert count) -> same vertex ordering, direct index
-                # 3. fallback -> keep base position (no crash deformation)
 
-                same_loop_count = (crash_loop_count == base_loop_count)
+                # 1. loop topology identical -> use loop vertex + crash split normal
+                # 2. same vertex count       -> match by vertex index, vertex normal
+                # 3. fallback                -> keep base position (no deformation)
                 same_vert_count = (len(crash_verts) == len(work_mesh.vertices))
+                loops_match = (crash_loop_count == base_loop_count)
+                if loops_match and crash_loop_count:
+                    base_lv  = [0] * base_loop_count
+                    crash_lv = [0] * crash_loop_count
+                    work_mesh.loops.foreach_get("vertex_index", base_lv)
+                    crash_loops.foreach_get("vertex_index", crash_lv)
+                    loops_match = (base_lv == crash_lv)
+
+                if loops_match:
+                    print(f"[BGM Export] crash '{crash_obj.name}': loop-exact match "
+                          f"({crash_loop_count} loops, {crash_how})")
+                elif same_vert_count:
+                    print(f"[BGM Export] NOTE: crash '{crash_obj.name}' does not share loop order with '{obj.name}' (triangulate both meshes the same way to avoid this.)")
+                else:
+                    print(f"[BGM Export] WARNING: crash '{crash_obj.name}' has {len(crash_verts)} vertices but '{obj.name}' has {len(work_mesh.vertices)} -> no correspondence")
 
                 crash_surfaces = []
 
@@ -1341,15 +1424,14 @@ def write_bgm(filepath: str, context, options: dict):
                     for buf_idx, (bvi, loop_idx) in enumerate(blender_vis):
                         off = buf_idx * vsize
 
-                        # crash_nrm_src: deformed normal in Blender space, or None to
-                        # keep the base normal already present in crash_vdata.
+                        # crash_nrm_src: deformed normal in Blender space, or none to keep the base normal already present in crash_vdata
                         crash_nrm_src = None
-                        if same_loop_count and loop_idx < crash_loop_count:
+                        if loops_match:
                             # primary: crash vertex/loop at the same loop position
                             crash_loop = crash_loops[loop_idx]
                             world_co = crash_mat_world @ crash_verts[crash_loop.vertex_index].co
                             crash_nrm_src = crash_loop.normal
-                        elif same_vert_count:
+                        elif same_vert_count and bvi < len(crash_verts):
                             # fallback: same vertex count, assume same ordering
                             world_co = crash_mat_world @ crash_verts[bvi].co
                             crash_nrm_src = crash_verts[bvi].normal
@@ -1400,7 +1482,8 @@ def write_bgm(filepath: str, context, options: dict):
                                 # float normal directly after the 12-byte position
                                 struct.pack_into('<3f', crash_vdata, off + 12, *fo2_cn)
 
-                    crash_surfaces.append((base_vdata, bytes(crash_vdata), vsize, base_vcount))
+                    crash_surfaces.append((base_vdata, bytes(crash_vdata), vsize,
+                                           base_vcount, flags))
 
                 if crash_surfaces:
                     all_crash_data.append((model_name, crash_surfaces))

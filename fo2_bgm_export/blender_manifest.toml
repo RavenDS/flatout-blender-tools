@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "fo2_bgm_export"
-version = "1.6.2"
+version = "1.6.3"
 name = "FlatOut BGM (Export)"
 tagline = "Export FlatOut 1/2/UC Model (body.bgm + crash.dat + body.ini + camera.ini)"
 maintainer = "ravenDS <https://github.com/RavenDS>"
