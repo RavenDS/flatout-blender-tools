@@ -1,7 +1,7 @@
 bl_info = {
     "name":        "FlatOut BGM Export",
     "author":      "ravenDS",
-    "version":     (1, 6, 3),
+    "version":     (1, 6, 4),
     "blender":     (3, 6, 0),
     "location":    "File > Export > FlatOut Car BGM (.bgm)",
     "description": "Export FlatOut 1/2/UC model (BGM) files. Based on reverse-egineering work by Chloe (FlatOutW32BGMTool)",
@@ -94,8 +94,11 @@ MATERIAL_PRIORITIES = {
 
 
 def get_material_priority(name: str) -> int:
-    """Get sort priority for a material name (higher = drawn later)."""
-    return MATERIAL_PRIORITIES.get(name.lower(), 0)
+    """Get sort priority for a material name (higher = drawn later).
+
+    The Blender duplicate suffix is stripped first
+    """
+    return MATERIAL_PRIORITIES.get(re.sub(r'\.\d{3}$', '', name).lower(), 0)
 
 
 # SHADER CONFIG  (from shaders.txt / FixupFBXCarMaterial)
@@ -905,11 +908,25 @@ def _topology_key(mesh):
 
 
 def build_crash_work_mesh(obj, work_mesh, crash_obj, auto_triangulate):
-    """Return (mesh, is_temp, how), crash mesh to sample matching work_mesh."""
+    """Return (mesh, is_temp, how, loop_order_safe) for the crash mesh to sample.
+
+    loop_order_safe says whether loop N of the crash mesh corresponds to loop N of work_mesh. 
+
+    Loop order only breaks when the two meshes are triangulated independently.
+
+    Two cases avoid that:
+
+    * base needed triangulating and the crash mesh is a deformed duplicate
+      -> copy the already-triangulated base and substitute the crash coordinates
+
+    * nothing needed triangulating (imported cars, already all triangles)
+      -> both meshes keep their authored face order
+    """
     crash_mesh = crash_obj.data
+    base_needs_tri = any(len(p.vertices) != 3 for p in obj.data.polygons)
+    crash_needs_tri = any(len(p.vertices) != 3 for p in crash_mesh.polygons)
 
     if auto_triangulate:
-        base_needs_tri = any(len(p.vertices) != 3 for p in obj.data.polygons)
         if base_needs_tri and _topology_key(obj.data) == _topology_key(crash_mesh):
             new_mesh = work_mesh.copy()
             co = [0.0] * (len(crash_mesh.vertices) * 3)
@@ -923,11 +940,13 @@ def build_crash_work_mesh(obj, work_mesh, crash_obj, auto_triangulate):
                 except (RuntimeError, ValueError, TypeError):
                     pass
             new_mesh.update()
-            return new_mesh, True, 'derived from base triangulation'
-        m, t = triangulate_mesh(crash_obj)
-        return m, t, 'independent triangulation'
+            return new_mesh, True, 'derived from base triangulation', True
 
-    return crash_mesh, False, 'no triangulation'
+        if base_needs_tri or crash_needs_tri:
+            m, t = triangulate_mesh(crash_obj)
+            return m, t, 'independent triangulation', False
+
+    return crash_mesh, False, 'no triangulation needed', True
 
 
 def write_crash_dat(filepath: str, crash_data: list, is_fouc: bool = False):
@@ -1192,14 +1211,20 @@ def write_bgm(filepath: str, context, options: dict):
     # crash data: list of (model_name, [(base_vdata, crash_vdata, vsize, vcount), ...])
     all_crash_data = []
 
-    # sort mesh objects by priority (process low-priority materials first)
+    # sort mesh objects by priority (low-priority meshes first, so lights land last)
+    #
+    # Key on the object's HIGHEST-priority material. Keying on the lowest made this
+    # sort a no-op: 331 of the 333 vanilla models that carry a prioritised material
+    # also carry an ordinary priority-0 one, so min() returned 0 for 99% of them and
+    # the object never moved. Measured over the vanilla cars, min() reordered models
+    # in 2 of 107 files; max() reorders 103 of 107.
     if use_priorities:
         def mesh_sort_key(obj):
             prios = []
             for slot in obj.material_slots:
                 if slot.material:
                     prios.append(get_material_priority(slot.material.name))
-            return min(prios) if prios else 0
+            return max(prios) if prios else 0
         mesh_objects.sort(key=mesh_sort_key)
 
     temp_meshes = []  # track temp meshes for cleanup
@@ -1373,8 +1398,8 @@ def write_bgm(filepath: str, context, options: dict):
             model_name = re.sub(r'\.\d{3}$', '', obj.name)
             crash_obj = crash_mesh_map.get(model_name)
             if crash_obj and surface_build_info:
-                crash_work_mesh, crash_is_temp, crash_how = build_crash_work_mesh(
-                    obj, work_mesh, crash_obj, auto_triangulate)
+                crash_work_mesh, crash_is_temp, crash_how, loop_order_safe = \
+                    build_crash_work_mesh(obj, work_mesh, crash_obj, auto_triangulate)
                 if crash_is_temp:
                     temp_meshes.append(crash_work_mesh)
 
@@ -1391,25 +1416,23 @@ def write_bgm(filepath: str, context, options: dict):
 
                 # determine lookup strategy:
 
-                # 1. loop topology identical -> use loop vertex + crash split normal
-                # 2. same vertex count       -> match by vertex index, vertex normal
-                # 3. fallback                -> keep base position (no deformation)
+                # 1. same face order  -> use each mesh's own loop N (best)
+                # 2. same vertex count -> match by vertex index, vertex normal
+                # 3. fallback          -> keep base position (no deformation)
+                #
+                # do NOT require the two loop arrays to hold equal vertex indices
+                # the importer welds base vertices but not crash vertices
                 same_vert_count = (len(crash_verts) == len(work_mesh.vertices))
-                loops_match = (crash_loop_count == base_loop_count)
-                if loops_match and crash_loop_count:
-                    base_lv  = [0] * base_loop_count
-                    crash_lv = [0] * crash_loop_count
-                    work_mesh.loops.foreach_get("vertex_index", base_lv)
-                    crash_loops.foreach_get("vertex_index", crash_lv)
-                    loops_match = (base_lv == crash_lv)
+                loops_match = loop_order_safe and (crash_loop_count == base_loop_count)
 
                 if loops_match:
-                    print(f"[BGM Export] crash '{crash_obj.name}': loop-exact match "
+                    print(f"[BGM Export] crash '{crash_obj.name}': loop match "
                           f"({crash_loop_count} loops, {crash_how})")
                 elif same_vert_count:
-                    print(f"[BGM Export] NOTE: crash '{crash_obj.name}' does not share loop order with '{obj.name}' (triangulate both meshes the same way to avoid this.)")
+                    print(f"[BGM Export] NOTE: crash '{crash_obj.name}' loop order not "
+                          f"usable ({crash_how}) - matching '{obj.name}' by vertex index")
                 else:
-                    print(f"[BGM Export] WARNING: crash '{crash_obj.name}' has {len(crash_verts)} vertices but '{obj.name}' has {len(work_mesh.vertices)} -> no correspondence")
+                    print(f"[BGM Export] WARNING: crash '{crash_obj.name}' has {len(crash_verts)} vertices, '{obj.name}' has {len(work_mesh.vertices)}, loops {crash_loop_count} vs {base_loop_count} ({crash_how}) -> NO correspondence, exporting with no deformation")
 
                 crash_surfaces = []
 
