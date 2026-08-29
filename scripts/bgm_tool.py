@@ -433,6 +433,13 @@ def _find_crash_dat(bgm_path):
     if named and standalone:
         print(f"  crash.dat: found both '{os.path.basename(named)}'"
               f" and '{os.path.basename(standalone)}'.")
+        if not sys.stdin.isatty():
+            # non-interactive (scripted / two-step subprocess): default to the
+            # named file — it is the more specific match, and in the two-step
+            # console path it is the freshly converted crash from step 1
+            print(f"  crash.dat: non-interactive, using named"
+                  f" '{os.path.basename(named)}'")
+            return named, False
         while True:
             ans = input("  Which one to use? [1] named  [2] standalone (crash.dat): ").strip()
             if ans == '1': return named, False
@@ -4421,39 +4428,70 @@ _ALL_TARGETS     = _CONSOLE_TARGETS | _PC_TARGETS
 
 def main():
     args = sys.argv[1:]
-    do_full       = '-full'       in args
-    do_clean      = '-clean'      in args or do_full
-    do_optimize   = '-optimize'   in args or do_full
-    do_menucar    = '-menucar'    in args
-    do_lightorder = '-lightorder' in args
-    do_windflip   = '-windflip'   in args
-    do_lighthacks = '-lighthacks' in args
-    lighthacks_targets = None
-    if do_lighthacks:
-        lh_idx = args.index('-lighthacks')
-        if lh_idx+1<len(args) and not args[lh_idx+1].startswith('-'):
-            lighthacks_targets = set(args[lh_idx+1].split(','))
-    convert_target = None
-    for i,a in enumerate(args):
-        if a=='-convert' and i+1<len(args) and args[i+1].upper() in _ALL_TARGETS:
-            convert_target=args[i+1].upper(); break
-    do_strip = '-strip' in args
-    num_samples = 16
-    if '-samples' in args:
-        idx=args.index('-samples')
-        try: num_samples=int(args[idx+1])
-        except: pass
 
-    flags={'-clean','-optimize','-full','-menucar','-windflip',
-           '-lighthacks','-lightorder','-convert','-strip','-samples',
-           'FO1','FO2','FOUC','PS2','PSP','XBOX',
-           'fo1','fo2','fouc','ps2','psp','xbox'}
-    if lighthacks_targets is not None:
-        lh_idx=args.index('-lighthacks'); flags.add(args[lh_idx+1])
-    if '-samples' in args:
-        idx=args.index('-samples')
-        if idx+1<len(args): flags.add(args[idx+1])
-    pos_args=[a for a in args if a not in flags]
+    # Strict left-to-right argument scanner.  Flag ORDER never affects the
+    # result: operations always run in the fixed pipeline order regardless of
+    # how the flags are written.  Value-taking flags consume their value by
+    # POSITION (never by token content), so filenames can no longer be
+    # swallowed as -lighthacks targets and a stray convert target word can no
+    # longer vanish from the positionals.  Malformed usage is a hard error
+    # instead of a silent behaviour change (previously '-convert -clean FO2'
+    # silently skipped the conversion entirely).
+    _BOOL_FLAGS = {'-clean', '-optimize', '-full', '-menucar', '-windflip',
+                   '-lightorder', '-strip'}
+    seen_flags         = set()
+    pos_args           = []
+    convert_target     = None
+    do_lighthacks      = False
+    lighthacks_targets = None
+    num_samples        = 16
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in _BOOL_FLAGS:
+            seen_flags.add(a); i += 1; continue
+        if a == '-convert':
+            if i+1 < len(args) and args[i+1].upper() in _ALL_TARGETS:
+                convert_target = args[i+1].upper(); i += 2; continue
+            print("ERROR: -convert must be immediately followed by one of: "
+                  "FO1, FO2, FOUC, PS2, PSP, XBOX", file=sys.stderr)
+            sys.exit(1)
+        if a == '-lighthacks':
+            do_lighthacks = True
+            if i+1 < len(args):
+                nxt = args[i+1]; low = nxt.lower()
+                looks_like_file = ('/' in nxt or '\\' in nxt or
+                                   low.endswith('.bgm') or low.endswith('.dat'))
+                if not nxt.startswith('-') and not looks_like_file:
+                    lighthacks_targets = set(nxt.split(',')); i += 2; continue
+            i += 1; continue
+        if a == '-samples':
+            if i+1 < len(args):
+                try:
+                    num_samples = int(args[i+1]); i += 2; continue
+                except ValueError:
+                    pass
+            print("ERROR: -samples must be immediately followed by a number",
+                  file=sys.stderr)
+            sys.exit(1)
+        if a.startswith('-'):
+            print(f"ERROR: unknown flag: {a}", file=sys.stderr)
+            sys.exit(1)
+        pos_args.append(a); i += 1
+
+    do_full       = '-full'       in seen_flags
+    do_clean      = '-clean'      in seen_flags or do_full
+    do_optimize   = '-optimize'   in seen_flags or do_full
+    do_menucar    = '-menucar'    in seen_flags
+    do_lightorder = '-lightorder' in seen_flags
+    do_windflip   = '-windflip'   in seen_flags
+    do_strip      = '-strip'      in seen_flags
+
+    if len(pos_args) > 2:
+        print(f"ERROR: unexpected extra arguments: {' '.join(pos_args[2:])}",
+              file=sys.stderr)
+        sys.exit(1)
+
     any_op=(do_clean or do_optimize or do_menucar or do_windflip or
             do_lighthacks or do_lightorder or convert_target)
 
