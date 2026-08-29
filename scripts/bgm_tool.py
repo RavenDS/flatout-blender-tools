@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FlatOut BGM Tool 2.3.0 — multi-platform BGM converter & optimizer
+FlatOut BGM Tool 2.3.1 — multi-platform BGM converter & optimizer
 https://github.com/RavenDS/flatout-blender-tools
 
 Supported input formats  (auto-detected):
@@ -451,6 +451,81 @@ def _crash_dst_path(output_bgm, is_standalone):
         return os.path.join(os.path.dirname(os.path.abspath(output_bgm)), 'crash.dat')
     return os.path.splitext(output_bgm)[0] + '_crash.dat'
 
+def _tag_surfaces_and_snapshot(surfaces, models):
+    """Tag every surface with a stable '_tag' id and return the original
+    per-model surface tag order  {model_name: [tag, ...]}."""
+    for i, s in enumerate(surfaces):
+        s['_tag'] = i
+    orig = {}
+    for m in models:
+        orig[m['name']] = [surfaces[si]['_tag']
+                           for si in m['surfaces'] if 0 <= si < len(surfaces)]
+    return orig
+
+
+def _tag_index_map(surfaces):
+    """Map tag -> first index in the given surfaces list."""
+    out = {}
+    for i, s in enumerate(surfaces):
+        t = s.get('_tag')
+        if t is not None and t not in out:
+            out[t] = i
+    return out
+
+
+def _sync_crash_to_model_order(crash_path, models, surfaces, orig_model_tags,
+                               is_fouc):
+    """Rewrite each crash node's surface list in the CURRENT model surface
+    order.  Crash surfaces in the file are in the original (source BGM) model
+    order; the game maps them positionally, so after -lightorder / -menucar /
+    -lighthacks the file must be permuted (and extended for duplicates) to
+    match.  No-op when every node is already in order."""
+    if not orig_model_tags:
+        return
+    nodes = _parse_crash_dat(crash_path, is_fouc=is_fouc)
+    model_by_name = {m['name']: m['surfaces'] for m in models}
+
+    changed = False
+    new_nodes = []
+    for node_name, surfs in nodes:
+        base = node_name.replace('_crash', '')
+        cur_ids = model_by_name.get(base)
+        tags    = orig_model_tags.get(base)
+        if cur_ids is None or tags is None:
+            new_nodes.append((node_name, surfs))
+            continue
+        if len(surfs) != len(tags):
+            print(f"  crash.dat: WARNING node '{node_name}' has {len(surfs)}"
+                  f" surfaces but model originally had {len(tags)}"
+                  f" — order left unchanged")
+            new_nodes.append((node_name, surfs))
+            continue
+        tag_to_orig_pos = {t: j for j, t in enumerate(tags)}
+        new_surfs = []
+        ok = True
+        for si in cur_ids:
+            t = surfaces[si].get('_tag') if 0 <= si < len(surfaces) else None
+            j = tag_to_orig_pos.get(t)
+            if j is None:
+                print(f"  crash.dat: WARNING node '{node_name}': surface {si}"
+                      f" has no source crash surface — order left unchanged")
+                ok = False
+                break
+            new_surfs.append(surfs[j])
+        if not ok:
+            new_nodes.append((node_name, surfs))
+            continue
+        if len(new_surfs) != len(surfs) or \
+           any(tag_to_orig_pos.get(surfaces[si].get('_tag')) != p
+               for p, si in enumerate(cur_ids)):
+            changed = True
+        new_nodes.append((node_name, new_surfs))
+
+    if changed:
+        _write_crash_dat(crash_path, new_nodes, is_fouc=is_fouc)
+        print(f"  crash.dat: surfaces re-synced to model order"
+              f"  ({os.path.basename(crash_path)})")
+
 
 def _parse_crash_dat(path, is_fouc=False):
     """Parse a crash.dat file.
@@ -806,7 +881,8 @@ def _convert_xbox_crash_to_pc(xbox_crash_path, output_path, streams, surfaces, m
 def _remap_crash_dat(crash_path, output_bgm, models,
                      surf_seen, surf_vs, surf_original_vc,
                      streams_orig, surfaces_orig,
-                     is_fouc=False, is_standalone=False):
+                     is_fouc=False, is_standalone=False,
+                     orig_model_tags=None):
     """Remap crash.dat vertex arrays to match deduplicated vertex ordering.
 
     FO2 / FO1: remaps both the crash vbuf (vtx) and the 48-byte weight array.
@@ -814,22 +890,31 @@ def _remap_crash_dat(crash_path, output_bgm, models,
     In both cases the vertex-to-new-index lookup uses the original BGM VB data
     (same raw-bytes key used by op_optimize's surf_seen dict).
     is_standalone=True means the source was a bare crash.dat (not <stem>_crash.dat).
+    orig_model_tags (when given) maps crash surface j to the correct surface
+    via stable '_tag' ids, so the mapping survives -lightorder / -menucar
+    reordering of the model surface lists.
     """
 
     crash_nodes    = _parse_crash_dat(crash_path, is_fouc=is_fouc)
     model_by_name  = {m['name']: m['surfaces'] for m in models}
     wgt_size       = 40 if is_fouc else 48
+    tag_to_idx     = _tag_index_map(surfaces_orig) if orig_model_tags else None
 
     new_nodes = []
     for node_name, surfs in crash_nodes:
         base = node_name.replace('_crash', '')
-        if base not in model_by_name:
+        if tag_to_idx is not None and base in orig_model_tags:
+            # tag-based lookup: crash surf j ↔ surface whose tag is the j-th
+            # entry of the model's ORIGINAL surface order
+            bgm_surf_ids = [tag_to_idx.get(t, -1) for t in orig_model_tags[base]]
+        elif base in model_by_name:
+            bgm_surf_ids = model_by_name[base]
+        else:
             print(f"  crash.dat: WARNING node '{node_name}' → model '{base}'"
                   f" not found, kept unchanged")
             new_nodes.append((node_name, surfs))
             continue
 
-        bgm_surf_ids = model_by_name[base]
         new_surfs = []
 
         for j, crash_surf in enumerate(surfs):
@@ -840,7 +925,7 @@ def _remap_crash_dat(crash_path, output_bgm, models,
                 continue
 
             si = bgm_surf_ids[j]
-            if si not in surf_seen:
+            if si < 0 or si not in surf_seen:
                 new_surfs.append(crash_surf)
                 continue
 
@@ -1854,7 +1939,8 @@ def _remap_shaders(materials_raw, src_is_fouc, src_is_fo1,
 def _convert_crash_dat_file(crash_path, output_path,
                              src_is_fouc, dst_is_fouc,
                              surfaces, streams_src, streams_dst,
-                             models=None, surfaces_dst=None):
+                             models=None, surfaces_dst=None,
+                             orig_model_tags=None):
     """Convert a crash.dat file between FO2/FO1 and FOUC formats.
 
     FO2/FO1 crash surface:
@@ -1883,6 +1969,10 @@ def _convert_crash_dat_file(crash_path, output_path,
         for m in models:
             model_surf_map[m['name']] = m['surfaces']
 
+    # tag-based lookup
+    tag_pre = _tag_index_map(surfaces)     if orig_model_tags else None
+    tag_dst = _tag_index_map(surfaces_dst) if (orig_model_tags and surfaces_dst is not None) else None
+
     def _enc_nrm(v):
         return max(0, min(255, int(round((v + 1.0) * 127.0))))
 
@@ -1893,6 +1983,7 @@ def _convert_crash_dat_file(crash_path, output_path,
         new_surfs = []
         base_name = node_name.replace('_crash', '')
         model_surf_ids = model_surf_map.get(base_name)
+        node_tags = orig_model_tags.get(base_name) if orig_model_tags else None
 
         for j, crash_surf in enumerate(surfs):
             if src_is_fouc and not dst_is_fouc:
@@ -1901,7 +1992,11 @@ def _convert_crash_dat_file(crash_path, output_path,
                 # surface lookup: prefer model-name-based lookup so each crash surface maps 
                 # to the correct BGM surface (fixes wrong vtx slice / wrong vs).
                 bgm_surf = None
-                if model_surf_ids is not None and j < len(model_surf_ids):
+                if node_tags is not None and tag_pre is not None and j < len(node_tags):
+                    surf_id = tag_pre.get(node_tags[j], -1)
+                    if 0 <= surf_id < len(surfaces):
+                        bgm_surf = surfaces[surf_id]
+                elif model_surf_ids is not None and j < len(model_surf_ids):
                     surf_id = model_surf_ids[j]
                     if surf_id < len(surfaces):
                         bgm_surf = surfaces[surf_id]
@@ -1915,7 +2010,11 @@ def _convert_crash_dat_file(crash_path, output_path,
                 # wrong after per-surface VB conversion where each surface owns its stream.
                 bgm_surf_dst = None
                 if surfaces_dst is not None:
-                    if model_surf_ids is not None and j < len(model_surf_ids):
+                    if node_tags is not None and tag_dst is not None and j < len(node_tags):
+                        sid_dst = tag_dst.get(node_tags[j], -1)
+                        if 0 <= sid_dst < len(surfaces_dst):
+                            bgm_surf_dst = surfaces_dst[sid_dst]
+                    elif model_surf_ids is not None and j < len(model_surf_ids):
                         sid_dst = model_surf_ids[j]
                         if sid_dst < len(surfaces_dst):
                             bgm_surf_dst = surfaces_dst[sid_dst]
@@ -1953,6 +2052,13 @@ def _convert_crash_dat_file(crash_path, output_path,
                     cnf = ((cn[2]/127.0)-1.0, (cn[1]/127.0)-1.0, (cn[0]/127.0)-1.0)
                     new_wgt += struct.pack('<12f', *bpf, *cpf, *bnf, *cnf)
 
+                # self-check: crash vertex count must match the destination
+                # surface's vertex count or the game skips/misapplies deformation
+                if bgm_surf_dst is not None and nv != bgm_surf_dst['vc']:
+                    print(f"  crash.dat: WARNING {node_name} surf {j}: "
+                          f"{nv} crash verts vs {bgm_surf_dst['vc']} surface verts "
+                          f"— deformation will not work for this surface")
+
                 new_surfs.append({'vtx': vtx, 'wgt': bytes(new_wgt), 'vs': dst_vs})
 
             else:
@@ -1985,7 +2091,8 @@ def _convert_crash_dat_file(crash_path, output_path,
                     else:
                         uvi = (0, 0)
 
-                    new_wgt += struct.pack('<3h3h4B4B4B4B4B4B2H',
+                    # UVs packed as signed int16 ('2h')
+                    new_wgt += struct.pack('<3h3h4B4B4B4B4B4B2h',
                         *bpi, *cpi,
                         128, 128, 128, 255,   # baseUnkBump1 (neutral tangent)
                         128, 128, 128, 255,   # crashUnkBump1
@@ -4471,6 +4578,9 @@ def main():
 
     # ── PATH B: PC input (FO1 / FO2 / FOUC) ──
     version,materials_raw,streams,surfaces,models,meshes,objects,is_fouc,is_fo1=parse_bgm(inp)
+    # tag surfaces with stable ids + snapshot original per-model surface order,
+    # so crash.dat correspondence survives -lightorder / -menucar / -lighthacks
+    orig_model_tags=_tag_surfaces_and_snapshot(surfaces,models)
     if is_fouc:  ver_label='FOUC'
     elif is_fo1: ver_label=f'FO1 (0x{version:X})'
     else:        ver_label='FO2'
@@ -4581,7 +4691,8 @@ def main():
         if src_is_fouc!=dst_is_fouc:
             tmp_bgm=out+'.__tmp__'
             _remap_crash_dat(crash_src,tmp_bgm,models,*opt_crash_info,
-                             is_fouc=src_is_fouc,is_standalone=crash_standalone)
+                             is_fouc=src_is_fouc,is_standalone=crash_standalone,
+                             orig_model_tags=orig_model_tags)
             # Use a fixed suffix for the temp crash so it never collides with
             # dst_crash (_crash_dst_path strips '.__tmp__' as an extension
             # when the output path has no .bgm extension).
@@ -4594,42 +4705,33 @@ def main():
                   f"({'FOUC→FO2/FO1' if src_is_fouc else 'FO2/FO1→FOUC'}) ...")
             _convert_crash_dat_file(tmp_crash,dst_crash,src_is_fouc,dst_is_fouc,
                                      surfaces_pre_convert,streams_pre_convert,streams,
-                                     models=models,surfaces_dst=surfaces)
+                                     models=models,surfaces_dst=surfaces,
+                                     orig_model_tags=orig_model_tags)
             if os.path.exists(tmp_crash): os.remove(tmp_crash)
             if os.path.exists(tmp_bgm):   os.remove(tmp_bgm)
             print(f"  crash.dat: done → {os.path.getsize(dst_crash):,} B  ({os.path.basename(dst_crash)})")
         else:
             _remap_crash_dat(crash_src,out,models,*opt_crash_info,
-                             is_fouc=src_is_fouc,is_standalone=crash_standalone)
+                             is_fouc=src_is_fouc,is_standalone=crash_standalone,
+                             orig_model_tags=orig_model_tags)
     elif convert_target and src_is_fouc!=dst_is_fouc:
         dst_crash=_crash_dst_path(out,crash_standalone)
         print(f"  crash.dat: converting format "
               f"({'FOUC→FO2/FO1' if src_is_fouc else 'FO2/FO1→FOUC'}) ...")
         _convert_crash_dat_file(crash_src,dst_crash,src_is_fouc,dst_is_fouc,
                                  surfaces_pre_convert,streams_pre_convert,streams,
-                                 models=models,surfaces_dst=surfaces)
+                                 models=models,surfaces_dst=surfaces,
+                                 orig_model_tags=orig_model_tags)
         print(f"  crash.dat: {os.path.getsize(crash_src):,} B → {os.path.getsize(dst_crash):,} B  ({os.path.basename(dst_crash)})")
     else:
         _copy_crash_dat(inp,out)
 
-    if do_lighthacks and b_dupe_map and crash_src:
+    # re-sync crash.dat surface order to the final model surface lists
+    if crash_src:
         dst_crash=_crash_dst_path(out,crash_standalone)
-        if not os.path.exists(dst_crash): shutil.copy2(crash_src,dst_crash)
-        crash_nodes=_parse_crash_dat(dst_crash,is_fouc=dst_is_fouc)
-        crash_node_idx={}
-        for ni,(node_name,_) in enumerate(crash_nodes):
-            crash_node_idx[node_name.replace('_crash','')]=ni
-        import copy as _copy2; patched=0
-        for model_name,orig_pos in b_dupe_map:
-            ni=crash_node_idx.get(model_name)
-            if ni is None: continue
-            node_name,crash_surfs=crash_nodes[ni]
-            if orig_pos<len(crash_surfs):
-                crash_surfs.append(_copy2.copy(crash_surfs[orig_pos]))
-                crash_nodes[ni]=(node_name,crash_surfs); patched+=1
-        if patched:
-            _write_crash_dat(dst_crash,crash_nodes,is_fouc=dst_is_fouc)
-            print(f"  crash.dat: mirrored {patched} _b duplicate(s) ({os.path.basename(dst_crash)})")
+        if os.path.exists(dst_crash):
+            _sync_crash_to_model_order(dst_crash,models,surfaces,
+                                       orig_model_tags,dst_is_fouc)
     print("\nDone!")
 
 
