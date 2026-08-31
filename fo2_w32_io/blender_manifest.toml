@@ -1,0 +1,15 @@
+schema_version = "1.0.0"
+
+id = "io_scene_fo2_w32"
+version = "1.0.0"
+name = "FlatOut 2 Track (W32)"
+tagline = "Import/Export FlatOut 2 track geometry (*.w32) + companion files"
+maintainer = "ravenDS <https://github.com/RavenDS>"
+type = "add-on"
+
+website = "https://github.com/RavenDS/flatout-blender-tools"
+tags = ["Import-Export"]
+
+blender_version_min = "4.2.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
