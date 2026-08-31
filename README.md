@@ -21,6 +21,7 @@ A collection of Blender Add-Ons &amp; Python scripts for **FlatOut 1/2/Ultimate 
 
 ## Standalone Tools
 * **[PS2TexTool](tools/PS2TexTool.exe):** GUI to easily import **.dds** into PS2 **.tm2** and PSP **.tex** skin files
+* **[FO2db](tools/FO2db.exe):** Improved database tool with drag-n-drop, hybrid data support (.foj + .h), and more
 
 ## Legacy Tools
 _These tools are provided for convenience and won't be updated_
