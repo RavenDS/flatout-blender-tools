@@ -5,6 +5,7 @@ A collection of Blender Add-Ons &amp; Python scripts for **FlatOut 1/2/Ultimate 
 * **fo2_bgm_import:** Import **FO1/FO2/FOUC** _.bgm_ + additional files (_crash.dat_, _body.ini_, _camera.ini_, _bones.ini_)
 * **fo2_bgm_export:** Export **FO1/FO2/FOUC** _.bgm_ + additional files (_crash.dat_, _body.ini_, _camera.ini_, _bones.ini_)
 * **fo2_bgm_hierarchy:** Reorganize a blender scene into the fo2_bgm_export structure
+* **fo2_w32_io:** Import/Export **.w32** geometry + additional files (**FO2 only**)
 * **fo2_bsa_io:** Import/Export **.bsa** driver animations
 * **fo2_trackai_import:** Import FO2 _trackai.bin_ + additional files (_splines.ai_, _startpoints.bed_, _splitpoints.bed_)
 * **fo2_trackai_export:** Export FO2 _trackai.bin_ + additional files (_splines.ai_, _startpoints.bed_, _splitpoints.bed_)
