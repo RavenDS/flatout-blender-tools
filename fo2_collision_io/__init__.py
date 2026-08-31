@@ -49,6 +49,14 @@ MAX_LEAF_TRIANGLES = (1 << LEAF_TRIANGLE_COUNT_BITS) - 1  # 127 (format max)
 TARGET_LEAF_TRIANGLES = 10  # (leaves up to 10 tris, could be edited)
 
 SHADOWMAP_SIZE = 512
+# Fixed world placement of the shadowmap, hardcoded in FlatOut2.exe (the
+# shadow grid struct at 0x4B3BC9 is initialized with min=-1000, max=+1000 on
+# both world X and Z). The shadowmap ALWAYS covers [-1000,+1000] m centered
+# on the origin, independent of the track's collision extent. (Earlier code
+# placed the preview plane at +/-symmetric_extent, which only looked right
+# because vanilla tracks happen to fill roughly that window.)
+SHADOWMAP_WORLD_MIN = -1000.0
+SHADOWMAP_WORLD_MAX = 1000.0
 
 FO2_SURFACE_NAMES = [
     "NoCollision", "Tarmac", "Tarmac_Mark", "Asphalt", "Asphalt_Mark",
@@ -84,6 +92,46 @@ def _surface_category(sid):
 def _surface_name(sid):
     i = sid - 1
     return FO2_SURFACE_NAMES[i] if 0 <= i < len(FO2_SURFACE_NAMES) else f"Unknown_{sid}"
+
+
+# ── Leaf bitmask semantics (reverse-engineered) ─────────────────────────────
+# The 4-bit leaf bitmask selects which QUERY TYPES a triangle participates in.
+# Confirmed by a controlled cross-track survey (1.75M triangles, 48 CDB files)
+# using the special surfaces as ground truth:
+#   No_Camera_Col (42)   -> 0001   Camera_Only_Col (43) -> 0010
+#   Tree (36)            -> 0001   (camera clips through foliage)
+#   Water (39)           -> 0110   (car drives through, camera blocked)
+#   shadowed ground      -> 1011 vs unshadowed variants 0011
+#   bit 0 (1): collides with the CAR (physics)
+#   bit 1 (2): collides with the CAMERA
+#   bit 2 (4): WATER / liquid surface
+#   bit 3 (8): SHADOWMAPPED (samples shadowmap_w2.dat via shadow UVs)
+# These are exposed as human-readable object properties:
+#   fo2_collide_car / fo2_collide_camera / fo2_is_water / fo2_has_shadow
+# which take priority over the raw fo2_bitmask on export.
+BITMASK_BOOL_PROPS = (
+    ("fo2_collide_car",    1),
+    ("fo2_collide_camera", 2),
+    ("fo2_is_water",       4),
+    ("fo2_has_shadow",     8),
+)
+
+
+def _bitmask_to_bool_props(obj, bitmask):
+    """Write the human-readable boolean properties for a bitmask."""
+    for prop, bit in BITMASK_BOOL_PROPS:
+        obj[prop] = bool(bitmask & bit)
+
+
+def _bool_props_to_bitmask(obj, base):
+    """Overlay any present boolean properties onto a base bitmask."""
+    bm = int(base)
+    for prop, bit in BITMASK_BOOL_PROPS:
+        v = obj.get(prop)
+        if v is None:
+            continue
+        bm = (bm | bit) if v else (bm & ~bit)
+    return bm
 
 
 def _ones(n):
@@ -446,7 +494,14 @@ def build_collision_mesh(cdb, collection, group_by_material=True):
         obj["fo2_surface_id"] = surface_id
         obj["fo2_lo_flags"] = lo_flags
         obj["fo2_hi_flags"] = hi_flags
-        obj["fo2_bitmask"] = bitmask
+        # the human-readable booleans ARE the bitmask (bit0=car, bit1=camera,
+        # bit2=water, bit3=shadow); no raw fo2_bitmask is stored anymore.
+        # fo2_has_shadow above is set from actual shadow-UV presence, which
+        # matches bit 3 in vanilla data; force-sync it to the bitmask here
+        obj["fo2_has_shadow"] = bool(bitmask & 8)
+        obj["fo2_collide_car"] = bool(bitmask & 1)
+        obj["fo2_collide_camera"] = bool(bitmask & 2)
+        obj["fo2_is_water"] = bool(bitmask & 4)
 
         if needs_subcol:
             if surface_id not in sub_collections:
@@ -482,10 +537,12 @@ def load_shadowmap(filepath, header, collection):
     img.pack()
     img.update()
 
-    ext = header.symmetric_extent
-    half_x, half_z = ext[0], ext[2]
-    verts = [(-half_x, -half_z, 0), (half_x, -half_z, 0),
-             (half_x, half_z, 0), (-half_x, half_z, 0)]
+    # FIXED world window (see SHADOWMAP_WORLD_* above): the shadowmap always
+    # spans [-1000,+1000] on world X and Z, so the preview plane is the same
+    # square for every track, regardless of collision extent.
+    mn, mx = SHADOWMAP_WORLD_MIN, SHADOWMAP_WORLD_MAX
+    verts = [(mn, mn, 0), (mx, mn, 0),
+             (mx, mx, 0), (mn, mx, 0)]
     faces = [(0, 1, 2, 3)]
 
     mesh = bpy.data.meshes.new("shadowmap_plane")
@@ -510,7 +567,12 @@ def load_shadowmap(filepath, header, collection):
     mesh.materials.append(mat)
 
     obj = bpy.data.objects.new("shadowmap", mesh)
-    obj.location.z = header.mins[1] * header.axis_multipliers[1]
+    # world-origin plane; game samples purely by world X/Z so Z is cosmetic.
+    # sit slightly below the lowest geometry so it doesn't z-fight the ground
+    try:
+        obj.location.z = header.mins[1] * header.axis_multipliers[1]
+    except Exception:
+        obj.location.z = 0.0
     collection.objects.link(obj)
     # store shadowmap source path
     collection["fo2_shadowmap_path"] = filepath
@@ -618,8 +680,10 @@ def _get_collision_flags(obj, mat):
     hi = obj.get("fo2_hi_flags")
     bm = obj.get("fo2_bitmask")
 
-    if sid is not None and lo is not None and hi is not None and bm is not None:
-        return int(sid), int(lo), int(hi), int(bm)
+    if sid is not None and lo is not None and hi is not None:
+        # bitmask composed from the readable booleans; legacy fo2_bitmask
+        # (older scenes) serves as the base for any missing booleans
+        return int(sid), int(lo), int(hi), _bool_props_to_bitmask(obj, bm if bm is not None else 0x3)
 
     # Derive missing bitmask from fo2_has_shadow or surface_id
     if bm is None:
@@ -630,6 +694,7 @@ def _get_collision_flags(obj, mat):
             bm = _DEFAULT_BITMASK.get(int(sid), 0x3)
         else:
             bm = 0x3
+    bm = _bool_props_to_bitmask(obj, bm)
 
     return (
         int(sid) if sid is not None else 27,
@@ -767,11 +832,27 @@ def _collect_export_triangles(meshes, inv_mult):
                     if vi not in vert_shadow:
                         vert_shadow[vi] = "skip"
 
+        # optional per-face lo_flags baked by the W32 organizer. Bit k marks
+        # FILE edge k as concave; convex edges must stay clear (verified
+        # against vanilla: convex 0.0-0.2% set, concave 95-100% set).
+        lo_attr = None
+        try:
+            a = tri_mesh.attributes.get("fo2_lo_flags")
+            if a is not None and getattr(a, 'domain', '') == 'FACE':
+                lo_attr = a.data
+        except Exception:
+            lo_attr = None
+
         for poly in tri_mesh.polygons:
             if len(poly.vertices) != 3:
                 continue
             mat = tri_mesh.materials[poly.material_index] if tri_mesh.materials else None
             sid, lo_flags, hi_flags, bitmask = _get_collision_flags(obj, mat)
+            if lo_attr is not None:
+                try:
+                    lo_flags = int(lo_attr[poly.index].value) & 0x3F
+                except Exception:
+                    pass
 
             sverts = []
             seq_indices = []
@@ -832,10 +913,13 @@ def _collect_export_triangles(meshes, inv_mult):
         if needs_triangulate:
             bpy.data.meshes.remove(tri_mesh)
 
-        # Write all computed properties back to object
+        # Write all computed properties back to object (booleans only - the
+        # readable flags ARE the bitmask)
         obj["fo2_surface_id"] = sid
         obj["fo2_lo_flags"] = lo_flags
-        obj["fo2_bitmask"] = bitmask
+        obj["fo2_collide_car"] = bool(bitmask & 1)
+        obj["fo2_collide_camera"] = bool(bitmask & 2)
+        obj["fo2_is_water"] = bool(bitmask & 4)
         if obj.get("fo2_has_shadow") is None:
             obj["fo2_has_shadow"] = bool(bitmask & 8)
 
@@ -1398,6 +1482,43 @@ class FO2_OT_ExportCollision(bpy.types.Operator):
                     "Disable only for completely new collision meshes without a shadowmap",
         default=True)
 
+    export_shadowmap_dat: bpy.props.BoolProperty(
+        name="Export shadowmap_w2.dat",
+        description="Write the shadowmap generated by 'W32: Apply ShadowMap' "
+                    "(scene raw data, or the fo2_shadowmap image) as "
+                    "shadowmap_w2.dat next to the exported cdb. Copy it into "
+                    "the track's lighting/ folder",
+        default=False)
+
+    def _write_shadowmap(self, context):
+        out = os.path.join(os.path.dirname(self.filepath), "shadowmap_w2.dat")
+        # authoritative source: raw bytes stored by W32: Apply ShadowMap
+        hx = context.scene.get("fo2_shadowmap_hex")
+        if hx:
+            try:
+                data = bytes.fromhex(str(hx))
+                if len(data) == SHADOWMAP_SIZE * SHADOWMAP_SIZE:
+                    with open(out, "wb") as f:
+                        f.write(data)
+                    self.report({'INFO'}, f"Wrote {out}")
+                    return True
+            except Exception as e:
+                self.report({'WARNING'}, f"Scene shadowmap data invalid: {e}")
+        # fallback: the image datablock
+        img = bpy.data.images.get("fo2_shadowmap")
+        if img is None:
+            for i in bpy.data.images:
+                if i.name.endswith("shadowmap_w2.dat"):
+                    img = i
+                    break
+        if img is not None and export_shadowmap(out, img):
+            self.report({'INFO'}, f"Wrote {out}")
+            return True
+        self.report({'WARNING'}, "No shadowmap found - run 'W32: Apply "
+                                 "ShadowMap' first (shadowmap_w2.dat not "
+                                 "written)")
+        return False
+
     def execute(self, context):
         try:
             sm_path = ""
@@ -1413,6 +1534,8 @@ class FO2_OT_ExportCollision(bpy.types.Operator):
                              self.preserve_multipliers, sm_path)
             if not ok:
                 return {'CANCELLED'}
+            if self.export_shadowmap_dat:
+                self._write_shadowmap(context)
 
         except RuntimeError as e:
             self.report({'ERROR'}, str(e))
