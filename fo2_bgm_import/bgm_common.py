@@ -1168,19 +1168,20 @@ def build_blender_meshes(context, parser: BGMParser, options: dict):
         mat_index_map = {}  # bgm mat id -> local mesh mat index
         mesh_materials = []  # ordered list of blender materials for this mesh
 
-        # two level vertex deduplication to eliminate seam creases when merging surfaces:
+        # vertex deduplication to eliminate seam creases when merging surfaces:
+        # dedup by (stream_id, absolute_vb_index): surfaces that share the same
+        # physical VB data (same stream, same index) always get the same Blender vertex.
         #
-        # 1 — by (stream_id, absolute_vb_index): surfaces that share the same
-        #   physical VB data (same stream, same index) always get the same Blender vertex.
+        # From selo's edit:
+        # Preserve source vertex identity. Reuse a Blender vertex only when two
+        # surfaces reference the exact same physical vertex-buffer entry. Distinct
+        # VB entries must remain distinct even when their decoded position and normal
+        # are identical: they may represent intentional seams, overlapping geometry,
+        # or separate vertices which happen to occupy the same point in space.
         #
-        # 2 — by (decoded_position, decoded_normal): surfaces that DON'T share VB
-        #   indices but have vertices at the same 3D position with the same normal (i.e.
-        #   seam boundary vertices duplicated into separate VB regions) are also merged.
-        #   Vertices at the same position with DIFFERENT normals are kept separate — those
-        #   represent intentional hard edges.
-
+        # Do not weld by decoded values here. Besides erasing that identity, rounded
+        # position/normal keys can merge merely-near vertices and can collapse faces.
         abs_stream_idx_to_vert = {}   # (stream_id, abs_vb_idx) -> bl_vi
-        pos_nrm_to_vert       = {}    # (pos_key, nrm_key)       -> bl_vi
 
         for surf in surfaces:
             vb = parser.vertex_buffers[surf.stream_id[0]]
@@ -1209,28 +1210,15 @@ def build_blender_meshes(context, parser: BGMParser, options: dict):
 
             local_to_blender = {}  # local surface vert index -> index in all_verts
             for vi, v in enumerate(verts):
-                # level 1: exact VB index match
+                # exact VB index match only
                 abs_key = (surf.stream_id[0], base_vertex_offset + vi)
                 if abs_key in abs_stream_idx_to_vert:
                     local_to_blender[vi] = abs_stream_idx_to_vert[abs_key]
                     continue
 
-                # level 2: same decoded position + same decoded normal
-                # use raw float values rounded to avoid fp noise; 
-                # normal as 3-tuple of rounded floats so quantization doesn't prevent matching.
-                nrm_key = (round(v.nx, 4), round(v.ny, 4), round(v.nz, 4))                           if has_normals else None
-                pos_key = (round(v.x, 6), round(v.y, 6), round(v.z, 6))
-                pn_key  = (pos_key, nrm_key)
-                if pn_key in pos_nrm_to_vert:
-                    bl_vi = pos_nrm_to_vert[pn_key]
-                    abs_stream_idx_to_vert[abs_key] = bl_vi
-                    local_to_blender[vi] = bl_vi
-                    continue
-
                 # New vertex
                 bl_vi = len(all_verts)
                 abs_stream_idx_to_vert[abs_key] = bl_vi
-                pos_nrm_to_vert[pn_key]         = bl_vi
                 local_to_blender[vi]            = bl_vi
 
                 pos = Vector((v.x, v.y, v.z))
