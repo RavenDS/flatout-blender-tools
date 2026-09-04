@@ -1,7 +1,7 @@
 bl_info = {
     "name":        "FlatOut 2 TrackAI Exporter",
-    "author":      "ravenDS (github.com/ravenDS)",
-    "version":     (2, 3, 1),
+    "author":      "ravenDS, additional edits by Cryptid",
+    "version":     (2, 3, 2),
     "blender":     (3, 6, 0),
     "location":    "File > Export > FlatOut 2 TrackAI (.bin)",
     "description": "Export FlatOut 2 AI path data (trackai.bin + .bed)",
@@ -293,12 +293,115 @@ def _discover_section_collections(root_col):
     return [(child.name.replace("TrackAI_", "", 1), child) for _, child in found]
 
 
+def _ordered_open_ribbon_rows(ribbon_obj):
+    """Return ordered (left_vertex, right_vertex) rows for an open quad strip.
+
+    Blender mesh edits do not preserve the importer's alternating vertex-index
+    convention. Follow shared quad edges instead, then keep each side
+    continuous by choosing the orientation with the shortest rail-to-rail
+    movement. Non-strip or closed topology returns None so callers can retain
+    the legacy index-pair fallback.
+    """
+    mesh = ribbon_obj.data
+    polygons = list(mesh.polygons)
+    if len(polygons) < 2 or any(len(poly.vertices) != 4
+                                for poly in polygons):
+        return None
+
+    face_edges = []
+    edge_faces = {}
+    for face_index, poly in enumerate(polygons):
+        vertices = list(poly.vertices)
+        edges = []
+        for i, vertex in enumerate(vertices):
+            edge = tuple(sorted((vertex, vertices[(i + 1) % 4])))
+            edges.append(edge)
+            edge_faces.setdefault(edge, []).append(face_index)
+        face_edges.append(edges)
+
+    adjacency = [set() for _ in polygons]
+    for users in edge_faces.values():
+        if len(users) == 2:
+            a, b = users
+            adjacency[a].add(b)
+            adjacency[b].add(a)
+        elif len(users) > 2:
+            return None
+
+    endpoints = [i for i, neighbours in enumerate(adjacency)
+                 if len(neighbours) == 1]
+    if len(endpoints) != 2 or any(len(neighbours) not in (1, 2)
+                                  for neighbours in adjacency):
+        return None
+
+    def shared_edge(face_a, face_b):
+        common = set(face_edges[face_a]).intersection(face_edges[face_b])
+        return next(iter(common)) if len(common) == 1 else None
+
+    def terminal_edge(face_index, inner_edge):
+        opposite = [edge for edge in face_edges[face_index]
+                    if not set(edge).intersection(inner_edge)]
+        return opposite[0] if len(opposite) == 1 else None
+
+    def endpoint_key(face_index):
+        neighbour = next(iter(adjacency[face_index]))
+        inner = shared_edge(face_index, neighbour)
+        terminal = terminal_edge(face_index, inner) if inner else None
+        return min(terminal) if terminal else len(mesh.vertices)
+
+    current = min(endpoints, key=endpoint_key)
+    ordered_faces = []
+    previous = None
+    while current is not None:
+        ordered_faces.append(current)
+        following = [index for index in adjacency[current]
+                     if index != previous]
+        if len(following) > 1:
+            return None
+        previous, current = current, (following[0] if following else None)
+    if len(ordered_faces) != len(polygons):
+        return None
+
+    first_shared = shared_edge(ordered_faces[0], ordered_faces[1])
+    last_shared = shared_edge(ordered_faces[-2], ordered_faces[-1])
+    first_row = terminal_edge(ordered_faces[0], first_shared)
+    last_row = terminal_edge(ordered_faces[-1], last_shared)
+    if first_row is None or last_row is None:
+        return None
+
+    unordered_rows = [first_row]
+    for i in range(len(ordered_faces) - 1):
+        row = shared_edge(ordered_faces[i], ordered_faces[i + 1])
+        if row is None:
+            return None
+        unordered_rows.append(row)
+    unordered_rows.append(last_row)
+
+    world = [ribbon_obj.matrix_world @ vertex.co
+             for vertex in mesh.vertices]
+    first = unordered_rows[0]
+    left = min(first)
+    right = first[1] if first[0] == left else first[0]
+    rows = [(left, right)]
+    for a, b in unordered_rows[1:]:
+        direct = ((world[left] - world[a]).length_squared
+                  + (world[right] - world[b]).length_squared)
+        crossed = ((world[left] - world[b]).length_squared
+                   + (world[right] - world[a]).length_squared)
+        if crossed < direct:
+            a, b = b, a
+        rows.append((a, b))
+        left, right = a, b
+    return rows
+
+
 def _extract_boundaries_from_ribbon(sec_col):
     """Derive left/right boundary point lists from a section's Ribbon mesh.
 
-    The Ribbon is expected to follow the importer's convention: alternating
-    left/right vertices in file order (v[0]=left[0], v[1]=right[0],
-    v[2]=left[1], v[3]=right[1], ...).
+    Open quad ribbons are read from their face topology, which remains valid
+    after extrusion/subdivision even when Blender changes vertex numbering.
+    Other topology falls back to the importer's alternating convention:
+    v[0]=left[0], v[1]=right[0], v[2]=left[1], v[3]=right[1], ...
 
     Handles odd-length vertex lists by trimming the trailing unpaired vertex,
     which is the common failure mode when a user post-edits the ribbon
@@ -318,6 +421,8 @@ def _extract_boundaries_from_ribbon(sec_col):
         print(f"[TrackAI Export] '{sec_col.name}': '{ribbon_obj.name}' is "
               f"not a MESH (type={ribbon_obj.type}); cannot use as ribbon")
         return None, None
+    if ribbon_obj.mode == 'EDIT':
+        ribbon_obj.update_from_editmode()
     verts = ribbon_obj.data.vertices
     n_verts = len(verts)
     if n_verts < 4:
@@ -337,12 +442,21 @@ def _extract_boundaries_from_ribbon(sec_col):
               f"(pairing may be slightly off — inspect the mesh if the "
               f"generated boundaries look wrong)")
         n_verts -= 1
+    rows = _ordered_open_ribbon_rows(ribbon_obj)
+    if rows is not None:
+        print(f"[TrackAI Export] '{sec_col.name}': reading Ribbon as an "
+              f"open quad strip ({len(rows)} rows)")
+    else:
+        rows = [(i, i + 1) for i in range(0, n_verts, 2)]
+        print(f"[TrackAI Export] '{sec_col.name}': Ribbon is not an open "
+              f"quad strip; using alternating vertex indices")
+
     lefts = []
     rights = []
     mw = ribbon_obj.matrix_world
-    for i in range(0, n_verts, 2):
-        left_world = mw @ verts[i].co
-        right_world = mw @ verts[i + 1].co
+    for left_index, right_index in rows:
+        left_world = mw @ verts[left_index].co
+        right_world = mw @ verts[right_index].co
         lefts.append(blender_to_fo2(left_world))
         rights.append(blender_to_fo2(right_world))
     return lefts, rights
@@ -800,6 +914,72 @@ def compute_forward(centers, i, n, is_closed):
     return normalize(d)
 
 
+def _nearest_route_segment(point, route, is_closed):
+    """Return the nearest route segment index and interpolation factor."""
+    n = len(route)
+    segment_count = n if is_closed else n - 1
+    best = None
+    for i in range(max(0, segment_count)):
+        a = route[i]
+        b = route[(i + 1) % n]
+        ab = vec_sub(b, a)
+        length_sq = ab[0]*ab[0] + ab[1]*ab[1] + ab[2]*ab[2]
+        if length_sq < 1e-12:
+            continue
+        ap = vec_sub(point, a)
+        t = (ap[0]*ab[0] + ap[1]*ab[1] + ap[2]*ab[2]) / length_sq
+        t = max(0.0, min(1.0, t))
+        projected = vec_add(a, vec_scale(ab, t))
+        distance = vec_dist(point, projected)
+        candidate = (distance, i, t)
+        if best is None or candidate[0] < best[0] - 1e-7:
+            best = candidate
+    return None if best is None else (best[1], best[2], best[0])
+
+
+def _infer_path0_branch_refs(main_centers, branch_centers,
+                             main_is_closed=True):
+    """Infer an open branch's incoming/outgoing Path0 sequence links.
+
+    FlatOut treats these as departure/continuation links: the branch starts
+    after its nearest Path0 segment and rejoins at the node following its
+    nearest final Path0 segment.
+    """
+    if len(main_centers) < 2 or len(branch_centers) < 2:
+        return None, None
+    start_hit = _nearest_route_segment(
+        branch_centers[0], main_centers, main_is_closed)
+    end_hit = _nearest_route_segment(
+        branch_centers[-1], main_centers, main_is_closed)
+    if start_hit is None or end_hit is None:
+        return None, None
+
+    prev_seq = int(start_hit[0])
+    end_segment = int(end_hit[0])
+    if main_is_closed:
+        next_seq = (end_segment + 1) % len(main_centers)
+    else:
+        next_seq = min(end_segment + 1, len(main_centers) - 1)
+    return (0, prev_seq), (0, next_seq)
+
+
+def _effective_node_centers(curve_centers, empties):
+    """Apply the same empty position overrides used by node serialization."""
+    if len(empties) != len(curve_centers):
+        return list(curve_centers)
+    result = []
+    for i, empty in enumerate(empties):
+        center = _read_vec3_prop(empty, 'fo2_center', curve_centers[i])
+        import_bl = (center[0], center[2], center[1])
+        delta_fo2 = (empty.location[0] - import_bl[0],
+                     empty.location[2] - import_bl[2],
+                     empty.location[1] - import_bl[1])
+        result.append((center[0] + delta_fo2[0],
+                       center[1] + delta_fo2[1],
+                       center[2] + delta_fo2[2]))
+    return result
+
+
 def _read_vec3_prop(e, key, fallback):
     """Read a vec3 custom property from an empty, return as tuple"""
     v = e.get(key)
@@ -1022,6 +1202,15 @@ def build_section_nodes(centers, lefts, rights, targets, n, is_closed,
             sentinel2 = int(e.get('fo2_sentinel2', sentinel2))
             unk5 = int(e.get('fo2_unk5', unk5))
 
+        # Geometry-derived branch endpoint links remain authoritative even
+        # when imported/generated empties contain stale endpoint self-links.
+        if section_index > 0 and not is_closed:
+            if is_first and branch_prev_seq is not None:
+                prev_index = branch_prev_seq
+                sentinel2 = prev_index + 1
+            if is_last and branch_next_seq is not None:
+                node_index = branch_next_seq
+
         # write node (208 bytes)
         buf += struct.pack('<I', TAG_NODE_START)
         buf += struct.pack('<I', _u(node_index))
@@ -1184,6 +1373,8 @@ def export_trackai(filepath, context, options):
         speed_radius_threshold = float(options.get('speed_radius_threshold', 7071.0))
         generate_speed_hints = bool(options.get('generate_speed_hints', True))
         flip_boundaries = bool(options.get('flip_boundaries', False))
+        main_route_centers = None
+        main_route_is_closed = True
 
         for sec_i, (sec_name, sec_col) in enumerate(section_cols):
             is_closed = sec_col.get('fo2_is_closed', True)
@@ -1383,16 +1574,36 @@ def export_trackai(filepath, context, options):
 
             # gather empties (if present all fields are read from them)
             empties = gather_empties(sec_col, sec_name)
+            effective_centers = _effective_node_centers(centers, empties)
 
-            # branch refs (used for from-scratch sec >0 cross-section endpoints).
-            # Format: [parent_sec_idx, parent_seq_idx]. Ignored when empties are
-            # present (empties carry the values verbatim).
+            if sec_i == 0:
+                main_route_centers = effective_centers
+                main_route_is_closed = bool(is_closed)
+
+            # Infer open alternate-route endpoints from Path0 geometry even
+            # when node empties exist; generated empties commonly retain
+            # endpoint self-links which isolate the branch from the game graph.
             branch_prev_ref = None
             branch_next_ref = None
-            if sec_i > 0 and not empties:
+            if (sec_i > 0 and not is_closed and main_route_centers):
+                branch_prev_ref, branch_next_ref = _infer_path0_branch_refs(
+                    main_route_centers, effective_centers,
+                    main_route_is_closed)
+                if branch_prev_ref and branch_next_ref:
+                    sec_col['fo2_branch_prev_ref'] = list(branch_prev_ref)
+                    sec_col['fo2_branch_next_ref'] = list(branch_next_ref)
+                    print(f"[TrackAI Export] Section '{sec_name}': "
+                          f"connected to Path0 "
+                          f"prev={branch_prev_ref[1]}, "
+                          f"next={branch_next_ref[1]}")
+
+            # Stored refs remain the fallback when geometry inference is not
+            # possible, for example with an incomplete main route.
+            if branch_prev_ref is None:
                 _bp = sec_col.get('fo2_branch_prev_ref')
                 if _bp and len(_bp) == 2:
                     branch_prev_ref = (int(_bp[0]), int(_bp[1]))
+            if branch_next_ref is None:
                 _bn = sec_col.get('fo2_branch_next_ref')
                 if _bn and len(_bn) == 2:
                     branch_next_ref = (int(_bn[0]), int(_bn[1]))
@@ -3268,6 +3479,165 @@ class FO2_OT_ReverseSplitpointIndexes(bpy.types.Operator):
         return {'FINISHED'}
 
 
+def _project_to_route_xy(point, route_points, is_closed):
+    """Return (distance_along_route, horizontal_tangent) nearest to point."""
+    n = len(route_points)
+    segment_count = n if is_closed else n - 1
+    best = None
+    distance_along = 0.0
+    for i in range(segment_count):
+        a = route_points[i]
+        b = route_points[(i + 1) % n]
+        dx = b.x - a.x
+        dy = b.y - a.y
+        seg_len_sq = dx * dx + dy * dy
+        if seg_len_sq < 1e-12:
+            continue
+        seg_len = math.sqrt(seg_len_sq)
+        t = ((point.x - a.x) * dx + (point.y - a.y) * dy) / seg_len_sq
+        t = max(0.0, min(1.0, t))
+        px = a.x + t * dx
+        py = a.y + t * dy
+        dist_sq = (point.x - px) ** 2 + (point.y - py) ** 2
+        candidate = (dist_sq, distance_along + t * seg_len,
+                     Vector((dx / seg_len, dy / seg_len, 0.0)))
+        if best is None or candidate[0] < best[0]:
+            best = candidate
+        distance_along += seg_len
+    if best is None:
+        return None
+    return best[1], best[2], distance_along
+
+
+class TRACKAI_OT_rotate_splitpoints_to_route(bpy.types.Operator):
+    """Align and number splitpoint gates in Path0 CenterLine direction."""
+    bl_idname = "trackai.rotate_splitpoints_to_route_direction"
+    bl_label = "TrackAI: Rotate Splitpoints to Route Direction"
+    bl_description = (
+        "Rotate splitpoint gates perpendicular to Path0_CenterLine, enforce "
+        "vertex 0=Left and vertex 2=Right, and renumber them in route order"
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        if context.mode != 'OBJECT':
+            return False
+        root = find_trackai_root(context)
+        if root is None:
+            return False
+        path0 = next((c for c in root.children
+                      if c.name == "TrackAI_Path0"), None)
+        split_col = next((c for c in root.children
+                          if c.name == "TrackAI_Splitpoints"), None)
+        return path0 is not None and split_col is not None
+
+    def execute(self, context):
+        root = find_trackai_root(context)
+        path0 = next((c for c in root.children
+                      if c.name == "TrackAI_Path0"), None)
+        split_col = next((c for c in root.children
+                          if c.name == "TrackAI_Splitpoints"), None)
+        center_obj = find_object_containing(path0, "_CenterLine")
+        if center_obj is None or center_obj.type != 'CURVE':
+            self.report({'ERROR'}, "TrackAI_Path0 needs a _CenterLine curve")
+            return {'CANCELLED'}
+
+        route_points = []
+        is_closed = bool(path0.get('fo2_is_closed', True))
+        for spline in center_obj.data.splines:
+            if len(spline.points) >= 2:
+                route_points.extend(center_obj.matrix_world @ p.co.xyz
+                                    for p in spline.points)
+                is_closed = bool(spline.use_cyclic_u)
+                break
+            if len(spline.bezier_points) >= 2:
+                route_points.extend(center_obj.matrix_world @ p.co
+                                    for p in spline.bezier_points)
+                is_closed = bool(spline.use_cyclic_u)
+                break
+        if len(route_points) < 2:
+            self.report({'ERROR'}, "Path0_CenterLine has fewer than two points")
+            return {'CANCELLED'}
+
+        gates = []
+        for obj in split_col.objects:
+            if obj.type != 'MESH' or len(obj.data.vertices) < 3:
+                continue
+            center_world = obj.matrix_world @ obj.data.vertices[1].co
+            projected = _project_to_route_xy(
+                center_world, route_points, is_closed)
+            if projected is None:
+                continue
+            along, tangent, route_length = projected
+            gates.append({
+                'obj': obj,
+                'old_index': int(obj.get('fo2_splitpoint_index', 0)),
+                'along': along,
+                'tangent': tangent,
+                'route_length': route_length,
+            })
+        if not gates:
+            self.report({'ERROR'}, "No valid splitpoint gate meshes found")
+            return {'CANCELLED'}
+
+        anchor = next((g for g in gates if g['old_index'] == 0),
+                      min(gates, key=lambda g: g['along']))
+        route_length = anchor['route_length']
+        gates.sort(key=lambda g: ((g['along'] - anchor['along']) % route_length,
+                                  g['old_index']))
+        for new_index, gate in enumerate(gates):
+            obj = gate['obj']
+            verts = obj.data.vertices
+            mw = obj.matrix_world
+            inv = mw.inverted_safe()
+            left_old = mw @ verts[0].co
+            center = mw @ verts[1].co
+            right_old = mw @ verts[2].co
+            left_len = math.hypot(left_old.x - center.x,
+                                  left_old.y - center.y)
+            right_len = math.hypot(right_old.x - center.x,
+                                   right_old.y - center.y)
+            if left_len < 1e-6 or right_len < 1e-6:
+                half = 0.5 * math.hypot(right_old.x - left_old.x,
+                                        right_old.y - left_old.y)
+                left_len = right_len = max(half, 1.0)
+
+            forward = gate['tangent']
+            driver_left = Vector((-forward.y, forward.x, 0.0))
+            driver_right = -driver_left
+            left_new = center + driver_left * left_len
+            right_new = center + driver_right * right_len
+            left_new.z = left_old.z
+            right_new.z = right_old.z
+            verts[0].co = inv @ left_new
+            verts[1].co = inv @ center
+            verts[2].co = inv @ right_new
+            obj.data.update()
+            obj['fo2_splitpoint_index'] = new_index
+
+            pos_fo2 = blender_to_fo2(center)
+            left_fo2 = blender_to_fo2(left_new)
+            right_fo2 = blender_to_fo2(right_new)
+            obj['fo2_splitpoint_position'] = list(pos_fo2)
+            obj['fo2_splitpoint_left'] = list(left_fo2)
+            obj['fo2_splitpoint_right'] = list(right_fo2)
+            if 'fo2_bed_splitpoint_position' in obj:
+                obj['fo2_bed_splitpoint_position'] = list(pos_fo2)
+                obj['fo2_bed_splitpoint_left'] = list(left_fo2)
+                obj['fo2_bed_splitpoint_right'] = list(right_fo2)
+
+        for i, gate in enumerate(gates):
+            gate['obj'].name = f"__TrackAI_SplitpointTemp_{i}__"
+        for i, gate in enumerate(gates):
+            gate['obj'].name = f"Splitpoint{i + 1}_Gate"
+        context.view_layer.update()
+        _refresh_ui(context)
+        self.report({'INFO'},
+                    f"Aligned and renumbered {len(gates)} splitpoints")
+        return {'FINISHED'}
+
+
 class TRACKAI_OT_ribbon_from_boundaries(bpy.types.Operator):
     """Create a Ribbon mesh from the active section's Left/Right boundary curves"""
     bl_idname = "trackai.ribbon_from_boundaries"
@@ -4197,6 +4567,7 @@ def menu_func_object(self, context):
     self.layout.operator(FO2_OT_MakeTrackAIHierarchy.bl_idname)
     self.layout.operator(FO2_OT_AddStandardStartpoints.bl_idname)
     self.layout.operator(FO2_OT_SnapStartpointsToRibbon.bl_idname)
+    self.layout.operator(TRACKAI_OT_rotate_splitpoints_to_route.bl_idname)
     self.layout.separator()
     self.layout.operator(FO2_OT_ReverseTrack.bl_idname)
     self.layout.operator(FO2_OT_ReverseNodeIndexes.bl_idname)
@@ -4213,6 +4584,7 @@ _CLASSES = (
     FO2_OT_MakeTrackAIHierarchy,
     FO2_OT_ReverseNodeIndexes,
     FO2_OT_ReverseSplitpointIndexes,
+    TRACKAI_OT_rotate_splitpoints_to_route,
     TRACKAI_OT_ribbon_from_boundaries,
     TRACKAI_OT_boundaries_from_ribbon,
     ExportTrackAI,
