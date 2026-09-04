@@ -1,7 +1,7 @@
 bl_info = {
     "name":        "FlatOut 2 TrackAI Exporter",
     "author":      "ravenDS (github.com/ravenDS)",
-    "version":     (2, 3, 0),
+    "version":     (2, 3, 1),
     "blender":     (3, 6, 0),
     "location":    "File > Export > FlatOut 2 TrackAI (.bin)",
     "description": "Export FlatOut 2 AI path data (trackai.bin + .bed)",
@@ -216,6 +216,21 @@ def sample_curve_points(obj):
             world = obj.matrix_world @ Vector((pt.co.x, pt.co.y, pt.co.z))
             points.append(blender_to_fo2(world))
     return points
+
+
+def sample_target_curve_points(obj):
+    """Read TargetLine points, including uncommitted edit-mode changes."""
+    if obj is None or obj.type != 'CURVE':
+        return []
+    if obj.mode == 'EDIT':
+        try:
+            # Curve control points edited in Edit Mode can remain in Blender's
+            # edit buffer until the mode changes. Flush only the TargetLine so
+            # exporting directly from Edit Mode sees the current coordinates.
+            obj.update_from_editmode()
+        except (AttributeError, RuntimeError):
+            pass
+    return sample_curve_points(obj)
 
 
 def find_object_in_collection(col, suffix):
@@ -797,11 +812,13 @@ def build_section_nodes(centers, lefts, rights, targets, n, is_closed,
                         empties, section_index,
                         branch_prev_ref=None, branch_next_ref=None,
                         speed_lookahead=3, speed_radius_threshold=7071.0,
-                        generate_speed_hints=True):
+                        generate_speed_hints=True,
+                        prefer_curve_target=False):
     """Build binary node data for one section
     
-    If empties are present, ALL fields are read from them (positions included).
-    Curves are only used as fallback when there are no empties.
+    If empties are present, their fields are read as the roundtrip source.
+    When prefer_curve_target is true, TargetLine coordinates stay authoritative
+    so edits to that curve are exported even when imported node empties exist.
 
     From-scratch defaults follow the vanilla patterns verified across 10 tracks
     / 33 sections / 1728 nodes:
@@ -958,7 +975,8 @@ def build_section_nodes(centers, lefts, rights, targets, n, is_closed,
             left = _read_vec3_prop(e, 'fo2_left', left)
             right = _read_vec3_prop(e, 'fo2_right', right)
             mid = _read_vec3_prop(e, 'fo2_mid', mid)
-            target = _read_vec3_prop(e, 'fo2_target', target)
+            if not prefer_curve_target:
+                target = _read_vec3_prop(e, 'fo2_target', target)
 
             # apply movement delta: derive import location from fo2_center,
             # compare to current obj.location, apply delta to all positions
@@ -972,7 +990,8 @@ def build_section_nodes(centers, lefts, rights, targets, n, is_closed,
                 left = (left[0] + delta_fo2[0], left[1] + delta_fo2[1], left[2] + delta_fo2[2])
                 right = (right[0] + delta_fo2[0], right[1] + delta_fo2[1], right[2] + delta_fo2[2])
                 mid = (mid[0] + delta_fo2[0], mid[1] + delta_fo2[1], mid[2] + delta_fo2[2])
-                target = (target[0] + delta_fo2[0], target[1] + delta_fo2[1], target[2] + delta_fo2[2])
+                if not prefer_curve_target:
+                    target = (target[0] + delta_fo2[0], target[1] + delta_fo2[1], target[2] + delta_fo2[2])
 
             # direction
             forward = _read_vec3_prop(e, 'fo2_forward', forward)
@@ -1179,7 +1198,8 @@ def export_trackai(filepath, context, options):
             centers = sample_curve_points(center_obj)
             lefts = sample_curve_points(left_obj)
             rights = sample_curve_points(right_obj)
-            targets = sample_curve_points(target_obj)
+            targets = sample_target_curve_points(target_obj)
+            prefer_curve_target = bool(targets)
 
             # Ribbon fallback: when Left/Right curves are missing (e.g. the user
             # only has a Ribbon mesh for the section), derive boundaries from
@@ -1313,6 +1333,7 @@ def export_trackai(filepath, context, options):
                         sec_col, f"{sec_name}_TargetLine",
                         target_points, is_closed)
                     targets = list(target_points)
+                    prefer_curve_target = True
                     print(f"[TrackAI Export] Section '{sec_name}': "
                           f"generated TargetLine ({gen_desc})")
 
@@ -1393,7 +1414,8 @@ def export_trackai(filepath, context, options):
                 branch_next_ref=branch_next_ref,
                 speed_lookahead=speed_lookahead,
                 speed_radius_threshold=speed_radius_threshold,
-                generate_speed_hints=generate_speed_hints)
+                generate_speed_hints=generate_speed_hints,
+                prefer_curve_target=prefer_curve_target)
             f.write(node_data)
 
             # Mirror the just-written node records back into Blender as per-node
