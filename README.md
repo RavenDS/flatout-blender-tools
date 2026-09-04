@@ -30,6 +30,8 @@ _These tools are provided for convenience and won't be updated_
 
 
 ## Credits &amp; Notes
-- [Chloe](https://github.com/gaycoderprincess) for her work on the model (bgm) format ([FlatOutW32BGMTool](https://github.com/gaycoderprincess/FlatOutW32BGMTool))
-- [mrwonko](https://github.com/mrwonko/) for his work on the collision (cdb2) format ([flatout-open-level-editor](https://github.com/mrwonko/flatout-open-level-editor))
+- **[Chloe](https://github.com/gaycoderprincess)** for her work on the model (bgm) format ([FlatOutW32BGMTool](https://github.com/gaycoderprincess/FlatOutW32BGMTool))
+- **[mrwonko](https://github.com/mrwonko/)** for his work on the collision (cdb2) format ([flatout-open-level-editor](https://github.com/mrwonko/flatout-open-level-editor))
+- **Selo** for his extensive testing of BGM plugins & tools, and fixes for the BGM plugins
+- **Cryptid** for his extensive testing of TrackAI plugins, edits & fixes for the TrackAI plugins
 - This project is (_obviously_) AI-assisted
