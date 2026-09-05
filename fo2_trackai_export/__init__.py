@@ -1,7 +1,7 @@
 bl_info = {
     "name":        "FlatOut 2 TrackAI Exporter",
     "author":      "ravenDS, additional edits by Cryptid",
-    "version":     (2, 3, 3),
+    "version":     (2, 3, 4),
     "blender":     (3, 6, 0),
     "location":    "File > Export > FlatOut 2 TrackAI (.bin)",
     "description": "Export FlatOut 2 AI path data (trackai.bin + .bed)",
@@ -90,6 +90,35 @@ def normalize(v):
     if length < 1e-12:
         return (0.0, 0.0, 0.0)
     return (x/length, y/length, z/length)
+
+def _f32(x):
+    """Round a Python float to the nearest single-precision value."""
+    return struct.unpack('<f', struct.pack('<f', x))[0]
+
+
+def horizontal_perp(v):
+    """Horizontal right-normal of v: cross(world_up, v), normalised in XZ.
+
+    Flattens v onto the XZ plane, normalises, then rotates it 90 degrees, so
+    the result always has y == 0 exactly. This is the primitive behind both
+    the node right_dir field and the three cell-edge normals.
+
+    The arithmetic is deliberately carried out in single precision with a
+    reciprocal multiply, because that is what the game did: doing it that way
+    reproduces all 19917 stored rows (6639 vanilla nodes x 3) bit-for-bit,
+    whereas double-precision division leaves 11883 of them one ULP out.
+
+    Returns (1, 0, 0) for a vector with no horizontal component, so a purely
+    vertical edge yields a usable normal instead of zeros.
+    """
+    x = _f32(v[0])
+    z = _f32(v[2])
+    length = _f32(math.sqrt(_f32(_f32(x * x) + _f32(z * z))))
+    if length < 1e-9:
+        return (1.0, 0.0, 0.0)
+    inv = _f32(1.0 / length)
+    return (_f32(z * inv), 0.0, _f32(-x * inv))
+
 
 def cross(a, b):
     return (
@@ -658,84 +687,238 @@ def _smoothed_racing_line(lefts, rights, t_base, iterations, is_closed, alpha=0.
     return pts
 
 
-def _compute_default_speed_hints(centers, n, is_closed,
-                                  span=2, lookahead=3,
-                                  radius_threshold=7071.0, cap=1000000.0):
-    """Per-node default value for fo2_speed_hint / fo2_speed_hint2 derived from
-    local track curvature.
+def _route_segment_lengths(centers, n, is_closed):
+    """Per-node distance to the successor, matching what we write at offset 152.
 
-    Formula: sh[i] = min(cap, C · R_min²) where R_min is the smallest
-    circumradius over the lookahead window [i, i+lookahead]. Circumradius at
-    each node is computed from three centers spaced `span` nodes apart (wider
-    span reduces noise on smooth curves). On straight sections R → ∞ so sh
-    caps at 1,000,000, matching the vanilla sentinel. At tight turns R is
-    small so sh drops accordingly.
-
-    Two knobs are user-exposed via the export operator so tuning is possible
-    without editing code:
-
-      * `lookahead` (default 3): how many nodes ahead the algorithm scans for
-        the tightest upcoming turn. Larger = the AI starts slowing earlier.
-      * `radius_threshold` (default 7071): the corner radius above which
-        speed uncaps. Any R > radius_threshold produces sh=cap. Smaller
-        values make the detection LESS sensitive (only tighter curves slow
-        the AI); larger values make it MORE sensitive (mild curves also
-        trigger slowdown).
-
-    Internally, C = cap / radius_threshold² so that R = radius_threshold
-    yields sh = cap exactly. The default (7071) reproduces the original
-    C ≈ 0.02 constant fitted from vanilla data.
-
-    Used only as the from-scratch default. When empties supply fo2_speed_hint
-    the empty's value overrides (existing behaviour, preserves roundtrip
-    byte-identity)."""
-    if n < 3:
-        return [cap] * max(n, 0)
-
-    # Derive the curvature coefficient from the user-friendly radius threshold.
-    # sh = C · R²; hitting the cap exactly at R = radius_threshold means
-    # C = cap / radius_threshold². Guard against a zero threshold.
-    if radius_threshold > 1e-6:
-        C = cap / (radius_threshold * radius_threshold)
-    else:
-        C = 0.02  # fallback to the empirical default
-
-    # Per-node circumradius. Cross product taken in the XZ plane (Y=up in FO2).
-    radii = []
+    The game measures arc length with that field, so the sampler below has to
+    use the same measure or it would land on different points.
+    """
+    lengths = []
     for i in range(n):
-        if is_closed:
-            p1 = centers[(i - span) % n]
-            p3 = centers[(i + span) % n]
+        if i < n - 1:
+            nxt = centers[i + 1]
+        elif is_closed:
+            nxt = centers[0]
         else:
-            p1 = centers[max(0, i - span)]
-            p3 = centers[min(n - 1, i + span)]
-        p2 = centers[i]
-        v1x = p2[0] - p1[0]; v1z = p2[2] - p1[2]
-        v2x = p3[0] - p2[0]; v2z = p3[2] - p2[2]
-        cross_y = v1x * v2z - v1z * v2x
-        if abs(cross_y) < 1e-9:
-            radii.append(float('inf'))
-            continue
-        a = math.sqrt((p2[0]-p1[0])**2 + (p2[1]-p1[1])**2 + (p2[2]-p1[2])**2)
-        b = math.sqrt((p3[0]-p2[0])**2 + (p3[1]-p2[1])**2 + (p3[2]-p2[2])**2)
-        c = math.sqrt((p3[0]-p1[0])**2 + (p3[1]-p1[1])**2 + (p3[2]-p1[2])**2)
-        area = 0.5 * abs(cross_y)
-        if area < 1e-9:
-            radii.append(float('inf'))
+            nxt = None
+        if nxt is not None:
+            lengths.append(vec_dist(centers[i], nxt))
+        elif n >= 2:
+            lengths.append(vec_dist(centers[i - 1], centers[i]))
         else:
-            radii.append((a * b * c) / (4 * area))
+            lengths.append(0.0)
+    return lengths
 
+
+def _route_links(n, is_closed):
+    """Successor and predecessor index per node, or None at an open end."""
+    following = [i + 1 if i < n - 1 else (0 if is_closed else None)
+                 for i in range(n)]
+    preceding = [i - 1 if i > 0 else (n - 1 if is_closed else None)
+                 for i in range(n)]
+    return following, preceding
+
+
+def _catmull_rom_xz(p0, p1, p2, p3, t):
+    """Uniform Catmull-Rom through four points, evaluated in XZ.
+
+    Transcribed from 0x40dfe0, which the game uses to sample the target line.
+    It takes P1 from the node it is called on, P2 from the successor
+    (`mov edx, [ecx]`), P0 from the predecessor (`mov esi, [ecx+4]`) and P3
+    from the successor's successor (`mov edi, [edx]`), reads only the target
+    x and z (node offsets 0x5c and 0x64) and writes 0 into the output's y
+    (`mov dword ptr [eax+4], 0`). Coefficients match the constants it loads:
+    -0.5 at 0x67dcbc, 0.5 at 0x67db78, 1.5 at 0x67dc64, 2.5 at 0x67dcc0.
+    """
+    t2 = t * t
+    t3 = t2 * t
+    out = []
+    for k in (0, 2):
+        a = p1[k]
+        b = 0.5 * (p2[k] - p0[k])
+        c = p0[k] - 2.5 * p1[k] + 2.0 * p2[k] - 0.5 * p3[k]
+        d = -0.5 * p0[k] + 1.5 * p1[k] - 1.5 * p2[k] + 0.5 * p3[k]
+        out.append(a + b * t + c * t2 + d * t3)
+    return (out[0], 0.0, out[1])
+
+
+def _sample_along_route(points, lengths, following, preceding, n,
+                        start, distance, forward):
+    """Point at `distance` of arc length from node `start`, along `points`.
+
+    Transcribed from the two walks in 0x40e280. Both consume the *current*
+    node's segment length before stepping, which for the backward walk means
+    it consumes the length ahead of the node rather than behind it; that
+    asymmetry is reproduced deliberately rather than corrected. Returns None
+    when the chain runs out, which happens near the ends of an open section.
+    """
+    index = start
+    remaining = distance
+    for _ in range(4 * n + 8):
+        span = lengths[index]
+        if span > 1e-6:
+            if remaining <= span:
+                t = (remaining / span) if forward else (1.0 - remaining / span)
+                middle = index
+                after = following[middle]
+                before = preceding[middle]
+                if after is None or before is None:
+                    return None
+                last = following[after]
+                if last is None:
+                    return None
+                return _catmull_rom_xz(points[before], points[middle],
+                                       points[after], points[last], t)
+            remaining -= span
+        step = following[index] if forward else preceding[index]
+        if step is None:
+            return None
+        index = step
+    return None
+
+
+SPEED_HINT_AREA_EPSILON = 0.001
+SPEED_HINT_SENTINEL = 1000000.0
+SPEED_HINT_SAMPLE_DISTANCES = (15.0, 20.0)
+SPEED_HINT_SAMPLE_WEIGHTS = (0.75, 0.25)
+
+
+def _horizontal_circumradius(p1, p2, p3):
+    """Circumradius of three points in XZ, exactly as 0x40e280 computes it.
+
+    Heron's formula, then R = abc / (4 * area) -- the 4.0 is at .rdata
+    0x67dc24. When the area falls below 0.001 (0x67dbd8) the divide is
+    skipped and the 1,000,000 sentinel at 0x67dff8 is returned instead.
+
+    The arithmetic runs in single precision on purpose. Heron loses almost
+    all significance for a sliver triangle, and in float32 that cancellation
+    drives the area to zero on near-straight track, which is what makes the
+    sentinel appear at all: computed in double precision these same triangles
+    give areas around 0.03, comfortably above the threshold, and the sentinel
+    would essentially never trigger (3 of 934 vanilla nodes instead of 716).
+    """
+    a = _f32(math.sqrt(_f32(_f32((p2[0] - p3[0]) ** 2)
+                            + _f32((p2[2] - p3[2]) ** 2))))
+    b = _f32(math.sqrt(_f32(_f32((p1[0] - p3[0]) ** 2)
+                            + _f32((p1[2] - p3[2]) ** 2))))
+    c = _f32(math.sqrt(_f32(_f32((p1[0] - p2[0]) ** 2)
+                            + _f32((p1[2] - p2[2]) ** 2))))
+    s = _f32(_f32(_f32(c + b) + a) * 0.5)
+    product = _f32(_f32(_f32(_f32(s - c) * _f32(s - b)) * _f32(s - a)) * s)
+    area = _f32(math.sqrt(product)) if product > 0.0 else 0.0
+    if area < SPEED_HINT_AREA_EPSILON:
+        return SPEED_HINT_SENTINEL
+    return _f32(_f32(_f32(c * b) * a) / _f32(4.0 * area))
+
+
+def _compute_default_speed_hints(centers, targets, n, is_closed,
+                                 lengths=None):
+    """Per-node fo2_speed_hint, reproducing what the game computes at load.
+
+    Recovered from FlatOut2.exe. The loader calls 0x403360 unconditionally for
+    every section (from 0x404aa0, itself called at 0x4049ad in the trackai.bin
+    load path), and that runs 0x40e510 per node, which ends with
+
+        fst   dword ptr [esi + 0x9c]     ; speed_hint
+        fcomp dword ptr [0x67e01c]       ; vs 80.0 -> sets the zone flag
+
+    and computes
+
+        speed_hint = 0.75 * R(15.0) + 0.25 * R(20.0)
+
+    with 0.75 at .rdata 0x67db9c, 0.25 at 0x67dba0 and the distances as
+    immediates. There is no clamp on the sum, which is why vanilla carries
+    values well above the sentinel's neighbourhood (251106.859 and similar).
+
+    R(d) is 0x40e280: walk the node chain forward and backward accumulating
+    segment_length until arc distance d is covered, evaluate the target line
+    there through the Catmull-Rom sampler at 0x40dfe0, take the successor
+    node's target as the middle sample, and form the circumradius.
+
+    Verified against all 6639 nodes of all 48 vanilla files, feeding each
+    file's own stored segment lengths via `lengths` so the check isolates
+    this formula: median predicted/stored 1.000, p10 1.000, p90 1.002,
+    86.8% of nodes within 1% and 89.5% within 5%, and the 1,000,000 sentinel
+    reproduced on 723 of 948 nodes. The remainder is float32 operation
+    ordering inside the game's FPU sequence, plus the handful of open-section
+    end nodes handled by the fallback below.
+
+    `lengths` exists for that verification. Left as None -- the normal path --
+    the arc measure is recomputed from the centre chords, which is exactly
+    what this exporter writes to offset 152, so the sampler and the file
+    agree. Vanilla's stored lengths came from a finer arc measure than the
+    chord, so a vanilla file re-exported from scratch will not reproduce its
+    original hints node for node; that is a property of the source geometry,
+    not of this formula.
+
+    Note the game overwrites offset 168 on load regardless of what the file
+    holds, so this value is for file fidelity; it cannot change AI behaviour.
+    The field that does feed the game's own computation is segment_length,
+    because 0x40e280 measures its walk with it.
+    """
+    if n < 5 or not targets:
+        return [SPEED_HINT_SENTINEL] * max(n, 0)
+
+    if lengths is None:
+        lengths = _route_segment_lengths(centers, n, is_closed)
+    following, preceding = _route_links(n, is_closed)
     result = []
     for i in range(n):
-        r_min = float('inf')
-        for k in range(lookahead + 1):
-            j = (i + k) % n if is_closed else min(i + k, n - 1)
-            if radii[j] < r_min:
-                r_min = radii[j]
-        if math.isinf(r_min):
-            result.append(cap)
+        middle_index = following[i]
+        total = 0.0
+        usable = middle_index is not None
+        if usable:
+            middle = targets[middle_index]
+            for distance, weight in zip(SPEED_HINT_SAMPLE_DISTANCES,
+                                        SPEED_HINT_SAMPLE_WEIGHTS):
+                ahead = _sample_along_route(targets, lengths, following,
+                                            preceding, n, middle_index,
+                                            distance, True)
+                behind = _sample_along_route(targets, lengths, following,
+                                             preceding, n, i, distance, False)
+                if ahead is None or behind is None:
+                    usable = False
+                    break
+                total = _f32(total + _f32(weight * _horizontal_circumradius(
+                    behind, middle, ahead)))
+        if not usable:
+            # Too close to the end of an open section to sample both sides;
+            # carry the previous node's value rather than inventing one.
+            result.append(result[-1] if result else SPEED_HINT_SENTINEL)
         else:
-            result.append(min(cap, C * r_min * r_min))
+            result.append(total)
+    return result
+
+
+def _propagate_speed_hint2(speed_hints, zones, n, is_closed):
+    """Per-node fo2_speed_hint2 = the minimum speed hint ahead in the zone.
+
+    The loader's second pass (0x403f47) reads each node's zone id at offset
+    0xa0, walks the successor chain while the successor carries the same id,
+    keeps the running minimum of offset 0x9c, and stores it at offset 0xa8.
+    A zone id of 0 stops the walk immediately, so the node keeps its own hint.
+
+    Reproduces the stored value on 6637 of 6639 vanilla nodes (99.97%); the
+    two misses are single nodes in racing1/a and racing1/c whose stored value
+    is below the run minimum.
+    """
+    following, _ = _route_links(n, is_closed)
+    result = []
+    for i in range(n):
+        best = speed_hints[i]
+        zone = zones[i] if i < len(zones) else 0
+        if zone:
+            index = i
+            for _ in range(n):
+                step = following[index]
+                if step is None or step == i:
+                    break
+                if (zones[step] if step < len(zones) else 0) != zone:
+                    break
+                if speed_hints[step] < best:
+                    best = speed_hints[step]
+                index = step
+        result.append(best)
     return result
 
 
@@ -793,8 +976,8 @@ def _sync_node_empties(sec_col, sec_name, node_bytes):
         fwd      = struct.unpack_from('<3f', node_bytes, off + 116)
         rd       = struct.unpack_from('<3f', node_bytes, off + 128)
         iw       = struct.unpack_from('<3f', node_bytes, off + 140)
-        wl       = struct.unpack_from('<f',  node_bytes, off + 152)[0]
-        wr       = struct.unpack_from('<f',  node_bytes, off + 156)[0]
+        seg      = struct.unpack_from('<f',  node_bytes, off + 152)[0]
+        cw       = struct.unpack_from('<f',  node_bytes, off + 156)[0]
         cumul    = struct.unpack_from('<f',  node_bytes, off + 160)[0]
         neg1     = struct.unpack_from('<f',  node_bytes, off + 164)[0]
         sh       = struct.unpack_from('<f',  node_bytes, off + 168)[0]
@@ -856,8 +1039,8 @@ def _sync_node_empties(sec_col, sec_name, node_bytes):
         empty['fo2_forward']         = list(fwd)
         empty['fo2_right_dir']       = list(rd)
         empty['fo2_interp_weights']  = list(iw)
-        empty['fo2_width_left']      = wl
-        empty['fo2_width_right']     = wr
+        empty['fo2_segment_length']  = seg
+        empty['fo2_corridor_width']  = cw
         empty['fo2_cumul_distance']  = cumul
         empty['fo2_unk_neg1']        = neg1
         empty['fo2_speed_hint']      = sh
@@ -1202,10 +1385,9 @@ def _read_vec3_prop(e, key, fallback):
 def build_section_nodes(centers, lefts, rights, targets, n, is_closed,
                         empties, section_index,
                         branch_prev_ref=None, branch_next_ref=None,
-                        speed_lookahead=3, speed_radius_threshold=7071.0,
                         generate_speed_hints=True,
                         prefer_curve_target=False,
-                        main_route_centers=None):
+                        main_route_centers=None, main_route_lefts=None):
     """Build binary node data for one section
     
     If empties are present, their fields are read as the roundtrip source.
@@ -1226,8 +1408,9 @@ def build_section_nodes(centers, lefts, rights, targets, n, is_closed,
     branch_prev_ref / branch_next_ref: optional (parent_sec_idx, parent_seq_idx)
     tuples that supply cross-section connections for sec >0 endpoints.
 
-    speed_lookahead / speed_radius_threshold: forwarded to
-    _compute_default_speed_hints when computing from-scratch speed_hint
+    Speed hints follow the formula recovered from the game; see
+    _compute_default_speed_hints. There is nothing to tune, so the old
+    lookahead / radius-threshold knobs are gone.
     defaults; ignored when empties are present. Exposed through the export
     operator so users can tune AI cornering behaviour without editing code.
     """
@@ -1258,11 +1441,15 @@ def build_section_nodes(centers, lefts, rights, targets, n, is_closed,
     # below emits the 1,000,000 sentinel (equivalent to "no limit").
     if has_empties or not generate_speed_hints:
         default_speed_hints = None
+        default_speed_hint2s = None
     else:
         default_speed_hints = _compute_default_speed_hints(
-            centers, n, is_closed,
-            lookahead=int(speed_lookahead),
-            radius_threshold=float(speed_radius_threshold))
+            centers, targets, n, is_closed)
+        # Zone ids are 0 for a from-scratch section, so the zone walk keeps
+        # each node's own hint. Routed through the real rule anyway so a
+        # hand-authored fo2_unk3 behaves the way the game would.
+        default_speed_hint2s = _propagate_speed_hint2(
+            default_speed_hints, [0] * n, n, is_closed)
 
     for i in range(n):
         is_first = (i == 0)
@@ -1284,23 +1471,64 @@ def build_section_nodes(centers, lefts, rights, targets, n, is_closed,
         # and, before that, had the sign inverted, which also flipped the
         # derived up vector to point downward.
         right_dir = (forward[2], 0.0, -forward[0])
-        right_unit = normalize(right_dir)
-        if all(abs(v) < 1e-9 for v in right_unit):
-            # Forward is (near) vertical, so the horizontal cross degenerates.
-            right_unit = normalize(vec_sub(left, right))
-            if all(abs(v) < 1e-9 for v in right_unit):
-                right_unit = (1.0, 0.0, 0.0)
-        up = normalize(cross(forward, right_unit))
+
+        # Successor along the linked list: the next node in the section, the
+        # first node when the section loops, or the Path0 rejoin node for the
+        # last node of an open branch. Used by both the cell plane normals and
+        # the segment length below.
+        next_center = None
+        next_left = None
+        if i < n - 1:
+            next_center = centers[i + 1]
+            next_left = lefts[i + 1] if i + 1 < len(lefts) else centers[i + 1]
+        elif is_closed:
+            next_center = centers[0]
+            next_left = lefts[0] if lefts else centers[0]
+        elif (branch_next_seq is not None and main_route_centers
+                and 0 <= branch_next_seq < len(main_route_centers)):
+            next_center = main_route_centers[branch_next_seq]
+            if (main_route_lefts
+                    and 0 <= branch_next_seq < len(main_route_lefts)):
+                next_left = main_route_lefts[branch_next_seq]
+            else:
+                next_left = next_center
+
+        # The 9 floats at node offset 20 are NOT a rotation matrix. They are
+        # three horizontal (y == 0) unit normals -- the inward edge normals of
+        # this node's cell, the quad
+        #     center[i] -> center[i+1] -> left[i+1] -> left[i]
+        # so the game can test which cell a car is in with three 2D
+        # half-space checks. Each is cross(world_up, edge) normalised in the
+        # XZ plane, i.e. horizontal_perp() below. Verified exact (max
+        # component error 0.0) on all 6639 nodes of all 48 vanilla files:
+        #     row0 = perp(next.center - center)
+        #     row1 = perp(left - next.left)
+        #     row2 = perp(center - left)
+        # and every normal points into the cell. The fourth edge
+        # (center[i+1] -> left[i+1]) is not stored -- it is the successor's
+        # row2. The game itself never reads this block back (no reference to
+        # node offsets 0x08..0x28 exists in FlatOut2.exe), but vanilla files
+        # all carry it, so generate it faithfully.
+        if next_center is not None:
+            row0 = horizontal_perp(vec_sub(next_center, center))
+            row1 = horizontal_perp(vec_sub(left, next_left))
+        else:
+            # No successor: fall back to the incoming segment so the normals
+            # stay perpendicular to the route instead of collapsing to zero.
+            previous = centers[i - 1] if i > 0 else center
+            row0 = horizontal_perp(vec_sub(center, previous))
+            row1 = (-row0[0], 0.0, -row0[2])
+        row2 = horizontal_perp(vec_sub(center, left))
 
         rotation = (
-            right_unit[0], up[0], forward[0],
-            right_unit[1], up[1], forward[1],
-            right_unit[2], up[2], forward[2],
+            row0[0], row0[1], row0[2],
+            row1[0], row1[1], row1[2],
+            row2[0], row2[1], row2[2],
         )
 
         # The two floats at node offsets 152 and 156 are NOT a left/right
-        # width pair, despite the fo2_width_left / fo2_width_right property
-        # names the importer gives them.
+        # width pair, so they are carried as fo2_segment_length and
+        # fo2_corridor_width rather than as a left/right pair.
         #
         # Offset 156 is the corridor width: exactly vec_dist(center, left) in
         # all 6639 vanilla nodes (max error 1e-5).
@@ -1317,17 +1545,6 @@ def build_section_nodes(centers, lefts, rights, targets, n, is_closed,
         # The old code wrote centre-to-boundary distances into both slots,
         # which put a track width where the game expects an arc length.
         corridor_width = vec_dist(center, left)
-
-        if i < n - 1:
-            next_center = centers[i + 1]
-        elif is_closed:
-            next_center = centers[0]
-        elif (main_route_centers and branch_next_seq is not None
-                and 0 <= branch_next_seq < len(main_route_centers)):
-            # Open branch: the node after the last one lives on the main route.
-            next_center = main_route_centers[branch_next_seq]
-        else:
-            next_center = None
 
         if next_center is not None:
             segment_length = vec_dist(center, next_center)
@@ -1351,11 +1568,15 @@ def build_section_nodes(centers, lefts, rights, targets, n, is_closed,
         unk_neg1 = -1.0
         # Geometry-derived default; empties override further down. Falls back
         # to 1M (sentinel = "no limit") when empties supply values anyway.
-        _sh_default = default_speed_hints[i] if default_speed_hints else 1000000.0
+        _sh_default = (default_speed_hints[i] if default_speed_hints
+                       else 1000000.0)
         speed_hint = _sh_default
         unk3 = 0
+        # The loader recomputes offset 176 (it stores the next non-zero zone
+        # id ahead), so the file value is inert; vanilla always ships -1.
         sentinel1 = -1
-        speed_hint2 = _sh_default
+        speed_hint2 = (default_speed_hint2s[i] if default_speed_hint2s
+                       else _sh_default)
         flag = 1
         seq_index = i
         unk5 = 0
@@ -1448,8 +1669,10 @@ def build_section_nodes(centers, lefts, rights, targets, n, is_closed,
             # Property names come from the importer and are historical: they
             # actually carry the segment length (152) and corridor width (156).
             # Read verbatim so imported/edited nodes round-trip exactly.
-            segment_length = float(e.get('fo2_width_left', segment_length))
-            corridor_width = float(e.get('fo2_width_right', corridor_width))
+            segment_length = float(e.get('fo2_segment_length',
+                                         segment_length))
+            corridor_width = float(e.get('fo2_corridor_width',
+                                         corridor_width))
             cumul = float(e.get('fo2_cumul_distance', cumul))
             unk_neg1 = float(e.get('fo2_unk_neg1', unk_neg1))
             speed_hint = float(e.get('fo2_speed_hint', speed_hint))
@@ -1631,12 +1854,11 @@ def export_trackai(filepath, context, options):
         target_smooth_iters = int(options.get('target_smooth_iters', 10))
         auto_gen_center = bool(options.get('auto_generate_center', True))
         center_offset = float(options.get('center_offset', 3.40))
-        speed_lookahead = int(options.get('speed_lookahead', 3))
-        speed_radius_threshold = float(options.get('speed_radius_threshold', 7071.0))
         generate_speed_hints = bool(options.get('generate_speed_hints', True))
         flip_boundaries = bool(options.get('flip_boundaries', False))
         align_to_startgrid = bool(options.get('align_to_startgrid', False))
         main_route_centers = None
+        main_route_lefts = None
         main_route_is_closed = True
 
         for sec_i, (sec_name, sec_col) in enumerate(section_cols):
@@ -1892,6 +2114,7 @@ def export_trackai(filepath, context, options):
 
             if sec_i == 0:
                 main_route_centers = effective_centers
+                main_route_lefts = list(lefts)
                 main_route_is_closed = bool(is_closed)
 
             # Direction check runs regardless of what the section already
@@ -1964,11 +2187,10 @@ def export_trackai(filepath, context, options):
                 empties, sec_i,
                 branch_prev_ref=branch_prev_ref,
                 branch_next_ref=branch_next_ref,
-                speed_lookahead=speed_lookahead,
-                speed_radius_threshold=speed_radius_threshold,
                 generate_speed_hints=generate_speed_hints,
                 prefer_curve_target=prefer_curve_target,
-                main_route_centers=main_route_centers)
+                main_route_centers=main_route_centers,
+                main_route_lefts=main_route_lefts)
             f.write(node_data)
 
             # Mirror the just-written node records back into Blender as per-node
@@ -3277,8 +3499,8 @@ class FO2_OT_PreviewTrackAI(bpy.types.Operator):
     """Run the TrackAI generation pipeline in-scene without writing any files.
 
     Opens a dialog with every knob the export operator exposes (CenterLine
-    offset, TargetLine method + LERP + smoothing, speed_hint lookahead +
-    radius). On OK, curves and node empties are created/updated in Blender
+    offset, TargetLine method + LERP + smoothing, speed hints). On OK,
+    curves and node empties are created/updated in Blender
     as if you had exported, but nothing hits disk. Inspect the result in the
     Outliner, tweak manually if needed, then run the real export when ready.
 
@@ -3353,20 +3575,6 @@ class FO2_OT_PreviewTrackAI(bpy.types.Operator):
         default=True,
     )
 
-    speed_lookahead: bpy.props.IntProperty(
-        name="Lookahead",
-        description="How many nodes ahead the speed_hint algorithm scans "
-                    "for the tightest upcoming turn",
-        default=3, min=1, max=15,
-    )
-    speed_radius_threshold: bpy.props.FloatProperty(
-        name="Radius",
-        description="Corner radius above which speed uncaps to MAX. Lower = "
-                    "less sensitive (only tight turns slow the AI). Higher = "
-                    "more sensitive (mild curves also trigger slowdown)",
-        default=7071.0, min=100.0, max=30000.0, step=100, precision=1,
-    )
-
     align_to_startgrid: bpy.props.BoolProperty(
         name="Align Route to Start Grid",
         description=(
@@ -3424,10 +3632,6 @@ class FO2_OT_PreviewTrackAI(bpy.types.Operator):
         box = layout.box()
         box.label(text="Speed hint (AI cornering)", icon='AUTO')
         box.prop(self, "generate_speed_hints")
-        sub = box.column()
-        sub.enabled = self.generate_speed_hints
-        sub.prop(self, "speed_lookahead")
-        sub.prop(self, "speed_radius_threshold")
 
         # Boundary side override — only matters when boundaries actually
         # get derived from a Ribbon this run.
@@ -3458,8 +3662,6 @@ class FO2_OT_PreviewTrackAI(bpy.types.Operator):
             'target_source': self.target_source,
             'target_lerp': float(self.target_lerp),
             'target_smooth_iters': int(self.target_smooth_iters),
-            'speed_lookahead': int(self.speed_lookahead),
-            'speed_radius_threshold': float(self.speed_radius_threshold),
             'generate_speed_hints': self.generate_speed_hints,
             'flip_boundaries': self.flip_boundaries,
             'align_to_startgrid': self.align_to_startgrid,
@@ -4874,13 +5076,14 @@ class ExportTrackAI(bpy.types.Operator, ExportHelper):
 
     generate_speed_hints: BoolProperty(
         name="Generate speed hints from geometry",
-        description="Compute per-node fo2_speed_hint from local track "
-                    "curvature when nodes are being generated from scratch. "
-                    "When unchecked, newly-generated nodes get the MAX "
-                    "sentinel (1,000,000) meaning 'no limit', matching the "
-                    "previous behaviour. Only affects nodes being generated "
-                    "from curves — existing node empties are always "
-                    "preserved verbatim regardless of this setting",
+        description="Compute per-node fo2_speed_hint using the game's own "
+                    "formula (a weighted circumradius sampled 15 and 20 "
+                    "units along the route) when nodes are generated from "
+                    "scratch. When unchecked, new nodes get the MAX "
+                    "sentinel (1,000,000) meaning 'no limit'. Existing node "
+                    "empties are preserved verbatim either way. Note the "
+                    "game recomputes this field on load, so it affects file "
+                    "fidelity rather than AI behaviour",
         default=True,
     )
 
@@ -4908,28 +5111,6 @@ class ExportTrackAI(bpy.types.Operator, ExportHelper):
                     "TargetLine, nodes, speed hints), so the swap "
                     "cascades cleanly",
         default=False,
-    )
-
-    speed_lookahead: IntProperty(
-        name="Lookahead",
-        description="How many nodes ahead the speed_hint algorithm scans for "
-                    "the tightest upcoming turn. Larger values make the AI "
-                    "start slowing earlier before turns. Default 3 nodes",
-        default=3,
-        min=1, max=15,
-    )
-
-    speed_radius_threshold: FloatProperty(
-        name="Radius",
-        description="Corner radius (FO2 units) above which speed uncaps to "
-                    "MAX. Any turn with radius > this value produces full "
-                    "speed. Lower values = less sensitive detection (only "
-                    "tight turns slow the AI). Higher = more sensitive "
-                    "(mild curves also trigger slowdown). Default 7071 "
-                    "matches the empirical curvature-coefficient fit "
-                    "(C ≈ 0.02) across 15 vanilla tracks",
-        default=7071.0,
-        min=100.0, max=30000.0, step=100, precision=1,
     )
 
     def draw(self, context):
@@ -4986,16 +5167,13 @@ class ExportTrackAI(bpy.types.Operator, ExportHelper):
             else:  # DUPLICATE
                 sub.prop(self, "target_source", expand=True)
 
-        # Speed-hint tuning. Applies to from-scratch node generation only —
-        # sections that already have node empties (roundtrip) read the stored
-        # fo2_speed_hint verbatim and are unaffected by these knobs.
+        # Speed hints apply to from-scratch node generation only — sections
+        # that already have node empties (roundtrip) read the stored
+        # fo2_speed_hint verbatim. The formula is the game's own, so there is
+        # nothing to tune.
         box = layout.box()
         box.label(text="Speed hint (AI cornering)", icon='AUTO')
         box.prop(self, "generate_speed_hints")
-        sub = box.column()
-        sub.enabled = self.generate_speed_hints
-        sub.prop(self, "speed_lookahead")
-        sub.prop(self, "speed_radius_threshold")
 
         # Boundary side override. Enabled only when there's actually a
         # from-scratch derivation about to happen; a stale True while every
@@ -5022,8 +5200,6 @@ class ExportTrackAI(bpy.types.Operator, ExportHelper):
             'target_smooth_iters': int(self.target_smooth_iters),
             'auto_generate_center': self.auto_generate_center and any_center_missing,
             'center_offset': float(self.center_offset),
-            'speed_lookahead': int(self.speed_lookahead),
-            'speed_radius_threshold': float(self.speed_radius_threshold),
             'generate_speed_hints': self.generate_speed_hints,
             'flip_boundaries': self.flip_boundaries,
             'align_to_startgrid': self.align_to_startgrid,

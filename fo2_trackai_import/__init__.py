@@ -1,7 +1,7 @@
 bl_info = {
     "name":        "FlatOut 2 TrackAI Importer",
     "author":      "ravenDS",
-    "version":     (2, 3, 0),
+    "version":     (2, 3, 1),
     "blender":     (3, 6, 0),
     "location":    "File > Import > FlatOut 2 TrackAI (.bin)",
     "description": "Import FlatOut 2 AI path data (trackai.bin +.bed +camera.ini)",
@@ -56,8 +56,8 @@ class AINode:
         'forward',            # forward direction (normalized)
         'right_dir',          # right/lateral direction (normalized)
         'interp_weights',     # 3 interpolation weights
-        'width_left',         # track half-width to left
-        'width_right',        # track half-width to right
+        'segment_length',     # distance to the next node in the linked list
+        'corridor_width',     # centre-to-`left` distance
         'cumul_distance',     # cumulative distance along spline
         'unk_neg1',           # always -1.0
         'speed_hint',         # speed / priority hint
@@ -205,8 +205,8 @@ def parse_node(data, offset):
 
     # weights and widths
     node.interp_weights, offset = read_vec3(data, offset)
-    node.width_left, offset = read_f32(data, offset)
-    node.width_right, offset = read_f32(data, offset)
+    node.segment_length, offset = read_f32(data, offset)
+    node.corridor_width, offset = read_f32(data, offset)
 
     # distance and tail data
     node.cumul_distance, offset = read_f32(data, offset)
@@ -911,8 +911,8 @@ def create_node_empties(name, nodes, scale, collection):
         empty['fo2_forward'] = list(node.forward)
         empty['fo2_right_dir'] = list(node.right_dir)
         empty['fo2_interp_weights'] = list(node.interp_weights)
-        empty['fo2_width_left'] = node.width_left
-        empty['fo2_width_right'] = node.width_right
+        empty['fo2_segment_length'] = node.segment_length
+        empty['fo2_corridor_width'] = node.corridor_width
         empty['fo2_cumul_distance'] = node.cumul_distance
         empty['fo2_unk_neg1'] = node.unk_neg1
         empty['fo2_speed_hint'] = node.speed_hint
