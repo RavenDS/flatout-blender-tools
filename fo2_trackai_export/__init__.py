@@ -1,7 +1,7 @@
 bl_info = {
     "name":        "FlatOut 2 TrackAI Exporter",
     "author":      "ravenDS, additional edits by Cryptid",
-    "version":     (2, 3, 2),
+    "version":     (2, 3, 3),
     "blender":     (3, 6, 0),
     "location":    "File > Export > FlatOut 2 TrackAI (.bin)",
     "description": "Export FlatOut 2 AI path data (trackai.bin + .bed)",
@@ -293,14 +293,23 @@ def _discover_section_collections(root_col):
     return [(child.name.replace("TrackAI_", "", 1), child) for _, child in found]
 
 
-def _ordered_open_ribbon_rows(ribbon_obj):
-    """Return ordered (left_vertex, right_vertex) rows for an open quad strip.
+def _ordered_ribbon_rows(ribbon_obj):
+    """Return ordered (left_vertex, right_vertex) rows for a quad strip.
 
     Blender mesh edits do not preserve the importer's alternating vertex-index
     convention. Follow shared quad edges instead, then keep each side
     continuous by choosing the orientation with the shortest rail-to-rail
-    movement. Non-strip or closed topology returns None so callers can retain
-    the legacy index-pair fallback.
+    movement.
+
+    Handles both open strips (two end faces) and closed loops (every face has
+    exactly two neighbours). The closed case matters because a race circuit's
+    main route is a loop: falling back to alternating indices there pairs each
+    row across a quad *diagonal* instead of across the track, which skews every
+    boundary by one row, swaps the two rails at the seam, and then defeats
+    _detect_ribbon_closure so the loop is also exported as an open path.
+
+    Non-strip topology returns None so callers can retain the legacy
+    index-pair fallback.
     """
     mesh = ribbon_obj.data
     polygons = list(mesh.polygons)
@@ -330,9 +339,10 @@ def _ordered_open_ribbon_rows(ribbon_obj):
 
     endpoints = [i for i, neighbours in enumerate(adjacency)
                  if len(neighbours) == 1]
-    if len(endpoints) != 2 or any(len(neighbours) not in (1, 2)
-                                  for neighbours in adjacency):
+    if len(endpoints) not in (0, 2) or any(len(neighbours) not in (1, 2)
+                                           for neighbours in adjacency):
         return None
+    is_loop = not endpoints
 
     def shared_edge(face_a, face_b):
         common = set(face_edges[face_a]).intersection(face_edges[face_b])
@@ -349,33 +359,85 @@ def _ordered_open_ribbon_rows(ribbon_obj):
         terminal = terminal_edge(face_index, inner) if inner else None
         return min(terminal) if terminal else len(mesh.vertices)
 
-    current = min(endpoints, key=endpoint_key)
-    ordered_faces = []
-    previous = None
-    while current is not None:
-        ordered_faces.append(current)
-        following = [index for index in adjacency[current]
-                     if index != previous]
-        if len(following) > 1:
-            return None
-        previous, current = current, (following[0] if following else None)
-    if len(ordered_faces) != len(polygons):
-        return None
+    def ascending_score(row_list):
+        return sum(1 for i in range(len(row_list) - 1)
+                   if min(row_list[i + 1]) > min(row_list[i]))
 
-    first_shared = shared_edge(ordered_faces[0], ordered_faces[1])
-    last_shared = shared_edge(ordered_faces[-2], ordered_faces[-1])
-    first_row = terminal_edge(ordered_faces[0], first_shared)
-    last_row = terminal_edge(ordered_faces[-1], last_shared)
-    if first_row is None or last_row is None:
-        return None
-
-    unordered_rows = [first_row]
-    for i in range(len(ordered_faces) - 1):
-        row = shared_edge(ordered_faces[i], ordered_faces[i + 1])
-        if row is None:
+    if is_loop:
+        # Walk the face cycle. Unlike an open strip, the first step has two
+        # candidate neighbours, so seed `previous` with the start face itself
+        # instead of None — otherwise the walk aborts immediately.
+        ordered_faces = [0]
+        previous = 0
+        current = min(adjacency[0])
+        while current != 0:
+            ordered_faces.append(current)
+            following = [index for index in adjacency[current]
+                         if index != previous]
+            if len(following) != 1:
+                return None
+            previous, current = current, following[0]
+        if len(ordered_faces) != len(polygons):
             return None
-        unordered_rows.append(row)
-    unordered_rows.append(last_row)
+
+        # One row per face: the edge shared with the preceding face. Taking
+        # index -1 first picks up the wrap-around seam between last and first.
+        unordered_rows = [shared_edge(ordered_faces[i - 1], ordered_faces[i])
+                          for i in range(len(ordered_faces))]
+        if any(row is None for row in unordered_rows):
+            return None
+
+        # Anchor on the row holding the lowest vertex index so an
+        # importer-built loop still starts at (left[0], right[0]).
+        anchor = min(range(len(unordered_rows)),
+                     key=lambda i: min(unordered_rows[i]))
+        unordered_rows = unordered_rows[anchor:] + unordered_rows[:anchor]
+
+        # Travel direction is topologically ambiguous on a loop. Prefer
+        # ascending vertex numbering, which reproduces the importer's original
+        # order exactly and follows the modelling order on hand-built ribbons.
+        # Use "Reverse Track" afterwards if the chosen direction is wrong.
+        reversed_rows = [unordered_rows[0]] + unordered_rows[1:][::-1]
+        if ascending_score(reversed_rows) > ascending_score(unordered_rows):
+            unordered_rows = reversed_rows
+    else:
+        current = min(endpoints, key=endpoint_key)
+        ordered_faces = []
+        previous = None
+        while current is not None:
+            ordered_faces.append(current)
+            following = [index for index in adjacency[current]
+                         if index != previous]
+            if len(following) > 1:
+                return None
+            previous, current = current, (following[0] if following else None)
+        if len(ordered_faces) != len(polygons):
+            return None
+
+        first_shared = shared_edge(ordered_faces[0], ordered_faces[1])
+        last_shared = shared_edge(ordered_faces[-2], ordered_faces[-1])
+        first_row = terminal_edge(ordered_faces[0], first_shared)
+        last_row = terminal_edge(ordered_faces[-1], last_shared)
+        if first_row is None or last_row is None:
+            return None
+
+        unordered_rows = [first_row]
+        for i in range(len(ordered_faces) - 1):
+            row = shared_edge(ordered_faces[i], ordered_faces[i + 1])
+            if row is None:
+                return None
+            unordered_rows.append(row)
+        unordered_rows.append(last_row)
+
+    # In a genuine quad strip every row is a rung across the track, so the
+    # rows must be pairwise vertex-disjoint. Fan/grid topologies can still
+    # form a valid face cycle (e.g. a 2x2 grid meeting at a centre vertex),
+    # and would otherwise be accepted and silently mis-paired.
+    row_vertices = set()
+    for row in unordered_rows:
+        row_vertices.update(row)
+    if len(row_vertices) != 2 * len(unordered_rows):
+        return None
 
     world = [ribbon_obj.matrix_world @ vertex.co
              for vertex in mesh.vertices]
@@ -398,9 +460,10 @@ def _ordered_open_ribbon_rows(ribbon_obj):
 def _extract_boundaries_from_ribbon(sec_col):
     """Derive left/right boundary point lists from a section's Ribbon mesh.
 
-    Open quad ribbons are read from their face topology, which remains valid
-    after extrusion/subdivision even when Blender changes vertex numbering.
-    Other topology falls back to the importer's alternating convention:
+    Quad ribbons are read from their face topology, which remains valid after
+    extrusion/subdivision even when Blender changes vertex numbering, and works
+    for both open stems and closed circuit loops. Other topology falls back to
+    the importer's alternating convention:
     v[0]=left[0], v[1]=right[0], v[2]=left[1], v[3]=right[1], ...
 
     Handles odd-length vertex lists by trimming the trailing unpaired vertex,
@@ -442,13 +505,13 @@ def _extract_boundaries_from_ribbon(sec_col):
               f"(pairing may be slightly off — inspect the mesh if the "
               f"generated boundaries look wrong)")
         n_verts -= 1
-    rows = _ordered_open_ribbon_rows(ribbon_obj)
+    rows = _ordered_ribbon_rows(ribbon_obj)
     if rows is not None:
-        print(f"[TrackAI Export] '{sec_col.name}': reading Ribbon as an "
-              f"open quad strip ({len(rows)} rows)")
+        print(f"[TrackAI Export] '{sec_col.name}': reading Ribbon from quad "
+              f"strip topology ({len(rows)} rows)")
     else:
         rows = [(i, i + 1) for i in range(0, n_verts, 2)]
-        print(f"[TrackAI Export] '{sec_col.name}': Ribbon is not an open "
+        print(f"[TrackAI Export] '{sec_col.name}': Ribbon is not a single "
               f"quad strip; using alternating vertex indices")
 
     lefts = []
@@ -941,12 +1004,28 @@ def _infer_path0_branch_refs(main_centers, branch_centers,
                              main_is_closed=True):
     """Infer an open branch's incoming/outgoing Path0 sequence links.
 
-    FlatOut treats these as departure/continuation links: the branch starts
-    after its nearest Path0 segment and rejoins at the node following its
-    nearest final Path0 segment.
+    FlatOut treats these as departure/continuation links: the branch departs
+    from its nearest Path0 node and rejoins at the node following the one its
+    final point sits closest to.
+
+    The rejoin node is rounded by the projection factor along the nearest
+    segment rather than always taking segment_index + 1. Measured against all
+    48 vanilla trackai.bin files (81 alternate routes), rounding reproduces the
+    shipped rejoin node in 62/81 branches versus 22/81 for the unrounded rule;
+    departure links match in 80/81 either way. The residual few differ by one
+    node, which suggests the original authors picked some rejoin points by
+    hand — so treat the result as a good default, not gospel.
+
+    A branch whose ribbon rows run backwards along Path0 is NOT corrected
+    here: reversing only the inferred links while the node sequence keeps its
+    original order produces a file whose links and geometry disagree, which is
+    worse than either alone. Such a section is reported by the export instead,
+    so its ribbon can be flipped at source.
     """
     if len(main_centers) < 2 or len(branch_centers) < 2:
         return None, None
+    n_main = len(main_centers)
+
     start_hit = _nearest_route_segment(
         branch_centers[0], main_centers, main_is_closed)
     end_hit = _nearest_route_segment(
@@ -955,12 +1034,147 @@ def _infer_path0_branch_refs(main_centers, branch_centers,
         return None, None
 
     prev_seq = int(start_hit[0])
-    end_segment = int(end_hit[0])
+    end_node = int(end_hit[0]) + (1 if float(end_hit[1]) >= 0.5 else 0)
     if main_is_closed:
-        next_seq = (end_segment + 1) % len(main_centers)
+        next_seq = (end_node + 1) % n_main
     else:
-        next_seq = min(end_segment + 1, len(main_centers) - 1)
+        next_seq = min(end_node + 1, n_main - 1)
     return (0, prev_seq), (0, next_seq)
+
+
+def _startgrid_route_direction(root_col, row_centers):
+    """Infer main-route travel direction from the start grid, in FO2 axes.
+
+    Returns (+1 keep, -1 reverse, 0 undecided, reason_text).
+
+    Two independent signals, both measured against the route tangent at the
+    node nearest the finish line:
+
+      * Primary — the mean facing direction of the startpoint empties. The
+        importer maps FO2 rot row 2 (forward) onto the empty's local +Y, so
+        that column of matrix_world is the direction the cars face on the
+        grid. Agrees with the vanilla Path0 node order in 46 of 48 tracks
+        (mean dot +0.82).
+      * Corroborating — the vector from the start grid centroid to the final
+        splitpoint. The grid sits *behind* the start/finish line, so this
+        points along travel. Agrees in 45 of 48 tracks.
+
+    Both must agree before a reversal is reported, because the two tracks
+    where the primary signal disagrees with vanilla (a nascar layout and a
+    stunt map) are exactly the cases where guessing would flip a correct
+    route. Derby and stunt arenas produce weak readings (|dot| ~ 0.3) since
+    their routes barely resemble a circuit, hence the magnitude floor.
+    """
+    if len(row_centers) < 5:
+        return 0, "route too short to measure a tangent"
+
+    start_col = None
+    split_col = None
+    for child in root_col.children:
+        if child.name.startswith("TrackAI_Startpoints"):
+            start_col = child
+        elif child.name.startswith("TrackAI_Splitpoints"):
+            split_col = child
+
+    forwards = []
+    positions = []
+    if start_col is not None:
+        for obj in start_col.objects:
+            if obj.type != 'EMPTY':
+                continue
+            if int(obj.get('fo2_startpoint_index', -1)) < 0:
+                continue
+            basis = obj.matrix_world.to_3x3()
+            fwd_bl = (basis[0][1], basis[1][1], basis[2][1])
+            forwards.append((fwd_bl[0], fwd_bl[2], fwd_bl[1]))
+            loc = obj.matrix_world.translation
+            positions.append((loc[0], loc[2], loc[1]))
+    if not forwards:
+        return 0, "no startpoints found"
+
+    grid_forward = normalize(tuple(
+        sum(f[k] for f in forwards) / len(forwards) for k in range(3)))
+    grid_center = tuple(
+        sum(p[k] for p in positions) / len(positions) for k in range(3))
+
+    # Finish line = highest-indexed splitpoint gate; its mesh vertex 1 is the
+    # gate centre (vertices 0/1/2 = left/position/right per the importer).
+    finish = None
+    if split_col is not None:
+        best = -1
+        for obj in split_col.objects:
+            if obj.type != 'MESH' or len(obj.data.vertices) < 3:
+                continue
+            idx = int(obj.get('fo2_splitpoint_index', -1))
+            if idx > best:
+                world = obj.matrix_world @ obj.data.vertices[1].co
+                finish = (world[0], world[2], world[1])
+                best = idx
+
+    reference = finish if finish is not None else grid_center
+    n = len(row_centers)
+    near = min(range(n),
+               key=lambda i: vec_dist(row_centers[i], reference))
+    tangent = normalize(vec_sub(row_centers[(near + 2) % n],
+                                row_centers[(near - 2) % n]))
+    if tangent is None or all(abs(v) < 1e-9 for v in tangent):
+        return 0, "route tangent is degenerate at the start line"
+
+    primary = (grid_forward[0] * tangent[0] + grid_forward[1] * tangent[1]
+               + grid_forward[2] * tangent[2])
+    if abs(primary) < 0.35:
+        return 0, (f"start grid faces almost across the route "
+                   f"(dot {primary:+.2f}); too weak to judge")
+
+    if finish is not None:
+        offset = normalize(vec_sub(finish, grid_center))
+        if offset is not None:
+            secondary = (offset[0] * tangent[0] + offset[1] * tangent[1]
+                         + offset[2] * tangent[2])
+            if secondary * primary < 0.0:
+                return 0, (f"startpoint facing (dot {primary:+.2f}) and grid "
+                           f"placement behind the finish line "
+                           f"(dot {secondary:+.2f}) disagree")
+
+    if primary > 0.0:
+        return 1, f"start grid agrees with ribbon order (dot {primary:+.2f})"
+    return -1, f"start grid opposes ribbon order (dot {primary:+.2f})"
+
+
+def _branch_runs_against_route(main_centers, branch_centers, main_is_closed):
+    """True when a branch's node order runs backwards along the main route.
+
+    Compares where the branch's first and last points fall along the main
+    route. A branch is meant to be driven in the same direction as the route
+    it leaves and rejoins, so descending progression means the ribbon was
+    modelled from the rejoin end.
+    """
+    if len(main_centers) < 2 or len(branch_centers) < 3:
+        return False
+    start_hit = _nearest_route_segment(
+        branch_centers[0], main_centers, main_is_closed)
+    end_hit = _nearest_route_segment(
+        branch_centers[-1], main_centers, main_is_closed)
+    if start_hit is None or end_hit is None:
+        return False
+    n = len(main_centers)
+    forward_gap = (int(end_hit[0]) - int(start_hit[0])) % n
+    backward_gap = (int(start_hit[0]) - int(end_hit[0])) % n
+    return backward_gap < forward_gap
+
+
+def _empty_center_delta_fo2(empty, center_fo2):
+    """Return how far a node empty has been moved, in FO2 axes.
+
+    The importer places the empty at fo2_to_blender(fo2_center), so comparing
+    the current object location against that reconstructed position recovers
+    any user translation. Shared by _effective_node_centers and
+    build_section_nodes so the two can never drift apart.
+    """
+    import_bl = (center_fo2[0], center_fo2[2], center_fo2[1])
+    return (empty.location[0] - import_bl[0],
+            empty.location[2] - import_bl[2],
+            empty.location[1] - import_bl[1])
 
 
 def _effective_node_centers(curve_centers, empties):
@@ -970,10 +1184,7 @@ def _effective_node_centers(curve_centers, empties):
     result = []
     for i, empty in enumerate(empties):
         center = _read_vec3_prop(empty, 'fo2_center', curve_centers[i])
-        import_bl = (center[0], center[2], center[1])
-        delta_fo2 = (empty.location[0] - import_bl[0],
-                     empty.location[2] - import_bl[2],
-                     empty.location[1] - import_bl[1])
+        delta_fo2 = _empty_center_delta_fo2(empty, center)
         result.append((center[0] + delta_fo2[0],
                        center[1] + delta_fo2[1],
                        center[2] + delta_fo2[2]))
@@ -993,7 +1204,8 @@ def build_section_nodes(centers, lefts, rights, targets, n, is_closed,
                         branch_prev_ref=None, branch_next_ref=None,
                         speed_lookahead=3, speed_radius_threshold=7071.0,
                         generate_speed_hints=True,
-                        prefer_curve_target=False):
+                        prefer_curve_target=False,
+                        main_route_centers=None):
     """Build binary node data for one section
     
     If empties are present, their fields are read as the roundtrip source.
@@ -1064,18 +1276,67 @@ def build_section_nodes(centers, lefts, rights, targets, n, is_closed,
         target = targets[i] if i < len(targets) else mid
 
         forward = compute_forward(centers, i, n, is_closed)
-        right_dir_vec = vec_sub(right, left)
-        right_dir = normalize(right_dir_vec)
-        up = normalize(cross(forward, right_dir))
+        # Exact vanilla rule: right_dir == cross(world_up, forward), i.e.
+        # (forward.z, 0, -forward.x), left UNNORMALISED so its length is the
+        # horizontal length of forward. This reproduces the stored field
+        # bit-for-bit in all 6639 vanilla nodes (max component error 0.0).
+        # Deriving it from the boundary points instead only agreed to ~0.98
+        # and, before that, had the sign inverted, which also flipped the
+        # derived up vector to point downward.
+        right_dir = (forward[2], 0.0, -forward[0])
+        right_unit = normalize(right_dir)
+        if all(abs(v) < 1e-9 for v in right_unit):
+            # Forward is (near) vertical, so the horizontal cross degenerates.
+            right_unit = normalize(vec_sub(left, right))
+            if all(abs(v) < 1e-9 for v in right_unit):
+                right_unit = (1.0, 0.0, 0.0)
+        up = normalize(cross(forward, right_unit))
 
         rotation = (
-            right_dir[0], up[0], forward[0],
-            right_dir[1], up[1], forward[1],
-            right_dir[2], up[2], forward[2],
+            right_unit[0], up[0], forward[0],
+            right_unit[1], up[1], forward[1],
+            right_unit[2], up[2], forward[2],
         )
 
-        width_left = vec_dist(center, left)
-        width_right = vec_dist(center, right)
+        # The two floats at node offsets 152 and 156 are NOT a left/right
+        # width pair, despite the fo2_width_left / fo2_width_right property
+        # names the importer gives them.
+        #
+        # Offset 156 is the corridor width: exactly vec_dist(center, left) in
+        # all 6639 vanilla nodes (max error 1e-5).
+        #
+        # Offset 152 is the distance to the NEXT node along the linked list,
+        # i.e. the length of the segment leaving this node. Evidence, measured
+        # over every vanilla file:
+        #   * cumul_distance[i+1] == cumul_distance[i] + field152[i] holds to
+        #     float precision for 4856 of 4857 main-route nodes;
+        #   * following the node_index forward pointer (i+1, wrapping to 0 on
+        #     a closed section, and the Path0 rejoin node for the last node of
+        #     an open branch) gives a median signed error of +0.006 against
+        #     the chord, with the residual spread symmetric about zero.
+        # The old code wrote centre-to-boundary distances into both slots,
+        # which put a track width where the game expects an arc length.
+        corridor_width = vec_dist(center, left)
+
+        if i < n - 1:
+            next_center = centers[i + 1]
+        elif is_closed:
+            next_center = centers[0]
+        elif (main_route_centers and branch_next_seq is not None
+                and 0 <= branch_next_seq < len(main_route_centers)):
+            # Open branch: the node after the last one lives on the main route.
+            next_center = main_route_centers[branch_next_seq]
+        else:
+            next_center = None
+
+        if next_center is not None:
+            segment_length = vec_dist(center, next_center)
+        elif n >= 2:
+            # No successor to measure to; reuse the incoming segment so the
+            # value stays in a plausible range instead of collapsing to zero.
+            segment_length = vec_dist(centers[i - 1], center)
+        else:
+            segment_length = 0.0
 
         if i == 0:
             cumul = 0.0
@@ -1160,11 +1421,7 @@ def build_section_nodes(centers, lefts, rights, targets, n, is_closed,
 
             # apply movement delta: derive import location from fo2_center,
             # compare to current obj.location, apply delta to all positions
-            import_bl = (center[0], center[2], center[1])  # fo2_to_blender
-            delta_bl = (e.location[0] - import_bl[0],
-                        e.location[1] - import_bl[1],
-                        e.location[2] - import_bl[2])
-            delta_fo2 = (delta_bl[0], delta_bl[2], delta_bl[1])  # blender_to_fo2
+            delta_fo2 = _empty_center_delta_fo2(e, center)
             if abs(delta_fo2[0]) > 1e-6 or abs(delta_fo2[1]) > 1e-6 or abs(delta_fo2[2]) > 1e-6:
                 center = (center[0] + delta_fo2[0], center[1] + delta_fo2[1], center[2] + delta_fo2[2])
                 left = (left[0] + delta_fo2[0], left[1] + delta_fo2[1], left[2] + delta_fo2[2])
@@ -1188,8 +1445,11 @@ def build_section_nodes(centers, lefts, rights, targets, n, is_closed,
                 interp_weights = tuple(float(v) for v in stored_iw)
 
             # scalar fields
-            width_left = float(e.get('fo2_width_left', width_left))
-            width_right = float(e.get('fo2_width_right', width_right))
+            # Property names come from the importer and are historical: they
+            # actually carry the segment length (152) and corridor width (156).
+            # Read verbatim so imported/edited nodes round-trip exactly.
+            segment_length = float(e.get('fo2_width_left', segment_length))
+            corridor_width = float(e.get('fo2_width_right', corridor_width))
             cumul = float(e.get('fo2_cumul_distance', cumul))
             unk_neg1 = float(e.get('fo2_unk_neg1', unk_neg1))
             speed_hint = float(e.get('fo2_speed_hint', speed_hint))
@@ -1202,14 +1462,16 @@ def build_section_nodes(centers, lefts, rights, targets, n, is_closed,
             sentinel2 = int(e.get('fo2_sentinel2', sentinel2))
             unk5 = int(e.get('fo2_unk5', unk5))
 
-        # Geometry-derived branch endpoint links remain authoritative even
-        # when imported/generated empties contain stale endpoint self-links.
-        if section_index > 0 and not is_closed:
-            if is_first and branch_prev_seq is not None:
-                prev_index = branch_prev_seq
-                sentinel2 = prev_index + 1
-            if is_last and branch_next_seq is not None:
-                node_index = branch_next_seq
+        # Endpoint links are NOT re-derived here. When a section has node
+        # empties they carry the authoritative links: either imported from the
+        # original trackai.bin, or written by _sync_node_empties from a
+        # previous export whose links came from _infer_path0_branch_refs.
+        # Overriding them from geometry on every export was measurably lossy:
+        # the inference reproduces both vanilla endpoint links in only 61 of 81
+        # alternate routes, so a plain import/export round-trip silently
+        # rewrote roughly a quarter of them. After reshaping Path0 or a branch
+        # the stored links do go stale; "Reconnect Alternate Routes"
+        # recomputes them on demand.
 
         # write node (208 bytes)
         buf += struct.pack('<I', TAG_NODE_START)
@@ -1226,8 +1488,8 @@ def build_section_nodes(centers, lefts, rights, targets, n, is_closed,
         buf += struct.pack('<3f', *[float(v) for v in forward])
         buf += struct.pack('<3f', *[float(v) for v in right_dir])
         buf += struct.pack('<3f', *[float(v) for v in interp_weights])
-        buf += struct.pack('<f', float(width_left))
-        buf += struct.pack('<f', float(width_right))
+        buf += struct.pack('<f', float(segment_length))   # offset 152
+        buf += struct.pack('<f', float(corridor_width))   # offset 156
         buf += struct.pack('<f', float(cumul))
         buf += struct.pack('<f', float(unk_neg1))
         buf += struct.pack('<f', float(speed_hint))
@@ -1373,6 +1635,7 @@ def export_trackai(filepath, context, options):
         speed_radius_threshold = float(options.get('speed_radius_threshold', 7071.0))
         generate_speed_hints = bool(options.get('generate_speed_hints', True))
         flip_boundaries = bool(options.get('flip_boundaries', False))
+        align_to_startgrid = bool(options.get('align_to_startgrid', False))
         main_route_centers = None
         main_route_is_closed = True
 
@@ -1411,6 +1674,57 @@ def export_trackai(filepath, context, options):
                               f"flip_boundaries=True, swapping L/R "
                               f"before generation")
                         r_lefts, r_rights = r_rights, r_lefts
+
+                    # Optional: orient the main route to the start grid. A
+                    # closed ribbon's travel direction is topologically
+                    # ambiguous, so the row order follows how the mesh was
+                    # modelled. Reversing travel also swaps which rail is on
+                    # the geometric right, so the two lists are reversed AND
+                    # exchanged, matching _swap_and_reverse_curves. Applied
+                    # before curve creation so the generated boundaries are
+                    # stored the right way round and every later export just
+                    # follows them.
+                    if align_to_startgrid and sec_i == 0:
+                        row_centers = [
+                            vec_scale(vec_add(a, b), 0.5)
+                            for a, b in zip(r_lefts, r_rights)]
+                        facing, reason = _startgrid_route_direction(
+                            root_col, row_centers)
+                        if facing < 0:
+                            print(f"[TrackAI Export] Section '{sec_name}': "
+                                  f"reversing route direction — {reason}")
+                            r_lefts, r_rights = (list(reversed(r_rights)),
+                                                 list(reversed(r_lefts)))
+                        elif facing > 0:
+                            print(f"[TrackAI Export] Section '{sec_name}': "
+                                  f"keeping route direction — {reason}")
+                        else:
+                            print(f"[TrackAI Export] Section '{sec_name}': "
+                                  f"start-grid alignment skipped — {reason}")
+
+                    # Alternate routes are never ambiguous: across all 48
+                    # vanilla trackai.bin files, all 81 alternate routes run
+                    # in the main route's direction and none of them loops
+                    # (verified by endpoint progression, stored link order,
+                    # projection monotonicity and per-node heading against
+                    # the Path0 tangent — 80/81 agree on every sampled node,
+                    # the last differing on a single junction node). So a
+                    # branch ribbon modelled from its rejoin end is simply
+                    # backwards and is corrected here rather than guessed at.
+                    # No user option: unlike the main route's direction this
+                    # is determined, not inferred.
+                    if sec_i > 0 and main_route_centers:
+                        row_centers = [
+                            vec_scale(vec_add(a, b), 0.5)
+                            for a, b in zip(r_lefts, r_rights)]
+                        if _branch_runs_against_route(main_route_centers,
+                                                      row_centers,
+                                                      main_route_is_closed):
+                            print(f"[TrackAI Export] Section '{sec_name}': "
+                                  f"ribbon runs backwards along the main "
+                                  f"route — reversing to match")
+                            r_lefts, r_rights = (list(reversed(r_rights)),
+                                                 list(reversed(r_lefts)))
 
                     # Auto-detect closure from the ribbon's actual geometry.
                     # The section's `fo2_is_closed` defaults to True (line
@@ -1580,22 +1894,49 @@ def export_trackai(filepath, context, options):
                 main_route_centers = effective_centers
                 main_route_is_closed = bool(is_closed)
 
-            # Infer open alternate-route endpoints from Path0 geometry even
-            # when node empties exist; generated empties commonly retain
-            # endpoint self-links which isolate the branch from the game graph.
+            # Direction check runs regardless of what the section already
+            # holds. A backwards branch derived from a Ribbon was corrected
+            # above, so reaching here means the section's own curves and/or
+            # node empties encode the wrong direction. Those are existing
+            # scene data that export must not rewrite in place -- reversing
+            # requires swapping the boundaries and regenerating the CenterLine
+            # on the opposite side -- so report and point at the operator.
+            if (sec_i > 0 and not is_closed and main_route_centers
+                    and _branch_runs_against_route(main_route_centers,
+                                                   effective_centers,
+                                                   main_route_is_closed)):
+                print(f"[TrackAI Export] WARNING: section '{sec_name}' runs "
+                      f"backwards along the main route. Every vanilla "
+                      f"alternate route follows the main route's direction, "
+                      f"so the AI will drive this one against the traffic. "
+                      f"Run \"TrackAI: Reconnect Alternate Routes\" to flip "
+                      f"it, then generate again.")
+
+            # Infer open alternate-route endpoints from Path0 geometry only
+            # when the section has no node empties. Once empties exist they are
+            # authoritative: imported vanilla links must survive a round-trip,
+            # and a from-scratch section's empties were themselves created by
+            # _sync_node_empties from a previous export whose links came from
+            # this same inference. Use "Reconnect Alternate Routes" to
+            # recompute links for a section that already has empties.
             branch_prev_ref = None
             branch_next_ref = None
-            if (sec_i > 0 and not is_closed and main_route_centers):
+            if (sec_i > 0 and not is_closed and main_route_centers
+                    and not empties):
                 branch_prev_ref, branch_next_ref = _infer_path0_branch_refs(
                     main_route_centers, effective_centers,
                     main_route_is_closed)
                 if branch_prev_ref and branch_next_ref:
-                    sec_col['fo2_branch_prev_ref'] = list(branch_prev_ref)
-                    sec_col['fo2_branch_next_ref'] = list(branch_next_ref)
                     print(f"[TrackAI Export] Section '{sec_name}': "
                           f"connected to Path0 "
                           f"prev={branch_prev_ref[1]}, "
                           f"next={branch_next_ref[1]}")
+                    # Record only when the user has nothing stored, so a
+                    # hand-tuned link is never silently replaced.
+                    if sec_col.get('fo2_branch_prev_ref') is None:
+                        sec_col['fo2_branch_prev_ref'] = list(branch_prev_ref)
+                    if sec_col.get('fo2_branch_next_ref') is None:
+                        sec_col['fo2_branch_next_ref'] = list(branch_next_ref)
 
             # Stored refs remain the fallback when geometry inference is not
             # possible, for example with an incomplete main route.
@@ -1626,7 +1967,8 @@ def export_trackai(filepath, context, options):
                 speed_lookahead=speed_lookahead,
                 speed_radius_threshold=speed_radius_threshold,
                 generate_speed_hints=generate_speed_hints,
-                prefer_curve_target=prefer_curve_target)
+                prefer_curve_target=prefer_curve_target,
+                main_route_centers=main_route_centers)
             f.write(node_data)
 
             # Mirror the just-written node records back into Blender as per-node
@@ -1840,11 +2182,7 @@ def _gather_section_node_data(section_cols):
             seq = int(e.get('fo2_seq_index', 0))
             if center and left and right:
                 # apply movement delta from empty location
-                import_bl = (center[0], center[2], center[1])
-                delta_bl = (e.location[0] - import_bl[0],
-                            e.location[1] - import_bl[1],
-                            e.location[2] - import_bl[2])
-                delta_fo2 = (delta_bl[0], delta_bl[2], delta_bl[1])
+                delta_fo2 = _empty_center_delta_fo2(e, center)
                 if abs(delta_fo2[0]) > 1e-6 or abs(delta_fo2[1]) > 1e-6 or abs(delta_fo2[2]) > 1e-6:
                     center = (center[0] + delta_fo2[0], center[1] + delta_fo2[1], center[2] + delta_fo2[2])
                     left = (left[0] + delta_fo2[0], left[1] + delta_fo2[1], left[2] + delta_fo2[2])
@@ -3029,6 +3367,18 @@ class FO2_OT_PreviewTrackAI(bpy.types.Operator):
         default=7071.0, min=100.0, max=30000.0, step=100, precision=1,
     )
 
+    align_to_startgrid: bpy.props.BoolProperty(
+        name="Align Route to Start Grid",
+        description=(
+            "When boundaries are derived from a Ribbon, orient the main "
+            "route to the start grid instead of to the mesh's vertex order. "
+            "Uses the direction the startpoints face, cross-checked against "
+            "their placement behind the last splitpoint, and leaves the "
+            "route untouched if the two disagree or the reading is weak. "
+            "Has no effect on sections that already have boundary curves"
+        ),
+        default=False,
+    )
     flip_boundaries: bpy.props.BoolProperty(
         name="Flip boundaries",
         description="Swap Left and Right boundaries when they get derived "
@@ -3084,6 +3434,7 @@ class FO2_OT_PreviewTrackAI(bpy.types.Operator):
         box = layout.box()
         box.label(text="Boundaries", icon='MOD_MIRROR')
         box.prop(self, "flip_boundaries")
+        box.prop(self, "align_to_startgrid")
 
     def execute(self, context):
         export_fn = _find_export_trackai()
@@ -3111,6 +3462,7 @@ class FO2_OT_PreviewTrackAI(bpy.types.Operator):
             'speed_radius_threshold': float(self.speed_radius_threshold),
             'generate_speed_hints': self.generate_speed_hints,
             'flip_boundaries': self.flip_boundaries,
+            'align_to_startgrid': self.align_to_startgrid,
         }
 
         try:
@@ -3635,6 +3987,158 @@ class TRACKAI_OT_rotate_splitpoints_to_route(bpy.types.Operator):
         _refresh_ui(context)
         self.report({'INFO'},
                     f"Aligned and renumbered {len(gates)} splitpoints")
+        return {'FINISHED'}
+
+
+class TRACKAI_OT_reconnect_alternate_routes(bpy.types.Operator):
+    """Align alternate routes to Path0: direction, then departure/rejoin links"""
+    bl_idname = "trackai.reconnect_alternate_routes"
+    bl_label = "TrackAI: Reconnect Alternate Routes"
+    bl_description = (
+        "Fix open alternate routes against Path0: reverse any that run "
+        "backwards, and re-derive departure/rejoin links for the rest. "
+        "Needed after reshaping Path0 or a branch, because node empties hold "
+        "the authoritative links and the export will not overwrite them"
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        if context.mode != 'OBJECT':
+            return False
+        root = find_trackai_root(context)
+        return root is not None
+
+    @staticmethod
+    def _section_centers(sec_col, sec_name):
+        """FO2-space node centres for a section, or None when unavailable."""
+        empties = gather_empties(sec_col, sec_name)
+        if len(empties) < 2:
+            return None, empties
+        centers = []
+        for empty in empties:
+            location = empty.location
+            fallback = (location[0], location[2], location[1])
+            center = _read_vec3_prop(empty, 'fo2_center', fallback)
+            delta_fo2 = _empty_center_delta_fo2(empty, center)
+            centers.append((center[0] + delta_fo2[0],
+                            center[1] + delta_fo2[1],
+                            center[2] + delta_fo2[2]))
+        return centers, empties
+
+    @staticmethod
+    def _flip_backwards_section(sec_col):
+        """Reverse a section that runs against the main route.
+
+        Mirrors Reverse Track's per-section step. _swap_and_reverse_curves
+        leaves each boundary object holding the data it should now hold, so no
+        renaming is needed. The CenterLine is deleted rather than reversed
+        because it sits a fixed offset to one side of the boundaries: after
+        the swap that offset points the wrong way, so it must be regenerated.
+        Node empties are dropped so they rebuild from the corrected curves,
+        which also lets the next export re-infer the Path0 links.
+        """
+        center = target = left = right = None
+        for obj in sec_col.objects:
+            if obj.type != 'CURVE':
+                continue
+            if "_CenterLine" in obj.name:
+                center = obj
+            elif "_TargetLine" in obj.name:
+                target = obj
+            elif "_LeftBoundary" in obj.name:
+                left = obj
+            elif "_RightBoundary" in obj.name:
+                right = obj
+        if left is None or right is None:
+            return False, "no boundary curve pair to flip"
+        _swap_and_reverse_curves(left, right)
+        if target is not None:
+            _reverse_nurbs_points_inplace(target)
+        if center is not None:
+            try:
+                bpy.data.objects.remove(center, do_unlink=True)
+            except Exception:
+                pass
+        dropped = _delete_node_empties_in_section(sec_col)
+        return True, (f"CenterLine and {dropped} node empties dropped for "
+                      f"regeneration")
+
+    def execute(self, context):
+        root = find_trackai_root(context)
+        sections = _discover_section_collections(root)
+        if not sections:
+            self.report({'ERROR'}, "No TrackAI section collections found")
+            return {'CANCELLED'}
+
+        main_name, main_col = sections[0]
+        main_centers, _ = self._section_centers(main_col, main_name)
+        if main_centers is None:
+            self.report({'ERROR'},
+                        f"'{main_name}' has fewer than two node empties - "
+                        f"export once to generate them first")
+            return {'CANCELLED'}
+        main_is_closed = bool(main_col.get('fo2_is_closed', True))
+
+        repaired = 0
+        flipped = 0
+        skipped = []
+        for sec_name, sec_col in sections[1:]:
+            # Same default as the export path: a section without an explicit
+            # fo2_is_closed is treated as a closed loop, and a closed section
+            # carries no Path0 departure/rejoin links.
+            if bool(sec_col.get('fo2_is_closed', True)):
+                skipped.append(f"{sec_name} (closed)")
+                continue
+            centers, empties = self._section_centers(sec_col, sec_name)
+            if centers is None:
+                skipped.append(f"{sec_name} (no node empties)")
+                continue
+
+            # Direction first: no vanilla alternate route runs against the
+            # main route, so a backwards section is broken rather than a
+            # style choice. Flipping discards its nodes, so recomputing links
+            # now would be pointless -- the next generate rebuilds and links
+            # them from the corrected curves.
+            if _branch_runs_against_route(main_centers, centers,
+                                          main_is_closed):
+                ok, note = self._flip_backwards_section(sec_col)
+                if ok:
+                    flipped += 1
+                    print(f"[TrackAI] '{sec_name}': ran backwards along "
+                          f"{main_name}; reversed - {note}")
+                else:
+                    skipped.append(f"{sec_name} (backwards, {note})")
+                continue
+
+            prev_ref, next_ref = _infer_path0_branch_refs(
+                main_centers, centers, main_is_closed)
+            if not prev_ref or not next_ref:
+                skipped.append(f"{sec_name} (inference failed)")
+                continue
+
+            prev_seq = int(prev_ref[1])
+            next_seq = int(next_ref[1])
+            first, last = empties[0], empties[-1]
+            old_prev = int(first.get('fo2_prev_index', -1))
+            old_next = int(last.get('fo2_node_index', -1))
+            first['fo2_prev_index'] = prev_seq
+            first['fo2_sentinel2'] = prev_seq + 1
+            last['fo2_node_index'] = next_seq
+            sec_col['fo2_branch_prev_ref'] = [0, prev_seq]
+            sec_col['fo2_branch_next_ref'] = [0, next_seq]
+            repaired += 1
+            print(f"[TrackAI] '{sec_name}': prev {old_prev} -> {prev_seq}, "
+                  f"next {old_next} -> {next_seq}")
+
+        _refresh_ui(context)
+        message = f"Reconnected {repaired} alternate route(s) to {main_name}"
+        if flipped:
+            message += (f"; reversed {flipped} backwards route(s) - "
+                        f"generate again to rebuild their nodes")
+        if skipped:
+            message += f"; skipped {', '.join(skipped)}"
+        self.report({'INFO'}, message)
         return {'FINISHED'}
 
 
@@ -4380,6 +4884,18 @@ class ExportTrackAI(bpy.types.Operator, ExportHelper):
         default=True,
     )
 
+    align_to_startgrid: BoolProperty(
+        name="Align Route to Start Grid",
+        description=(
+            "When boundaries are derived from a Ribbon, orient the main "
+            "route to the start grid instead of to the mesh's vertex order. "
+            "Uses the direction the startpoints face, cross-checked against "
+            "their placement behind the last splitpoint, and leaves the "
+            "route untouched if the two disagree or the reading is weak. "
+            "Has no effect on sections that already have boundary curves"
+        ),
+        default=False,
+    )
     flip_boundaries: BoolProperty(
         name="Flip boundaries",
         description="Swap Left and Right boundaries when they get derived "
@@ -4487,6 +5003,7 @@ class ExportTrackAI(bpy.types.Operator, ExportHelper):
         box = layout.box()
         box.label(text="Boundaries", icon='MOD_MIRROR')
         box.prop(self, "flip_boundaries")
+        box.prop(self, "align_to_startgrid")
 
     def execute(self, context):
         # Only pass the auto-gen flags when they can actually do something —
@@ -4509,6 +5026,7 @@ class ExportTrackAI(bpy.types.Operator, ExportHelper):
             'speed_radius_threshold': float(self.speed_radius_threshold),
             'generate_speed_hints': self.generate_speed_hints,
             'flip_boundaries': self.flip_boundaries,
+            'align_to_startgrid': self.align_to_startgrid,
         }
         try:
             result = export_trackai(self.filepath, context, options)
@@ -4568,6 +5086,7 @@ def menu_func_object(self, context):
     self.layout.operator(FO2_OT_AddStandardStartpoints.bl_idname)
     self.layout.operator(FO2_OT_SnapStartpointsToRibbon.bl_idname)
     self.layout.operator(TRACKAI_OT_rotate_splitpoints_to_route.bl_idname)
+    self.layout.operator(TRACKAI_OT_reconnect_alternate_routes.bl_idname)
     self.layout.separator()
     self.layout.operator(FO2_OT_ReverseTrack.bl_idname)
     self.layout.operator(FO2_OT_ReverseNodeIndexes.bl_idname)
@@ -4585,6 +5104,7 @@ _CLASSES = (
     FO2_OT_ReverseNodeIndexes,
     FO2_OT_ReverseSplitpointIndexes,
     TRACKAI_OT_rotate_splitpoints_to_route,
+    TRACKAI_OT_reconnect_alternate_routes,
     TRACKAI_OT_ribbon_from_boundaries,
     TRACKAI_OT_boundaries_from_ribbon,
     ExportTrackAI,
