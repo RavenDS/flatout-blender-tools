@@ -1,7 +1,7 @@
 bl_info = {
     "name":        "FlatOut 2 TrackAI Exporter",
     "author":      "ravenDS, additional edits by Cryptid",
-    "version":     (2, 3, 4),
+    "version":     (2, 3, 5),
     "blender":     (3, 6, 0),
     "location":    "File > Export > FlatOut 2 TrackAI (.bin)",
     "description": "Export FlatOut 2 AI path data (trackai.bin + .bed)",
@@ -616,75 +616,152 @@ def _create_track_curve(sec_col, name, fo2_points, is_closed):
     return obj
 
 
-def _smoothed_racing_line(lefts, rights, t_base, iterations, is_closed, alpha=0.5):
-    """Produce a per-node racing line inside the (right, left) corridor.
+NODE_INSET = 3.0
 
-    Method: initialize each point at LERP(right, left, t_base), then run a
-    Chaikin-style smoothing pass N times — each pass blends every point 50%
-    toward the midpoint of its two neighbours, then reprojects and clamps to
-    stay on the (right, left) segment at that node.
 
-    Empirical fit across 15 vanilla tracks:
-      * Best universal defaults are t_base ≈ 0.30, iterations ≈ 10, alpha ≈ 0.5,
-        giving RMS ≈ 2.2u vs. vanilla targets (vs. ~5.5u for the old "always
-        inner boundary" approach).
-      * Straight sections stay near a constant t_base offset from the inner
-        boundary; turns naturally pull the smoothed curve toward the corridor
-        limits, producing a wider-entry / apex-cut / wider-exit shape.
+def _lateral_unit(left, right):
+    """Unit vector along the node's lateral axis, pointing right -> away.
 
-    Returns a list of FO2-space points (one per input node)."""
-    n = min(len(lefts), len(rights))
+    All five node points are collinear on this axis in vanilla (median
+    off-axis residual 0.0000), so every derived point is an offset along it.
+    """
+    dx = right[0] - left[0]
+    dy = right[1] - left[1]
+    dz = right[2] - left[2]
+    length = math.sqrt(dx * dx + dy * dy + dz * dz)
+    if length < 1e-9:
+        return None
+    return (dx / length, dy / length, dz / length)
+
+
+def _inset_point(base, unit, distance=NODE_INSET):
+    return (base[0] + unit[0] * distance,
+            base[1] + unit[1] * distance,
+            base[2] + unit[2] * distance)
+
+
+def _node_center_from_boundaries(left, right):
+    """Vanilla's `center`: NODE_INSET outside `right`, away from `left`."""
+    unit = _lateral_unit(left, right)
+    return right if unit is None else _inset_point(right, unit)
+
+
+def _node_mid_from_boundaries(left, right):
+    """Vanilla's `mid`: NODE_INSET inside `left`, toward `right`.
+
+    Mirror image of `center`. Both are the same offset vector applied to
+    opposite rails, so mid - center == left - right. Measured over the race
+    sections of all 48 vanilla files, |left - mid| has a sharp mode at exactly
+    3.0 (2500 of 5820 nodes) with median 3.0081, the same shape as
+    |center - right| (2443 of 5820 at exactly 3.0). Fitting a constant by RMS
+    would suggest ~3.8, but that only reflects the shared upward tail: at 3.0
+    the typical node is reproduced to 0.038u and 57.2% of targets land within
+    0.1u, against 0.170u and 45.4% for the best proportional alternative.
+    """
+    unit = _lateral_unit(left, right)
+    return left if unit is None else _inset_point(left, unit)
+
+
+def _relaxed_racing_line(los, his, is_closed, external_prev=None,
+                         external_next=None, max_sweeps=2000, tol=1e-6):
+    """Vanilla's target line: minimum-curvature path inside [lo, hi] per node.
+
+    Vanilla's target line is the converged solution of a constrained
+    smoothing problem, not a fixed offset. Three measurements pin it down,
+    all over the race sections of the 48 vanilla files:
+
+      * the target lies on the segment between `right` and `mid` in 6638 of
+        6639 nodes, and sits exactly at one of those two limits in 60% of
+        them - the signature of a clamp, not of hand-drawing;
+      * for the 39.8% of nodes strictly inside the band, the target is
+        already at the smoothing fixed point: the median distance between it
+        and the projection of its neighbours' interpolated midpoint is
+        0.0306u;
+      * solving to convergence with vanilla's own `right`/`mid` as the bounds
+        reproduces the stored target with median error 0.0000u, RMS 0.0918u,
+        71.0% of nodes within 0.01u and 93.7% within 0.1u.
+
+    Method: projected Gauss-Seidel. Each sweep sets every point to the
+    projection of its neighbours' chord point onto its own segment, clamped
+    to that segment; iterate until nothing moves. Three details each earned
+    their place by measurement:
+
+      * the chord point is weighted by arc length rather than taken at the
+        midpoint, because node spacing is not uniform (p90 error 1.00u ->
+        0.36u), and the weights are recomputed from the line's own spacing
+        each sweep rather than from the centre line (0.36u -> 0.20u);
+      * the projection is done in XZ, matching the game's own 2D treatment
+        of these fields;
+      * an open branch's first and last nodes take their outside neighbour
+        from the main route via the node linked list. Without that, every
+        node with error above 0.5u was a branch endpoint - 430 of them, and
+        none anywhere else. Supplying them drops RMS from 0.7171u to 0.0918u.
+
+    `external_prev` / `external_next` are those outside neighbours. Returns a
+    list of FO2-space points, one per node.
+    """
+    n = min(len(los), len(his))
     if n == 0:
         return []
 
-    def lerp_point(i, t):
-        r = rights[i]; l = lefts[i]
-        return (r[0] + t * (l[0] - r[0]),
-                r[1] + t * (l[1] - r[1]),
-                r[2] + t * (l[2] - r[2]))
+    axes = []
+    lengths = []
+    for i in range(n):
+        ax = (his[i][0] - los[i][0], his[i][1] - los[i][1],
+              his[i][2] - los[i][2])
+        axes.append(ax)
+        lengths.append(ax[0] * ax[0] + ax[2] * ax[2])
 
-    pts = [lerp_point(i, t_base) for i in range(n)]
+    def at(i, t):
+        return (los[i][0] + axes[i][0] * t,
+                los[i][1] + axes[i][1] * t,
+                los[i][2] + axes[i][2] * t)
 
-    if n < 3 or iterations <= 0:
-        return pts  # no smoothing possible / requested
+    params = [0.5] * n
+    points = [at(i, 0.5) for i in range(n)]
+    if n < 3:
+        return points
 
-    for _ in range(int(iterations)):
-        new_pts = list(pts)
+    def flat_dist(a, b):
+        return math.hypot(a[0] - b[0], a[2] - b[2])
+
+    for _ in range(int(max_sweeps)):
+        largest = 0.0
         for i in range(n):
-            if is_closed:
-                p_prev = pts[(i - 1) % n]
-                p_next = pts[(i + 1) % n]
-            else:
-                # Open path: endpoints stay put (no neighbours to average with)
-                if i == 0 or i == n - 1:
-                    continue
-                p_prev = pts[i - 1]
-                p_next = pts[i + 1]
-
-            # Blend current toward the neighbour midpoint
-            mid = (0.5 * (p_prev[0] + p_next[0]),
-                   0.5 * (p_prev[1] + p_next[1]),
-                   0.5 * (p_prev[2] + p_next[2]))
-            blended = ((1.0 - alpha) * pts[i][0] + alpha * mid[0],
-                       (1.0 - alpha) * pts[i][1] + alpha * mid[1],
-                       (1.0 - alpha) * pts[i][2] + alpha * mid[2])
-
-            # Project blended onto the (right, left) segment; clamp t ∈ [0, 1]
-            r = rights[i]; l = lefts[i]
-            lr = (l[0] - r[0], l[1] - r[1], l[2] - r[2])
-            d_lr = lr[0]*lr[0] + lr[1]*lr[1] + lr[2]*lr[2]
-            if d_lr < 1e-9:
-                new_pts[i] = r
+            if lengths[i] < 1e-12:
                 continue
-            br = (blended[0] - r[0], blended[1] - r[1], blended[2] - r[2])
-            t_proj = (br[0]*lr[0] + br[1]*lr[1] + br[2]*lr[2]) / d_lr
-            t_proj = max(0.0, min(1.0, t_proj))
-            new_pts[i] = (r[0] + t_proj * lr[0],
-                          r[1] + t_proj * lr[1],
-                          r[2] + t_proj * lr[2])
-        pts = new_pts
+            if i > 0:
+                before = points[i - 1]
+            elif is_closed:
+                before = points[n - 1]
+            else:
+                before = external_prev
+            if i < n - 1:
+                after = points[i + 1]
+            elif is_closed:
+                after = points[0]
+            else:
+                after = external_next
+            if before is None or after is None:
+                continue
 
-    return pts
+            back = flat_dist(before, points[i])
+            fwd = flat_dist(points[i], after)
+            span = back + fwd
+            w = (back / span) if span > 1e-9 else 0.5
+            chord = (before[0] + (after[0] - before[0]) * w,
+                     before[1] + (after[1] - before[1]) * w,
+                     before[2] + (after[2] - before[2]) * w)
+
+            rel = (chord[0] - los[i][0], chord[2] - los[i][2])
+            t = (rel[0] * axes[i][0] + rel[1] * axes[i][2]) / lengths[i]
+            t = max(0.0, min(1.0, t))
+            largest = max(largest, abs(t - params[i]))
+            params[i] = t
+            points[i] = at(i, t)
+        if largest < tol:
+            break
+    return points
 
 
 def _route_segment_lengths(centers, n, is_closed):
@@ -777,6 +854,8 @@ def _sample_along_route(points, lengths, following, preceding, n,
     return None
 
 
+CAR_HALF_WIDTH = 1.8
+SPEED_HINT_ZONE_THRESHOLD = 80.0
 SPEED_HINT_AREA_EPSILON = 0.001
 SPEED_HINT_SENTINEL = 1000000.0
 SPEED_HINT_SAMPLE_DISTANCES = (15.0, 20.0)
@@ -888,6 +967,44 @@ def _compute_default_speed_hints(centers, targets, n, is_closed,
         else:
             result.append(total)
     return result
+
+
+def _corner_zones(speed_hints, targets, n, is_closed):
+    """Per-node corner-zone marker for node offset 172.
+
+    Zero on anything the game considers fast enough, otherwise the corner's
+    direction as +/-1. 0x40e510 compares the freshly computed speed_hint
+    against 80.0 (.rdata 0x67e01c) and only tags the node when it comes out
+    below, and across the race sections of all 48 vanilla files the match is
+    exact in both directions: all 966 nodes with a non-zero marker have
+    speed_hint < 80, and all 966 nodes with speed_hint < 80 carry one.
+
+    The sign is the negated 2D cross product of the target line's turn at
+    that node, which agrees with vanilla on 98.3% of tagged nodes; the
+    remainder are near-straight nodes where the cross product is too small
+    to have a reliable sign.
+    """
+    if not speed_hints or not targets or n < 3:
+        return [0] * max(n, 0)
+    following, preceding = _route_links(n, is_closed)
+    zones = []
+    for i in range(n):
+        if speed_hints[i] >= SPEED_HINT_ZONE_THRESHOLD:
+            zones.append(0)
+            continue
+        after = following[i]
+        before = preceding[i]
+        if after is None or before is None:
+            zones.append(0)
+            continue
+        incoming = vec_sub(targets[i], targets[before])
+        outgoing = vec_sub(targets[after], targets[i])
+        cross_y = (incoming[0] * outgoing[2] - incoming[2] * outgoing[0])
+        if abs(cross_y) < 1e-9:
+            zones.append(0)
+        else:
+            zones.append(-1 if cross_y > 0.0 else 1)
+    return zones
 
 
 def _propagate_speed_hint2(speed_hints, zones, n, is_closed):
@@ -1442,14 +1559,16 @@ def build_section_nodes(centers, lefts, rights, targets, n, is_closed,
     if has_empties or not generate_speed_hints:
         default_speed_hints = None
         default_speed_hint2s = None
+        _zones = None
     else:
         default_speed_hints = _compute_default_speed_hints(
             centers, targets, n, is_closed)
         # Zone ids are 0 for a from-scratch section, so the zone walk keeps
         # each node's own hint. Routed through the real rule anyway so a
         # hand-authored fo2_unk3 behaves the way the game would.
+        _zones = _corner_zones(default_speed_hints, targets, n, is_closed)
         default_speed_hint2s = _propagate_speed_hint2(
-            default_speed_hints, [0] * n, n, is_closed)
+            default_speed_hints, _zones, n, is_closed)
 
     for i in range(n):
         is_first = (i == 0)
@@ -1459,7 +1578,10 @@ def build_section_nodes(centers, lefts, rights, targets, n, is_closed,
         center = centers[i]
         left = lefts[i] if i < len(lefts) else center
         right = rights[i] if i < len(rights) else center
-        mid = vec_scale(vec_add(left, right), 0.5)
+        # `mid` is not the midpoint of the two boundaries, despite the
+        # name: it is the outer limit of the usable corridor, mirroring
+        # `center` on the opposite rail. See _node_mid_from_boundaries.
+        mid = _node_mid_from_boundaries(left, right)
         target = targets[i] if i < len(targets) else mid
 
         forward = compute_forward(centers, i, n, is_closed)
@@ -1562,16 +1684,51 @@ def build_section_nodes(centers, lefts, rights, targets, n, is_closed,
             for j in range(1, i + 1):
                 cumul += vec_dist(centers[j-1], centers[j])
 
-        # iw[0]+iw[2]==1 is an exact vanilla invariant; (0.13, 0.6, 0.87)
-        # is the empirical average and matches within observed ranges.
-        interp_weights = (0.13, 0.6, 0.87)
+        # The three floats at offset 140 are the node's lateral parameter
+        # range plus the target's position in it, all measured along
+        # center -> left (the axis every node point lies on):
+        #
+        #   iw[0] = CAR_HALF_WIDTH / width_right
+        #   iw[1] = the target's parameter along center -> left
+        #   iw[2] = 1 - CAR_HALF_WIDTH / width_right
+        #
+        # so iw[0] and iw[2] are the corridor ends pulled in by half a car
+        # width, which is why iw[0] + iw[2] == 1 exactly. Verified over the
+        # race sections of all 48 vanilla files: iw[0] * width_right equals
+        # 1.800000 at both the 1st and 99th percentile, |iw[0] - 1.8/wR| has
+        # median 3.9e-09 with 99.7% inside 1e-5, and iw[1] matches the
+        # target's parameter to a median of 2.1e-08 with 97.0% inside 1e-4.
+        # The old (0.13, 0.6, 0.87) was the pooled average of all three.
+        if width_right > 1e-6:
+            _margin = CAR_HALF_WIDTH / width_right
+        else:
+            _margin = 0.0
+        _lateral = vec_sub(left, center)
+        _lat_len_sq = (_lateral[0] * _lateral[0] + _lateral[1] * _lateral[1]
+                       + _lateral[2] * _lateral[2])
+        if _lat_len_sq > 1e-12:
+            _rel = vec_sub(target, center)
+            _u_target = (_rel[0] * _lateral[0] + _rel[1] * _lateral[1]
+                         + _rel[2] * _lateral[2]) / _lat_len_sq
+        else:
+            _u_target = 0.5
+        interp_weights = (_margin, _u_target, 1.0 - _margin)
         unk_neg1 = -1.0
         # Geometry-derived default; empties override further down. Falls back
         # to 1M (sentinel = "no limit") when empties supply values anyway.
         _sh_default = (default_speed_hints[i] if default_speed_hints
                        else 1000000.0)
         speed_hint = _sh_default
-        unk3 = 0
+        # Offset 172 is a corner-zone marker, not an unknown. It is non-zero
+        # exactly when speed_hint < SPEED_HINT_ZONE_THRESHOLD -- 966 of 966
+        # vanilla nodes satisfy that in both directions, matching the
+        # `fcomp dword ptr [0x67e01c]` guard in 0x40e510 -- and its sign is
+        # the corner direction, the negated 2D cross product of the target
+        # line's turn (98.3% agreement; the stragglers are near-straight
+        # nodes where the cross product is numerically tiny). It is what
+        # speed_hint2's minimum is propagated over, so getting it right is
+        # what makes that field meaningful rather than a copy of speed_hint.
+        unk3 = _zones[i] if _zones else 0
         # The loader recomputes offset 176 (it stores the next non-zero zone
         # id ahead), so the file value is inert; vanilla always ships -1.
         sentinel1 = -1
@@ -1850,15 +2007,15 @@ def export_trackai(filepath, context, options):
         auto_gen_target = bool(options.get('auto_generate_target', True))
         target_method = str(options.get('target_method', 'SMOOTH'))
         target_source = str(options.get('target_source', 'RIGHT'))
-        target_lerp = float(options.get('target_lerp', 0.30))
-        target_smooth_iters = int(options.get('target_smooth_iters', 10))
+        target_smooth_iters = int(options.get('target_smooth_iters', 2000))
         auto_gen_center = bool(options.get('auto_generate_center', True))
-        center_offset = float(options.get('center_offset', 3.40))
+        center_offset = float(options.get('center_offset', 3.00))
         generate_speed_hints = bool(options.get('generate_speed_hints', True))
         flip_boundaries = bool(options.get('flip_boundaries', False))
         align_to_startgrid = bool(options.get('align_to_startgrid', False))
         main_route_centers = None
         main_route_lefts = None
+        main_route_targets = None
         main_route_is_closed = True
 
         for sec_i, (sec_name, sec_col) in enumerate(section_cols):
@@ -1984,12 +2141,19 @@ def export_trackai(filepath, context, options):
                               f"from Ribbon mesh")
 
             # CenterLine auto-generation: after boundaries are settled (either
-            # user-drawn or ribbon-derived), offset RightBoundary perpendicular
-            # to LeftBoundary by a small distance (vanilla mean ~3.40 units).
-            # This places CenterLine just outside RightBoundary on the interior
-            # side of the track — matching the empirical vanilla layout where
-            # the ribbon (Left↔Right) covers the outer portion of the drivable
-            # surface and CenterLine sits ~3.4u further inside.
+            # user-drawn or ribbon-derived), offset RightBoundary away from
+            # LeftBoundary. Vanilla's `center` is exactly collinear with the
+            # two boundaries (median off-axis residual 0.0000) and sits
+            # OUTSIDE them, past `right`. The offset distance has a sharp mode
+            # at exactly 3.0 units -- 2443 of 5820 race-section nodes, and
+            # most tracks' median is exactly 3.000 -- with an upward tail that
+            # is not explained by corridor width (correlation +0.171, and no
+            # width-proportional model beats a constant). 3.0 is therefore
+            # taken as the authored value: it is the only setting that
+            # reproduces vanilla exactly on any node (18.7% of full 3D
+            # positions) and it minimises typical error, median 0.380u against
+            # 0.406u at the old 3.40 and 0.800u at the RMS-optimal 3.8, whose
+            # lower RMS only reflects that long tail.
             # Requires BOTH boundaries; if only one is available we can't
             # disambiguate the interior side and skip with a warning.
             if center_obj is None and auto_gen_center:
@@ -1997,16 +2161,13 @@ def export_trackai(filepath, context, options):
                     n_c = min(len(lefts), len(rights))
                     gen_centers = []
                     for i in range(n_c):
-                        l = lefts[i]; r = rights[i]
-                        dx = r[0] - l[0]; dy = r[1] - l[1]; dz = r[2] - l[2]
-                        d_len = math.sqrt(dx*dx + dy*dy + dz*dz)
-                        if d_len < 1e-6:
-                            # Degenerate: left ≈ right at this node — use r as-is
-                            gen_centers.append(r)
+                        unit = _lateral_unit(lefts[i], rights[i])
+                        if unit is None:
+                            # Degenerate: left ≈ right at this node.
+                            gen_centers.append(rights[i])
                         else:
-                            gen_centers.append((r[0] + center_offset * dx / d_len,
-                                                r[1] + center_offset * dy / d_len,
-                                                r[2] + center_offset * dz / d_len))
+                            gen_centers.append(
+                                _inset_point(rights[i], unit, center_offset))
                     center_obj = _create_track_curve(
                         sec_col, f"{sec_name}_CenterLine",
                         gen_centers, is_closed)
@@ -2039,14 +2200,33 @@ def export_trackai(filepath, context, options):
 
                 if target_method == 'SMOOTH':
                     if lefts and rights:
-                        target_points = _smoothed_racing_line(
-                            lefts, rights,
-                            t_base=target_lerp,
-                            iterations=target_smooth_iters,
-                            is_closed=bool(is_closed))
-                        gen_desc = (f"smoothed racing line "
-                                    f"(t={target_lerp:.2f}, "
-                                    f"{target_smooth_iters} iters)")
+                        n_t = min(len(lefts), len(rights))
+                        mids = [_node_mid_from_boundaries(lefts[i], rights[i])
+                                for i in range(n_t)]
+                        # An open branch's end nodes are smoothed against
+                        # their main-route neighbours, reached through the
+                        # node linked list, exactly as vanilla did.
+                        ext_prev = ext_next = None
+                        if (sec_i > 0 and not is_closed
+                                and main_route_targets):
+                            if (branch_prev_ref
+                                    and 0 <= branch_prev_ref[1]
+                                    < len(main_route_targets)):
+                                ext_prev = main_route_targets[
+                                    branch_prev_ref[1]]
+                            if (branch_next_ref
+                                    and 0 <= branch_next_ref[1]
+                                    < len(main_route_targets)):
+                                ext_next = main_route_targets[
+                                    branch_next_ref[1]]
+                        target_points = _relaxed_racing_line(
+                            rights[:n_t], mids,
+                            is_closed=bool(is_closed),
+                            external_prev=ext_prev,
+                            external_next=ext_next,
+                            max_sweeps=max(1, target_smooth_iters))
+                        gen_desc = (f"minimum-curvature racing line "
+                                    f"(<={target_smooth_iters} sweeps)")
                 else:  # DUPLICATE
                     source_points = rights if target_source == 'RIGHT' else lefts
                     source_name = ("RightBoundary" if target_source == 'RIGHT'
@@ -2115,6 +2295,7 @@ def export_trackai(filepath, context, options):
             if sec_i == 0:
                 main_route_centers = effective_centers
                 main_route_lefts = list(lefts)
+                main_route_targets = list(targets)
                 main_route_is_closed = bool(is_closed)
 
             # Direction check runs regardless of what the section already
@@ -3520,10 +3701,12 @@ class FO2_OT_PreviewTrackAI(bpy.types.Operator):
     )
     center_offset: bpy.props.FloatProperty(
         name="Offset",
-        description="Perpendicular distance from RightBoundary to the "
-                    "generated CenterLine (FO2 units). 3.40 matches the "
-                    "empirical mean across vanilla tracks",
-        default=3.40, min=0.0, max=50.0, step=10, precision=2,
+        description="Distance from RightBoundary to the generated "
+                    "CenterLine, away from LeftBoundary (FO2 units). 3.00 is "
+                    "the value vanilla was authored with: it is the sharp "
+                    "mode across vanilla nodes and the only setting that "
+                    "reproduces them exactly",
+        default=3.00, min=0.0, max=50.0, step=10, precision=2,
     )
 
     auto_generate_target: bpy.props.BoolProperty(
@@ -3544,28 +3727,6 @@ class FO2_OT_PreviewTrackAI(bpy.types.Operator):
         ],
         default='SMOOTH',
     )
-    target_lerp: bpy.props.FloatProperty(
-        name="Base position",
-        description="Initial LERP position inside the ribbon. 0 = "
-                    "RightBoundary (inner), 0.5 = center, 1 = LeftBoundary "
-                    "(outer). 0.30 = vanilla mean",
-        default=0.30, min=0.0, max=1.0, step=5, precision=2,
-    )
-    target_smooth_iters: bpy.props.IntProperty(
-        name="Smoothing passes",
-        description="Chaikin iterations. 0 = plain LERP with no smoothing",
-        default=10, min=0, max=50,
-    )
-    target_source: bpy.props.EnumProperty(
-        name="Duplicate from",
-        description="Which boundary to duplicate when method is Duplicate",
-        items=[
-            ('RIGHT', "RightBoundary", "Duplicate the inner boundary"),
-            ('LEFT',  "LeftBoundary",  "Duplicate the outer boundary"),
-        ],
-        default='RIGHT',
-    )
-
     generate_speed_hints: bpy.props.BoolProperty(
         name="Generate speed hints from geometry",
         description="Compute per-node fo2_speed_hint from curvature when "
@@ -3623,8 +3784,7 @@ class FO2_OT_PreviewTrackAI(bpy.types.Operator):
         sub = box.column(); sub.enabled = self.auto_generate_target
         sub.prop(self, "target_method")
         if self.target_method == 'SMOOTH':
-            sub.prop(self, "target_lerp", slider=True)
-            sub.prop(self, "target_smooth_iters")
+                sub.prop(self, "target_smooth_iters")
         else:
             sub.prop(self, "target_source", expand=True)
 
@@ -3660,7 +3820,6 @@ class FO2_OT_PreviewTrackAI(bpy.types.Operator):
             'auto_generate_target': self.auto_generate_target and any_target_missing,
             'target_method': self.target_method,
             'target_source': self.target_source,
-            'target_lerp': float(self.target_lerp),
             'target_smooth_iters': int(self.target_smooth_iters),
             'generate_speed_hints': self.generate_speed_hints,
             'flip_boundaries': self.flip_boundaries,
@@ -5024,25 +5183,15 @@ class ExportTrackAI(bpy.types.Operator, ExportHelper):
         default='SMOOTH',
     )
 
-    target_lerp: FloatProperty(
-        name="Base position",
-        description="Initial LERP position inside the ribbon. 0 = inner "
-                    "(RightBoundary), 0.5 = ribbon center, 1 = outer "
-                    "(LeftBoundary). Default 0.30 matches the empirical mean "
-                    "across vanilla tracks that don't hug a boundary uniformly",
-        default=0.30,
-        min=0.0, max=1.0, step=5, precision=2,
-    )
-
     target_smooth_iters: IntProperty(
         name="Smoothing passes",
-        description="Number of Chaikin smoothing iterations applied to the "
-                    "initial LERP line. 0 = plain LERP (no smoothing). Grid "
-                    "search on 15 vanilla tracks converged around 10; more "
-                    "passes produce smoother turns but at some point stop "
-                    "improving",
-        default=10,
-        min=0, max=50,
+        description="Maximum relaxation sweeps for the minimum-curvature "
+                    "racing line. The solver exits as soon as it converges, "
+                    "so this caps runtime rather than tuning the result. "
+                    "Vanilla sections converge in a median of 58 sweeps; the "
+                    "default leaves generous headroom for dense routes",
+        default=2000,
+        min=1, max=20000,
     )
 
     target_source: EnumProperty(
@@ -5066,11 +5215,14 @@ class ExportTrackAI(bpy.types.Operator, ExportHelper):
 
     center_offset: FloatProperty(
         name="Offset",
-        description="Perpendicular distance from RightBoundary to the "
-                    "generated CenterLine, in FO2 units. Default 3.40 matches "
-                    "the empirical mean across vanilla tracks (nascar is "
-                    "exactly 3.00; other tracks range 3.0-4.0)",
-        default=3.40,
+        description="Distance from RightBoundary to the generated "
+                    "CenterLine, away from LeftBoundary, in FO2 units. "
+                    "Default 3.00 is the value vanilla was authored with: "
+                    "2443 of 5820 race-section nodes sit at exactly 3.0 and "
+                    "most tracks' median is exactly 3.000. The mean is higher "
+                    "(~3.9) only because of an upward tail that corridor "
+                    "width does not explain",
+        default=3.00,
         min=0.0, max=50.0, step=10, precision=2,
     )
 
@@ -5162,8 +5314,7 @@ class ExportTrackAI(bpy.types.Operator, ExportHelper):
             sub.enabled = self.auto_generate_target
             sub.prop(self, "target_method")
             if self.target_method == 'SMOOTH':
-                sub.prop(self, "target_lerp", slider=True)
-                sub.prop(self, "target_smooth_iters")
+                        sub.prop(self, "target_smooth_iters")
             else:  # DUPLICATE
                 sub.prop(self, "target_source", expand=True)
 
@@ -5196,7 +5347,6 @@ class ExportTrackAI(bpy.types.Operator, ExportHelper):
             'auto_generate_target': self.auto_generate_target and any_target_missing,
             'target_method': self.target_method,
             'target_source': self.target_source,
-            'target_lerp': float(self.target_lerp),
             'target_smooth_iters': int(self.target_smooth_iters),
             'auto_generate_center': self.auto_generate_center and any_center_missing,
             'center_offset': float(self.center_offset),
