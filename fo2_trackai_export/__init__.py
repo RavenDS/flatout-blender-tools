@@ -1,7 +1,7 @@
 bl_info = {
     "name":        "FlatOut 2 TrackAI Exporter",
     "author":      "ravenDS, additional edits by Cryptid",
-    "version":     (2, 4, 0),
+    "version":     (2, 4, 1),
     "blender":     (3, 6, 0),
     "location":    "File > Export > FlatOut 2 TrackAI (.bin)",
     "description": "Export FlatOut 2 AI path data (trackai.bin + .bed)",
@@ -1068,11 +1068,28 @@ def _compute_default_speed_hints(centers, targets, n, is_closed,
                 total = _f32(total + _f32(weight * _horizontal_circumradius(
                     behind, middle, ahead)))
         if not usable:
-            # Too close to the end of an open section to sample both sides;
-            # carry the previous node's value rather than inventing one.
-            result.append(result[-1] if result else SPEED_HINT_SENTINEL)
+            # Too close to the end of an open section to sample both sides.
+            # Leave a hole and fill it below from the nearest node that did
+            # resolve: seeding the MAX sentinel here and carrying it forward
+            # marked genuine corners as "no limit", which is the opposite of
+            # what the geometry says. 127 nodes across the vanilla race
+            # sections hit this path.
+            result.append(None)
         else:
             result.append(total)
+
+    # Fill unresolved holes from the nearest resolved neighbour, searching
+    # both directions so a hole at index 0 does not inherit the sentinel.
+    if any(v is None for v in result):
+        resolved = [i for i, v in enumerate(result) if v is not None]
+        if not resolved:
+            return [SPEED_HINT_SENTINEL] * n
+        for i in range(n):
+            if result[i] is not None:
+                continue
+            nearest = min(resolved, key=lambda j: min(
+                abs(j - i), (n - abs(j - i)) if is_closed else n))
+            result[i] = result[nearest]
     return result
 
 
