@@ -1,7 +1,7 @@
 bl_info = {
     "name":        "FlatOut 2 TrackAI Exporter",
     "author":      "ravenDS, additional edits by Cryptid",
-    "version":     (2, 3, 5),
+    "version":     (2, 3, 6),
     "blender":     (3, 6, 0),
     "location":    "File > Export > FlatOut 2 TrackAI (.bin)",
     "description": "Export FlatOut 2 AI path data (trackai.bin + .bed)",
@@ -1688,19 +1688,19 @@ def build_section_nodes(centers, lefts, rights, targets, n, is_closed,
         # range plus the target's position in it, all measured along
         # center -> left (the axis every node point lies on):
         #
-        #   iw[0] = CAR_HALF_WIDTH / width_right
+        #   iw[0] = CAR_HALF_WIDTH / corridor_width
         #   iw[1] = the target's parameter along center -> left
-        #   iw[2] = 1 - CAR_HALF_WIDTH / width_right
+        #   iw[2] = 1 - CAR_HALF_WIDTH / corridor_width
         #
         # so iw[0] and iw[2] are the corridor ends pulled in by half a car
         # width, which is why iw[0] + iw[2] == 1 exactly. Verified over the
-        # race sections of all 48 vanilla files: iw[0] * width_right equals
+        # race sections of all 48 vanilla files: iw[0] * corridor_width equals
         # 1.800000 at both the 1st and 99th percentile, |iw[0] - 1.8/wR| has
         # median 3.9e-09 with 99.7% inside 1e-5, and iw[1] matches the
         # target's parameter to a median of 2.1e-08 with 97.0% inside 1e-4.
         # The old (0.13, 0.6, 0.87) was the pooled average of all three.
-        if width_right > 1e-6:
-            _margin = CAR_HALF_WIDTH / width_right
+        if corridor_width > 1e-6:
+            _margin = CAR_HALF_WIDTH / corridor_width
         else:
             _margin = 0.0
         _lateral = vec_sub(left, center)
@@ -2204,21 +2204,24 @@ def export_trackai(filepath, context, options):
                         mids = [_node_mid_from_boundaries(lefts[i], rights[i])
                                 for i in range(n_t)]
                         # An open branch's end nodes are smoothed against
-                        # their main-route neighbours, reached through the
-                        # node linked list, exactly as vanilla did.
+                        # their main-route neighbours. The branch refs are not
+                        # resolved until further down this same iteration, so
+                        # infer them here from the centres we already have --
+                        # reading the outer variable picked up the *previous*
+                        # section's value and left this silently inert.
                         ext_prev = ext_next = None
                         if (sec_i > 0 and not is_closed
-                                and main_route_targets):
-                            if (branch_prev_ref
-                                    and 0 <= branch_prev_ref[1]
+                                and main_route_centers
+                                and main_route_targets and centers):
+                            _bp, _bn = _infer_path0_branch_refs(
+                                main_route_centers, centers,
+                                main_route_is_closed)
+                            if (_bp and 0 <= _bp[1]
                                     < len(main_route_targets)):
-                                ext_prev = main_route_targets[
-                                    branch_prev_ref[1]]
-                            if (branch_next_ref
-                                    and 0 <= branch_next_ref[1]
+                                ext_prev = main_route_targets[_bp[1]]
+                            if (_bn and 0 <= _bn[1]
                                     < len(main_route_targets)):
-                                ext_next = main_route_targets[
-                                    branch_next_ref[1]]
+                                ext_next = main_route_targets[_bn[1]]
                         target_points = _relaxed_racing_line(
                             rights[:n_t], mids,
                             is_closed=bool(is_closed),
@@ -3727,6 +3730,28 @@ class FO2_OT_PreviewTrackAI(bpy.types.Operator):
         ],
         default='SMOOTH',
     )
+
+    target_smooth_iters: bpy.props.IntProperty(
+        name="Smoothing passes",
+        description="Maximum relaxation sweeps for the minimum-curvature "
+                    "racing line. The solver exits as soon as it converges, "
+                    "so this caps runtime rather than tuning the result. "
+                    "Vanilla sections converge in a median of 58 sweeps",
+        default=2000, min=1, max=20000,
+    )
+
+    target_source: bpy.props.EnumProperty(
+        name="Duplicate from",
+        description="Which boundary to duplicate when method is Duplicate",
+        items=[
+            ('RIGHT', "RightBoundary",
+             "Duplicate the inner boundary - the one vanilla's target line "
+             "sits nearest"),
+            ('LEFT',  "LeftBoundary", "Duplicate the outer boundary"),
+        ],
+        default='RIGHT',
+    )
+
     generate_speed_hints: bpy.props.BoolProperty(
         name="Generate speed hints from geometry",
         description="Compute per-node fo2_speed_hint from curvature when "
@@ -3784,7 +3809,7 @@ class FO2_OT_PreviewTrackAI(bpy.types.Operator):
         sub = box.column(); sub.enabled = self.auto_generate_target
         sub.prop(self, "target_method")
         if self.target_method == 'SMOOTH':
-                sub.prop(self, "target_smooth_iters")
+            sub.prop(self, "target_smooth_iters")
         else:
             sub.prop(self, "target_source", expand=True)
 
