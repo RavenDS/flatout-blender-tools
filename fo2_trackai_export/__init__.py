@@ -1,7 +1,7 @@
 bl_info = {
     "name":        "FlatOut 2 TrackAI Exporter",
     "author":      "ravenDS, additional edits by Cryptid",
-    "version":     (2, 3, 6),
+    "version":     (2, 4, 0),
     "blender":     (3, 6, 0),
     "location":    "File > Export > FlatOut 2 TrackAI (.bin)",
     "description": "Export FlatOut 2 AI path data (trackai.bin + .bed)",
@@ -662,6 +662,83 @@ def _node_mid_from_boundaries(left, right):
     return left if unit is None else _inset_point(left, unit)
 
 
+def _legacy_smoothed_racing_line(lefts, rights, t_base, iterations,
+                                 is_closed, alpha=0.5):
+    """The racing line generator as shipped up to v2.3.4, kept selectable.
+
+    Initialise each point at LERP(right, left, t_base), then run `iterations`
+    Chaikin-style passes: each pass blends every point `alpha` of the way
+    toward the midpoint of its two neighbours, then reprojects and clamps it
+    back onto that node's (right, left) segment. Open sections hold their
+    endpoints fixed.
+
+    It differs from _relaxed_racing_line in three ways that matter: it runs a
+    fixed number of passes rather than iterating to convergence, it weights
+    the neighbour midpoint uniformly rather than by arc length, and it clamps
+    to the full (right, left) corridor rather than to the [mid, right] band
+    the game actually confines the target to. Measured against the race
+    sections of all 48 vanilla files it scores RMS 2.024u with its 2.3.4
+    defaults, against 1.262u for the current method; it is retained because
+    it is what existing tracks were authored with and its shape is a known
+    quantity.
+
+    Reproduced verbatim from 2.3.4 apart from formatting, so output is
+    unchanged for the same inputs and parameters.
+    """
+    n = min(len(lefts), len(rights))
+    if n == 0:
+        return []
+
+    def lerp_point(i, t):
+        r = rights[i]
+        l = lefts[i]
+        return (r[0] + t * (l[0] - r[0]),
+                r[1] + t * (l[1] - r[1]),
+                r[2] + t * (l[2] - r[2]))
+
+    pts = [lerp_point(i, t_base) for i in range(n)]
+
+    if n < 3 or iterations <= 0:
+        return pts
+
+    for _ in range(int(iterations)):
+        new_pts = list(pts)
+        for i in range(n):
+            if is_closed:
+                p_prev = pts[(i - 1) % n]
+                p_next = pts[(i + 1) % n]
+            else:
+                # Open path: endpoints stay put, no neighbours to average.
+                if i == 0 or i == n - 1:
+                    continue
+                p_prev = pts[i - 1]
+                p_next = pts[i + 1]
+
+            mid = (0.5 * (p_prev[0] + p_next[0]),
+                   0.5 * (p_prev[1] + p_next[1]),
+                   0.5 * (p_prev[2] + p_next[2]))
+            blended = ((1.0 - alpha) * pts[i][0] + alpha * mid[0],
+                       (1.0 - alpha) * pts[i][1] + alpha * mid[1],
+                       (1.0 - alpha) * pts[i][2] + alpha * mid[2])
+
+            r = rights[i]
+            l = lefts[i]
+            lr = (l[0] - r[0], l[1] - r[1], l[2] - r[2])
+            d_lr = lr[0] * lr[0] + lr[1] * lr[1] + lr[2] * lr[2]
+            if d_lr < 1e-9:
+                new_pts[i] = r
+                continue
+            br = (blended[0] - r[0], blended[1] - r[1], blended[2] - r[2])
+            t_proj = (br[0] * lr[0] + br[1] * lr[1] + br[2] * lr[2]) / d_lr
+            t_proj = max(0.0, min(1.0, t_proj))
+            new_pts[i] = (r[0] + t_proj * lr[0],
+                          r[1] + t_proj * lr[1],
+                          r[2] + t_proj * lr[2])
+        pts = new_pts
+
+    return pts
+
+
 def _relaxed_racing_line(los, his, is_closed, external_prev=None,
                          external_next=None, max_sweeps=2000, tol=1e-6):
     """Vanilla's target line: minimum-curvature path inside [lo, hi] per node.
@@ -764,24 +841,56 @@ def _relaxed_racing_line(los, his, is_closed, external_prev=None,
     return points
 
 
-def _route_segment_lengths(centers, n, is_closed):
-    """Per-node distance to the successor, matching what we write at offset 152.
+def _axis_mid(center, left):
+    """Midpoint of one node's lateral axis: the middle of the corridor.
 
-    The game measures arc length with that field, so the sampler below has to
-    use the same measure or it would land on different points.
+    `center` and `left` are the two ends of the corridor, so their midpoint is
+    its geometric middle. Route length is measured along that curve, not along
+    `center`, which is merely one edge of it.
     """
+    return ((center[0] + left[0]) * 0.5, (center[1] + left[1]) * 0.5,
+            (center[2] + left[2]) * 0.5)
+
+
+def _corridor_axis(centers, lefts, n):
+    """Per-node corridor-axis midpoints."""
+    axis = []
+    for i in range(n):
+        c = centers[i]
+        axis.append(_axis_mid(c, lefts[i] if i < len(lefts) else c))
+    return axis
+
+
+def _route_segment_lengths(centers, lefts, n, is_closed, external_next=None):
+    """Per-node distance to the successor, i.e. node offset 152.
+
+    Measured between consecutive corridor-axis midpoints, (center + left) / 2.
+    Verified against the race sections of all 48 vanilla files: median error
+    0.00000, p90 0.00002, 100.0% of nodes exact to 1e-3. Measuring along
+    `center` instead -- the obvious reading, and what this used to do -- is out
+    by a median of 0.60, because `center` runs along the corridor's edge
+    rather than its middle.
+
+    Getting this right also makes cumul_distance exact, since the game
+    rebuilds that by accumulating this field (0x40dba0), and it feeds the
+    speed-hint sampler, whose arc walk advances by it.
+
+    `external_next` is the successor's axis midpoint when it lies outside the
+    section, which is the case at the last node of an open branch.
+    """
+    axis = _corridor_axis(centers, lefts, n)
     lengths = []
     for i in range(n):
         if i < n - 1:
-            nxt = centers[i + 1]
+            nxt = axis[i + 1]
         elif is_closed:
-            nxt = centers[0]
+            nxt = axis[0]
         else:
-            nxt = None
+            nxt = external_next
         if nxt is not None:
-            lengths.append(vec_dist(centers[i], nxt))
+            lengths.append(vec_dist(axis[i], nxt))
         elif n >= 2:
-            lengths.append(vec_dist(centers[i - 1], centers[i]))
+            lengths.append(vec_dist(axis[i - 1], axis[i]))
         else:
             lengths.append(0.0)
     return lengths
@@ -891,7 +1000,7 @@ def _horizontal_circumradius(p1, p2, p3):
 
 
 def _compute_default_speed_hints(centers, targets, n, is_closed,
-                                 lengths=None):
+                                 lengths=None, lefts=None):
     """Per-node fo2_speed_hint, reproducing what the game computes at load.
 
     Recovered from FlatOut2.exe. The loader calls 0x403360 unconditionally for
@@ -923,12 +1032,9 @@ def _compute_default_speed_hints(centers, targets, n, is_closed,
     end nodes handled by the fallback below.
 
     `lengths` exists for that verification. Left as None -- the normal path --
-    the arc measure is recomputed from the centre chords, which is exactly
+    the arc measure is recomputed by _route_segment_lengths, which is exactly
     what this exporter writes to offset 152, so the sampler and the file
-    agree. Vanilla's stored lengths came from a finer arc measure than the
-    chord, so a vanilla file re-exported from scratch will not reproduce its
-    original hints node for node; that is a property of the source geometry,
-    not of this formula.
+    agree.
 
     Note the game overwrites offset 168 on load regardless of what the file
     holds, so this value is for file fidelity; it cannot change AI behaviour.
@@ -939,7 +1045,8 @@ def _compute_default_speed_hints(centers, targets, n, is_closed,
         return [SPEED_HINT_SENTINEL] * max(n, 0)
 
     if lengths is None:
-        lengths = _route_segment_lengths(centers, n, is_closed)
+        lengths = _route_segment_lengths(centers, lefts if lefts else centers,
+                                         n, is_closed)
     following, preceding = _route_links(n, is_closed)
     result = []
     for i in range(n):
@@ -1256,25 +1363,42 @@ def gather_empties(col, section_name):
 
 # BUILD NODES FROM CURVES + EMPTIES
 
-def compute_forward(centers, i, n, is_closed):
-    """Compute forward direction from prev/next center positions"""
+def compute_forward(targets, i, n, is_closed, external_next=None):
+    """Node heading: the direction along the TARGET line to the next node.
+
+        forward = normalize(target[i+1] - target[i])
+
+    Exact on 100.0% of the race-section nodes of all 48 vanilla files. The
+    heading follows the racing line, not the centres and not the corridor
+    axis: measuring along the centres leaves a median component error of
+    0.033 and matches only 1.0% of nodes, and along the corridor axis 0.027
+    and 0.1%.
+
+    right_dir is then (forward.z, 0, -forward.x), bit-exact, so this one
+    formula settles both fields.
+
+    `external_next` is the successor's target when it lies outside the
+    section, i.e. at the last node of an open branch.
+    """
     if n < 2:
         return (1.0, 0.0, 0.0)
-    if is_closed:
-        prev = centers[(i - 1) % n]
-        nxt = centers[(i + 1) % n]
+    if i < n - 1:
+        nxt = targets[i + 1]
+    elif is_closed:
+        nxt = targets[0]
     else:
-        if i == 0:
-            prev = centers[0]
-            nxt = centers[1]
-        elif i == n - 1:
-            prev = centers[n - 2]
-            nxt = centers[n - 1]
-        else:
-            prev = centers[i - 1]
-            nxt = centers[i + 1]
-    d = vec_sub(nxt, prev)
-    return normalize(d)
+        nxt = external_next
+    if nxt is None:
+        # No successor to aim at; reuse the incoming direction so the frame
+        # stays tangent to the route instead of collapsing.
+        if n >= 2:
+            return normalize(vec_sub(targets[i], targets[i - 1]))
+        return (1.0, 0.0, 0.0)
+    d = vec_sub(nxt, targets[i])
+    result = normalize(d)
+    if all(abs(v) < 1e-9 for v in result) and n >= 2 and i > 0:
+        return normalize(vec_sub(targets[i], targets[i - 1]))
+    return result
 
 
 def _nearest_route_segment(point, route, is_closed):
@@ -1504,7 +1628,9 @@ def build_section_nodes(centers, lefts, rights, targets, n, is_closed,
                         branch_prev_ref=None, branch_next_ref=None,
                         generate_speed_hints=True,
                         prefer_curve_target=False,
-                        main_route_centers=None, main_route_lefts=None):
+                        main_route_centers=None, main_route_lefts=None,
+                        main_route_targets=None, mids=None,
+                        cumul_start=0.0):
     """Build binary node data for one section
     
     If empties are present, their fields are read as the roundtrip source.
@@ -1562,7 +1688,7 @@ def build_section_nodes(centers, lefts, rights, targets, n, is_closed,
         _zones = None
     else:
         default_speed_hints = _compute_default_speed_hints(
-            centers, targets, n, is_closed)
+            centers, targets, n, is_closed, lefts=lefts)
         # Zone ids are 0 for a from-scratch section, so the zone walk keeps
         # each node's own hint. Routed through the real rule anyway so a
         # hand-authored fo2_unk3 behaves the way the game would.
@@ -1581,10 +1707,18 @@ def build_section_nodes(centers, lefts, rights, targets, n, is_closed,
         # `mid` is not the midpoint of the two boundaries, despite the
         # name: it is the outer limit of the usable corridor, mirroring
         # `center` on the opposite rail. See _node_mid_from_boundaries.
-        mid = _node_mid_from_boundaries(left, right)
+        if mids and i < len(mids):
+            mid = mids[i]
+        else:
+            mid = _node_mid_from_boundaries(left, right)
         target = targets[i] if i < len(targets) else mid
 
-        forward = compute_forward(centers, i, n, is_closed)
+        _fwd_external = None
+        if (not is_closed and i == n - 1 and main_route_targets
+                and branch_next_seq is not None
+                and 0 <= branch_next_seq < len(main_route_targets)):
+            _fwd_external = main_route_targets[branch_next_seq]
+        forward = compute_forward(targets, i, n, is_closed, _fwd_external)
         # Exact vanilla rule: right_dir == cross(world_up, forward), i.e.
         # (forward.z, 0, -forward.x), left UNNORMALISED so its length is the
         # horizontal length of forward. This reproduces the stored field
@@ -1660,29 +1794,47 @@ def build_section_nodes(centers, lefts, rights, targets, n, is_closed,
         # over every vanilla file:
         #   * cumul_distance[i+1] == cumul_distance[i] + field152[i] holds to
         #     float precision for 4856 of 4857 main-route nodes;
-        #   * following the node_index forward pointer (i+1, wrapping to 0 on
-        #     a closed section, and the Path0 rejoin node for the last node of
-        #     an open branch) gives a median signed error of +0.006 against
-        #     the chord, with the residual spread symmetric about zero.
+        #   * it is measured between consecutive corridor-axis midpoints,
+        #     (center + left) / 2 -- the middle of the corridor, not `center`,
+        #     which is one of its edges. That reproduces every vanilla node
+        #     (median error 0.00000, p90 0.00002, 100.0% exact to 1e-3);
+        #     measuring along `center` is out by a median of 0.60.
         # The old code wrote centre-to-boundary distances into both slots,
         # which put a track width where the game expects an arc length.
         corridor_width = vec_dist(center, left)
 
+        _axis_here = _axis_mid(center, left)
         if next_center is not None:
-            segment_length = vec_dist(center, next_center)
+            segment_length = vec_dist(_axis_here,
+                                      _axis_mid(next_center, next_left))
         elif n >= 2:
             # No successor to measure to; reuse the incoming segment so the
             # value stays in a plausible range instead of collapsing to zero.
-            segment_length = vec_dist(centers[i - 1], center)
+            _prev_left = lefts[i - 1] if i - 1 < len(lefts) else centers[i - 1]
+            segment_length = vec_dist(_axis_mid(centers[i - 1], _prev_left),
+                                      _axis_here)
         else:
             segment_length = 0.0
 
+        # Route distance accumulated along the corridor axis. The origin is
+        # not always zero: section 0 always starts at 0.0 (all 33 race files),
+        # but an open branch starts at the main route's cumulative distance
+        # one node past its departure point -- exact on 77 of 77 vanilla
+        # branches, equivalently Path0's cumul at prev_index plus that node's
+        # own segment length. Starting every section at zero left branch
+        # distances wrong by a whole lap fraction.
         if i == 0:
-            cumul = 0.0
+            cumul = cumul_start
         else:
-            cumul = 0.0
+            cumul = cumul_start
+            _walk = _axis_mid(centers[0],
+                              lefts[0] if lefts else centers[0])
             for j in range(1, i + 1):
-                cumul += vec_dist(centers[j-1], centers[j])
+                _step = _axis_mid(
+                    centers[j],
+                    lefts[j] if j < len(lefts) else centers[j])
+                cumul += vec_dist(_walk, _step)
+                _walk = _step
 
         # The three floats at offset 140 are the node's lateral parameter
         # range plus the target's position in it, all measured along
@@ -2006,8 +2158,11 @@ def export_trackai(filepath, context, options):
 
         auto_gen_target = bool(options.get('auto_generate_target', True))
         target_method = str(options.get('target_method', 'SMOOTH'))
-        target_source = str(options.get('target_source', 'RIGHT'))
         target_smooth_iters = int(options.get('target_smooth_iters', 2000))
+        target_legacy_lerp = float(options.get('target_legacy_lerp',
+                                               0.30))
+        target_legacy_iters = int(options.get('target_legacy_iters',
+                                              10))
         auto_gen_center = bool(options.get('auto_generate_center', True))
         center_offset = float(options.get('center_offset', 3.00))
         generate_speed_hints = bool(options.get('generate_speed_hints', True))
@@ -2016,6 +2171,7 @@ def export_trackai(filepath, context, options):
         main_route_centers = None
         main_route_lefts = None
         main_route_targets = None
+        main_route_cumul = None
         main_route_is_closed = True
 
         for sec_i, (sec_name, sec_col) in enumerate(section_cols):
@@ -2027,11 +2183,17 @@ def export_trackai(filepath, context, options):
             left_obj = find_object_containing(sec_col, "_LeftBoundary")
             right_obj = find_object_containing(sec_col, "_RightBoundary")
             target_obj = find_object_containing(sec_col, "_TargetLine")
+            # `mid` bounds the racing line's corridor. It was always computed
+            # per node, but never surfaced as an editable curve; exposing it
+            # lets an authored one be supplied, which is the only way to
+            # reproduce a vanilla target exactly.
+            mid_obj = find_object_containing(sec_col, "_MidLine")
 
             centers = sample_curve_points(center_obj)
             lefts = sample_curve_points(left_obj)
             rights = sample_curve_points(right_obj)
             targets = sample_target_curve_points(target_obj)
+            mids = sample_curve_points(mid_obj)
             prefer_curve_target = bool(targets)
 
             # Ribbon fallback: when Left/Right curves are missing (e.g. the user
@@ -2180,17 +2342,25 @@ def export_trackai(filepath, context, options):
                           f"cannot auto-generate CenterLine — needs both "
                           f"LeftBoundary and RightBoundary")
 
-            # TargetLine auto-generation: after boundaries are settled (either
-            # user-drawn or ribbon-derived), synthesise a target line the AI
-            # will follow. Two methods:
+            # No MidLine is generated. `mid` is derived per node from the
+            # boundaries wherever it is needed (see the node loop and the
+            # racing-line solver), so materialising a curve for it would only
+            # add an object to the outliner. A hand-authored or imported
+            # _MidLine IS honoured when present -- that is the case where the
+            # value cannot be derived and the curve is the only carrier.
+
+            # TargetLine auto-generation: after boundaries are settled
+            # (user-drawn or ribbon-derived), synthesise the line the AI
+            # follows. Two methods, chosen by the user:
             #
-            #   SMOOTH   — corridor-clamped racing line: LERP at t_base within
-            #              the (right, left) ribbon, then Chaikin-smooth for
-            #              N iterations. Straights sit near t_base; turns pull
-            #              the curve toward the corridor edge (wider entry / cut
-            #              apex / wider exit). Empirically best across 14/15
-            #              vanilla tracks vs. duplication (avg RMS 2.2u vs 5.5u).
-            #   DUPLICATE — copy one boundary verbatim (nascar-style behaviour).
+            #   NEW    — minimum-curvature line, relaxed to convergence and
+            #            confined to the [mid, right] band the game actually
+            #            clamps the target to. RMS 1.262u against the race
+            #            sections of all 48 vanilla files.
+            #   LEGACY — the fixed-pass Chaikin smoothing shipped up to
+            #            v2.3.4, clamped to the full (right, left) corridor.
+            #            RMS 2.024u, but it is what existing tracks were
+            #            authored against.
             #
             # The generated curve becomes immediately visible in Blender via
             # the UI refresh at the end of export.
@@ -2198,10 +2368,14 @@ def export_trackai(filepath, context, options):
                 target_points = None
                 gen_desc = None
 
-                if target_method == 'SMOOTH':
+                if target_method != 'LEGACY':
                     if lefts and rights:
                         n_t = min(len(lefts), len(rights))
-                        mids = [_node_mid_from_boundaries(lefts[i], rights[i])
+                        if mids and len(mids) >= n_t:
+                            solver_mids = list(mids[:n_t])
+                        else:
+                            solver_mids = [
+                                _node_mid_from_boundaries(lefts[i], rights[i])
                                 for i in range(n_t)]
                         # An open branch's end nodes are smoothed against
                         # their main-route neighbours. The branch refs are not
@@ -2223,20 +2397,23 @@ def export_trackai(filepath, context, options):
                                     < len(main_route_targets)):
                                 ext_next = main_route_targets[_bn[1]]
                         target_points = _relaxed_racing_line(
-                            rights[:n_t], mids,
+                            rights[:n_t], solver_mids,
                             is_closed=bool(is_closed),
                             external_prev=ext_prev,
                             external_next=ext_next,
                             max_sweeps=max(1, target_smooth_iters))
                         gen_desc = (f"minimum-curvature racing line "
                                     f"(<={target_smooth_iters} sweeps)")
-                else:  # DUPLICATE
-                    source_points = rights if target_source == 'RIGHT' else lefts
-                    source_name = ("RightBoundary" if target_source == 'RIGHT'
-                                   else "LeftBoundary")
-                    if source_points:
-                        target_points = list(source_points)
-                        gen_desc = f"duplicated {source_name}"
+                else:  # LEGACY
+                    if lefts and rights:
+                        target_points = _legacy_smoothed_racing_line(
+                            lefts, rights,
+                            t_base=target_legacy_lerp,
+                            iterations=target_legacy_iters,
+                            is_closed=bool(is_closed))
+                        gen_desc = (f"legacy smoothed racing line "
+                                    f"(t={target_legacy_lerp:.2f}, "
+                                    f"{target_legacy_iters} passes)")
 
                 if target_points:
                     target_obj = _create_track_curve(
@@ -2300,6 +2477,13 @@ def export_trackai(filepath, context, options):
                 main_route_lefts = list(lefts)
                 main_route_targets = list(targets)
                 main_route_is_closed = bool(is_closed)
+                # Prefix sums along the corridor axis, so a branch can start
+                # at the right distance rather than at zero.
+                _mr_len = _route_segment_lengths(centers, lefts, n, is_closed)
+                main_route_cumul = [0.0] * n
+                for _j in range(1, n):
+                    main_route_cumul[_j] = (main_route_cumul[_j - 1]
+                                            + _mr_len[_j - 1])
 
             # Direction check runs regardless of what the section already
             # holds. A backwards branch derived from a Ribbon was corrected
@@ -2366,6 +2550,17 @@ def export_trackai(filepath, context, options):
             write_u32(f, TAG_SPLINE_SECTION)
             write_u32(f, n)
 
+            # An open branch's route distance continues from the main route
+            # one node past its departure point; section 0 starts at zero.
+            _cumul_start = 0.0
+            if (sec_i > 0 and not is_closed and main_route_cumul
+                    and branch_prev_ref):
+                _after = int(branch_prev_ref[1]) + 1
+                if main_route_is_closed:
+                    _after %= len(main_route_cumul)
+                if 0 <= _after < len(main_route_cumul):
+                    _cumul_start = main_route_cumul[_after]
+
             node_data = build_section_nodes(
                 centers, lefts, rights, targets, n, is_closed,
                 empties, sec_i,
@@ -2374,7 +2569,10 @@ def export_trackai(filepath, context, options):
                 generate_speed_hints=generate_speed_hints,
                 prefer_curve_target=prefer_curve_target,
                 main_route_centers=main_route_centers,
-                main_route_lefts=main_route_lefts)
+                main_route_lefts=main_route_lefts,
+                main_route_targets=main_route_targets,
+                mids=mids,
+                cumul_start=_cumul_start)
             f.write(node_data)
 
             # Mirror the just-written node records back into Blender as per-node
@@ -3494,6 +3692,7 @@ class FO2_OT_ReverseTrack(bpy.types.Operator):
         nodes_deleted = 0
         for sec_col in sections:
             center = None; target = None; left = None; right = None
+            mid = None
             for obj in sec_col.objects:
                 if obj.type != 'CURVE':
                     continue
@@ -3501,10 +3700,22 @@ class FO2_OT_ReverseTrack(bpy.types.Operator):
                 elif "_TargetLine" in obj.name:  target = obj
                 elif "_LeftBoundary" in obj.name: left = obj
                 elif "_RightBoundary" in obj.name: right = obj
+                elif "_MidLine" in obj.name:     mid = obj
 
-            if center is not None:
+            # CenterLine and MidLine are insets measured from named rails, so
+            # both go stale the moment the rails swap. Reversing them is not a
+            # simple pairing: in a lateral coordinate along unit(right - left)
+            # with left at 0, mid sits at NODE_INSET, right at L and center at
+            # L + NODE_INSET, so mirroring the axis maps left<->center and
+            # right<->mid, which does not compose cleanly with the rail swap.
+            # Drop both and let them regenerate. That loses authored inset
+            # data, so re-import or re-author a MidLine afterwards if you need
+            # vanilla-exact insets on a reversed track.
+            for stale in (center, mid):
+                if stale is None:
+                    continue
                 try:
-                    bpy.data.objects.remove(center, do_unlink=True)
+                    bpy.data.objects.remove(stale, do_unlink=True)
                 except Exception:
                     pass
                 curves_reversed += 1
@@ -3698,8 +3909,8 @@ class FO2_OT_PreviewTrackAI(bpy.types.Operator):
     auto_generate_center: bpy.props.BoolProperty(
         name="Auto-generate CenterLine",
         description="If a section has no _CenterLine curve, create one by "
-                    "offsetting RightBoundary perpendicular toward the track "
-                    "interior. Requires both boundaries.",
+                    "offsetting RightBoundary away from LeftBoundary. "
+                    "Requires both boundaries.",
         default=True,
     )
     center_offset: bpy.props.FloatProperty(
@@ -3720,15 +3931,33 @@ class FO2_OT_PreviewTrackAI(bpy.types.Operator):
     )
     target_method: bpy.props.EnumProperty(
         name="Method",
-        description="How to synthesise the TargetLine when auto-generating",
+        description="Which TargetLine generator to use when auto-generating",
         items=[
-            ('SMOOTH', "Smoothed racing line",
-             "Corridor-clamped Chaikin smoothing. Straights sit near t; turns "
-             "pull the curve toward the corridor edge."),
-            ('DUPLICATE', "Duplicate boundary",
-             "Copy one boundary verbatim (nascar-style AI)."),
+            ('NEW', "New Method",
+             "Minimum-curvature racing line, relaxed to convergence inside "
+             "the band the game confines the target to. RMS 1.262u against "
+             "the race sections of all 48 vanilla files"),
+            ('LEGACY', "Legacy",
+             "The fixed-pass Chaikin smoothing shipped up to v2.3.4, clamped "
+             "to the full ribbon. RMS 2.024u, but it is what existing tracks "
+             "were authored against"),
         ],
-        default='SMOOTH',
+        default='NEW',
+    )
+
+    target_legacy_lerp: bpy.props.FloatProperty(
+        name="Legacy LERP",
+        description="Legacy only: starting position across the ribbon. "
+                    "0 = RightBoundary, 1 = LeftBoundary. 0.30 is the 2.3.4 "
+                    "default",
+        default=0.30, min=0.0, max=1.0, step=5, precision=2,
+    )
+
+    target_legacy_iters: bpy.props.IntProperty(
+        name="Legacy passes",
+        description="Legacy only: number of Chaikin smoothing passes. 10 is "
+                    "the 2.3.4 default",
+        default=10, min=0, max=200,
     )
 
     target_smooth_iters: bpy.props.IntProperty(
@@ -3738,18 +3967,6 @@ class FO2_OT_PreviewTrackAI(bpy.types.Operator):
                     "so this caps runtime rather than tuning the result. "
                     "Vanilla sections converge in a median of 58 sweeps",
         default=2000, min=1, max=20000,
-    )
-
-    target_source: bpy.props.EnumProperty(
-        name="Duplicate from",
-        description="Which boundary to duplicate when method is Duplicate",
-        items=[
-            ('RIGHT', "RightBoundary",
-             "Duplicate the inner boundary - the one vanilla's target line "
-             "sits nearest"),
-            ('LEFT',  "LeftBoundary", "Duplicate the outer boundary"),
-        ],
-        default='RIGHT',
     )
 
     generate_speed_hints: bpy.props.BoolProperty(
@@ -3807,11 +4024,12 @@ class FO2_OT_PreviewTrackAI(bpy.types.Operator):
         # TargetLine
         row = box.row(); row.prop(self, "auto_generate_target")
         sub = box.column(); sub.enabled = self.auto_generate_target
-        sub.prop(self, "target_method")
-        if self.target_method == 'SMOOTH':
-            sub.prop(self, "target_smooth_iters")
+        sub.prop(self, "target_method", expand=True)
+        if self.target_method == 'LEGACY':
+            sub.prop(self, "target_legacy_lerp", slider=True)
+            sub.prop(self, "target_legacy_iters")
         else:
-            sub.prop(self, "target_source", expand=True)
+            sub.prop(self, "target_smooth_iters")
 
         # Speed hint
         box = layout.box()
@@ -3844,8 +4062,9 @@ class FO2_OT_PreviewTrackAI(bpy.types.Operator):
             'center_offset': float(self.center_offset),
             'auto_generate_target': self.auto_generate_target and any_target_missing,
             'target_method': self.target_method,
-            'target_source': self.target_source,
             'target_smooth_iters': int(self.target_smooth_iters),
+            'target_legacy_lerp': float(self.target_legacy_lerp),
+            'target_legacy_iters': int(self.target_legacy_iters),
             'generate_speed_hints': self.generate_speed_hints,
             'flip_boundaries': self.flip_boundaries,
             'align_to_startgrid': self.align_to_startgrid,
@@ -4424,7 +4643,7 @@ class TRACKAI_OT_reconnect_alternate_routes(bpy.types.Operator):
         Node empties are dropped so they rebuild from the corrected curves,
         which also lets the next export re-infer the Path0 links.
         """
-        center = target = left = right = None
+        center = target = left = right = mid = None
         for obj in sec_col.objects:
             if obj.type != 'CURVE':
                 continue
@@ -4436,19 +4655,26 @@ class TRACKAI_OT_reconnect_alternate_routes(bpy.types.Operator):
                 left = obj
             elif "_RightBoundary" in obj.name:
                 right = obj
+            elif "_MidLine" in obj.name:
+                mid = obj
         if left is None or right is None:
             return False, "no boundary curve pair to flip"
         _swap_and_reverse_curves(left, right)
         if target is not None:
             _reverse_nurbs_points_inplace(target)
-        if center is not None:
+        # Both insets go stale when the rails swap; see FO2_OT_ReverseTrack.
+        removed = []
+        for stale, label in ((center, "CenterLine"), (mid, "MidLine")):
+            if stale is None:
+                continue
             try:
-                bpy.data.objects.remove(center, do_unlink=True)
+                bpy.data.objects.remove(stale, do_unlink=True)
+                removed.append(label)
             except Exception:
                 pass
         dropped = _delete_node_empties_in_section(sec_col)
-        return True, (f"CenterLine and {dropped} node empties dropped for "
-                      f"regeneration")
+        return True, (f"{' and '.join(removed) or 'nothing'} plus {dropped} "
+                      f"node empties dropped for regeneration")
 
     def execute(self, context):
         root = find_trackai_root(context)
@@ -5195,17 +5421,36 @@ class ExportTrackAI(bpy.types.Operator, ExportHelper):
 
     target_method: EnumProperty(
         name="Method",
-        description="How to synthesise the TargetLine when auto-generating",
+        description="Which TargetLine generator to use when auto-generating",
         items=[
-            ('SMOOTH',    "Smoothed racing line",
-             "Corridor-clamped Chaikin smoothing: LERP at t within the ribbon, "
-             "then iteratively smooth. Straight sections stay near t; turns "
-             "naturally pull the curve toward the corridor edge (wider entry, "
-             "cut apex, wider exit). Best fit across most vanilla tracks."),
-            ('DUPLICATE', "Duplicate boundary",
-             "Copy one boundary verbatim (nascar-style AI that hugs a wall)."),
+            ('NEW', "New Method",
+             "Minimum-curvature racing line, relaxed to convergence inside "
+             "the band the game confines the target to. RMS 1.262u against "
+             "the race sections of all 48 vanilla files"),
+            ('LEGACY', "Legacy",
+             "The fixed-pass Chaikin smoothing shipped up to v2.3.4, clamped "
+             "to the full ribbon. RMS 2.024u, but it is what existing tracks "
+             "were authored against"),
         ],
-        default='SMOOTH',
+        default='NEW',
+    )
+
+    target_legacy_lerp: FloatProperty(
+        name="Legacy LERP",
+        description="Legacy only: starting position across the ribbon. "
+                    "0 = RightBoundary (inner), 1 = LeftBoundary (outer). "
+                    "0.30 is the 2.3.4 default",
+        default=0.30,
+        min=0.0, max=1.0, step=5, precision=2,
+    )
+
+    target_legacy_iters: IntProperty(
+        name="Legacy passes",
+        description="Legacy only: number of Chaikin smoothing passes applied "
+                    "to the initial LERP line. 0 = plain LERP. 10 is the "
+                    "2.3.4 default",
+        default=10,
+        min=0, max=200,
     )
 
     target_smooth_iters: IntProperty(
@@ -5219,22 +5464,12 @@ class ExportTrackAI(bpy.types.Operator, ExportHelper):
         min=1, max=20000,
     )
 
-    target_source: EnumProperty(
-        name="Duplicate from",
-        description="Which boundary to duplicate when method is Duplicate",
-        items=[
-            ('RIGHT', "RightBoundary", "Duplicate the inner boundary (RightBoundary in our plugin's convention)"),
-            ('LEFT',  "LeftBoundary",  "Duplicate the outer boundary (LeftBoundary in our plugin's convention)"),
-        ],
-        default='RIGHT',
-    )
-
     auto_generate_center: BoolProperty(
         name="Auto-generate CenterLine",
         description="If a section has no _CenterLine curve, create one by "
-                    "offsetting RightBoundary perpendicular toward the track "
-                    "interior. Requires both boundaries (uses Ribbon-derived "
-                    "ones when applicable). Runs before TargetLine.",
+                    "offsetting RightBoundary away from LeftBoundary. "
+                    "Requires both boundaries (uses Ribbon-derived ones when "
+                    "applicable). Runs before TargetLine.",
         default=True,
     )
 
@@ -5337,11 +5572,12 @@ class ExportTrackAI(bpy.types.Operator, ExportHelper):
         else:
             sub = box.column()
             sub.enabled = self.auto_generate_target
-            sub.prop(self, "target_method")
-            if self.target_method == 'SMOOTH':
-                        sub.prop(self, "target_smooth_iters")
-            else:  # DUPLICATE
-                sub.prop(self, "target_source", expand=True)
+            sub.prop(self, "target_method", expand=True)
+            if self.target_method == 'LEGACY':
+                sub.prop(self, "target_legacy_lerp", slider=True)
+                sub.prop(self, "target_legacy_iters")
+            else:
+                sub.prop(self, "target_smooth_iters")
 
         # Speed hints apply to from-scratch node generation only — sections
         # that already have node empties (roundtrip) read the stored
@@ -5371,8 +5607,9 @@ class ExportTrackAI(bpy.types.Operator, ExportHelper):
             'export_splitpoints_bed': self.export_splitpoints_bed,
             'auto_generate_target': self.auto_generate_target and any_target_missing,
             'target_method': self.target_method,
-            'target_source': self.target_source,
             'target_smooth_iters': int(self.target_smooth_iters),
+            'target_legacy_lerp': float(self.target_legacy_lerp),
+            'target_legacy_iters': int(self.target_legacy_iters),
             'auto_generate_center': self.auto_generate_center and any_center_missing,
             'center_offset': float(self.center_offset),
             'generate_speed_hints': self.generate_speed_hints,
